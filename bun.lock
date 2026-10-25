@@ -15,6 +15,9 @@
     "packages/relay": {
       "name": "@share-context-mcp/relay",
       "version": "0.0.0",
+      "dependencies": {
+        "@share-context-mcp/protocol": "workspace:*",
+      },
     },
     "packages/server": {
       "name": "@share-context-mcp/server",
