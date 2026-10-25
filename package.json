@@ -1,0 +1,13 @@
+{
+  "name": "share-context-mcp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "test": "bun test --pass-with-no-tests"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0"
+  }
+}
