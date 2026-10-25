@@ -7,6 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac, randomBytes } from "node:crypto";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -264,8 +265,28 @@ describe("relay websocket push", () => {
     }
   });
 
-  test("cross-channel isolation: sends on channel B do not reach channel A sockets", async () => {
-    const a = await setupChannel();
+  test("expired-token WS upgrade rejected (token TTL enforced at upgrade)", async () => {
+    const { channelId, token } = await setupChannel();
+    // Least-invasive TTL manipulation: expire the token directly in the
+    // relay's shared SQLite file (WAL — a brief external writer is safe);
+    // no production surface is added for a knob only tests observe.
+    const db = new Database(join(dir, "relay.db"));
+    try {
+      db.exec("PRAGMA journal_mode = WAL;");
+      db.prepare("UPDATE members SET token_expires_at = ? WHERE channel_id = ?").run(Date.now() - 1000, channelId);
+    } finally {
+      db.close();
+    }
+    const s = new WsSession(`${wsBase}/channels/${channelId}/ws?token=${encodeURIComponent(token)}`);
+    expect(await s.opened).toBe(false);
+  });
+
+  test("unknown-channel WS upgrade rejected", async () => {
+    const s = new WsSession(`${wsBase}/channels/000000000000/ws?token=${encodeURIComponent("whatever")}`);
+    expect(await s.opened).toBe(false);
+  });
+
+  test("cross-channel isolation: sends on channel B do not reach channel A sockets", async () => {    const a = await setupChannel();
     const b = await setupChannel();
     const sA = new WsSession(`${wsBase}/channels/${a.channelId}/ws?token=${encodeURIComponent(a.token)}`);
     try {
