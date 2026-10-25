@@ -9,7 +9,7 @@
  */
 import { Database } from "bun:sqlite";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { idempotencyKey, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
@@ -41,18 +41,53 @@ interface MessageRow {
   provenance_json: string;
 }
 
+const KEY_LOAD_RETRIES = 20;
+const KEY_LOAD_RETRY_MS = 5;
+
+/**
+ * Load or create the machine key, safe under concurrent first-run instances:
+ * - creation uses open(O_EXCL) so exactly ONE process wins the write —
+ *   no existsSync→write TOCTOU window, no last-writer-wins, no interleaved
+ *   O_TRUNC garbage that would silently brick stored passwords;
+ * - losers (EEXIST) load the winner's key, retrying briefly while the winner
+ *   is still between create and write (sync sleep via Atomics.wait — the
+ *   Store constructor is synchronous);
+ * - an existing file with a looser mode is re-tightened to 0600.
+ */
 function loadOrCreateMachineKey(keyPath: string): Buffer {
-  if (existsSync(keyPath)) {
-    const key = readFileSync(keyPath);
-    if (key.length !== MACHINE_KEY_BYTES) {
-      throw new Error(`machine key at ${keyPath} is corrupt (expected ${MACHINE_KEY_BYTES} bytes, got ${key.length})`);
-    }
-    return key;
-  }
-  const key = randomBytes(MACHINE_KEY_BYTES);
   mkdirSync(dirname(keyPath), { recursive: true });
-  writeFileSync(keyPath, key, { mode: 0o600 });
-  return key;
+  let fd: number;
+  try {
+    fd = openSync(keyPath, "wx", 0o600); // O_EXCL — fails with EEXIST if it exists
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    return loadExistingMachineKey(keyPath);
+  }
+  try {
+    const key = randomBytes(MACHINE_KEY_BYTES);
+    writeSync(fd, key);
+    return key;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function loadExistingMachineKey(keyPath: string): Buffer {
+  for (let attempt = 0; ; attempt++) {
+    const key = readFileSync(keyPath);
+    if (key.length === MACHINE_KEY_BYTES) {
+      chmodSync(keyPath, 0o600); // re-tighten a looser mode (idempotent)
+      return key;
+    }
+    if (attempt >= KEY_LOAD_RETRIES) {
+      throw new Error(
+        `machine key at ${keyPath} is corrupt (expected ${MACHINE_KEY_BYTES} bytes, got ${key.length})`,
+      );
+    }
+    // File exists but is empty/partial: a concurrent creator is mid-write.
+    const wait = Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, KEY_LOAD_RETRY_MS);
+    if (wait === "not-equal") throw new Error("machine key load retry unavailable on this thread");
+  }
 }
 
 /** AES-256-GCM under the machine key → "v1:" + base64(nonce ‖ ciphertext ‖ tag). */

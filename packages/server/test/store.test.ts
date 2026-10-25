@@ -3,9 +3,10 @@
  * per-channel cursor isolation, cache upsert, and `a&b,c&d` search semantics.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { idempotencyKey, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { Store } from "../src/store";
@@ -52,6 +53,44 @@ describe("Store", () => {
     const s2 = new Store(dbPath);
     expect(readFileSync(keyPath).equals(first)).toBe(true);
     s2.close();
+  });
+
+  test("concurrent first-run Stores share ONE machine key (no last-writer-wins)", async () => {
+    const keyPath = join(dir, "machine.key");
+    const dbPath = join(dir, "state.db"); // spec §5.5: concurrent instances SHARE one SQLite file
+    const stores = await Promise.all(
+      [0, 1, 2, 3].map(() => Promise.resolve().then(() => new Store(dbPath))),
+    );
+    try {
+      const keys = stores.map(() => readFileSync(keyPath));
+      // all four instances observed the same 32 bytes — exactly one winner
+      for (const k of keys) {
+        expect(k.length).toBe(32);
+        expect(k.equals(keys[0])).toBe(true);
+      }
+      // cross-readability: a password stored by one instance decrypts in the
+      // others (a divergent machine key would fail GCM auth here)
+      stores[0].upsertChannel({ channelId: "channelone01", password: "shared-secret-1", memberName: "a", epoch: 1 });
+      stores[3].upsertChannel({ channelId: "channeltwo02", password: "shared-secret-2", memberName: "b", epoch: 1 });
+      expect(stores[1].getChannelSecret("channelone01")?.password).toBe("shared-secret-1");
+      expect(stores[2].getChannelSecret("channeltwo02")?.password).toBe("shared-secret-2");
+      expect(stores[3].getChannelSecret("channelone01")?.password).toBe("shared-secret-1");
+    } finally {
+      for (const s of stores) s.close();
+    }
+  });
+
+  test("a looser existing machine key mode is re-tightened to 0600", () => {
+    const keyPath = join(dir, "machine.key");
+    writeFileSync(keyPath, randomBytes(32), { mode: 0o666 });
+    const s = new Store(join(dir, "state.db"));
+    try {
+      expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+      s.close();
+    } catch (e) {
+      s.close();
+      throw e;
+    }
   });
 
   test("channel secret roundtrip: password encrypted at rest, decrypts back", () => {
