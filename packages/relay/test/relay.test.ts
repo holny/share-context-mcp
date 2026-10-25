@@ -287,6 +287,41 @@ describe("blind relay", () => {
     expect(joinOldPw.status).toBe(401);
   });
 
+  test("concurrent sends allocate distinct seqs 1..N with zero 500s (F-1)", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const { body } = await joinChannel(channelId, "alice", PASSWORD);
+    const token = body.token as string;
+
+    // 8 parallel sends: the channel row is read before the body-parse await
+    // point in each request, so a stale next_seq would previously collide on
+    // the (channel_id, seq) PK and surface as a 500.
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        sendClaim(token, channelId, `concurrent message #${i}`, { topic: `conc-${i}` }),
+      ),
+    );
+    const seqs: number[] = [];
+    for (const r of results) {
+      expect(r.status).toBe(200);
+      expect(r.body.deduped).toBe(false);
+      seqs.push(r.body.seq as number);
+    }
+    expect([...seqs].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // the persisted ledger agrees: exactly 8 rows, contiguous seqs
+    const list = await fetch(`${base}/channels/${channelId}/messages?since=0`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const listBody = (await list.json()) as { messages: Array<{ seq: number }>; nextSeq: number };
+    expect(listBody.messages.map((m) => m.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(listBody.nextSeq).toBe(9);
+  });
+
   test("unknown channel and unknown route return structured 404 errors", async () => {
     const missing = await postJson("/channels/doesnotexist/challenge", { memberName: "x" });
     expect(missing.status).toBe(404);

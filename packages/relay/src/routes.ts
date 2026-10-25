@@ -111,7 +111,7 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
   const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, nonce, ciphertext, idem_key, created_at) VALUES (?, ?, ?, ?, ?, ?)");
   const stmtMessageByIdem = db.prepare("SELECT seq FROM messages WHERE channel_id = ? AND idem_key = ?");
   const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
-  const stmtBumpSeq = db.prepare("UPDATE channels SET next_seq = ? WHERE id = ?");
+  const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq");
 
   /** Returns channel+member for a valid Bearer token, or null (caller answers 401). */
   function authenticate(channelId: string, req: Request): { channel: ChannelRow; member: MemberRow } | null {
@@ -141,15 +141,21 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
     return { ok: true, values };
   }
 
-  const storeMessage = db.transaction((channelId: string, channel: ChannelRow, nonce: string, ciphertext: string, idemKey: string): Response => {
+  const storeMessage = db.transaction((channelId: string, nonce: string, ciphertext: string, idemKey: string): Response => {
     const existing = stmtMessageByIdem.get(channelId, idemKey) as { seq: number } | undefined;
     if (existing) {
       return json({ seq: existing.seq, deduped: true });
     }
-    const seq = channel.next_seq;
-    stmtInsertMessage.run(channelId, seq, nonce, ciphertext, idemKey, new Date().toISOString());
-    stmtBumpSeq.run(seq + 1, channelId);
-    return json({ seq, deduped: false });
+    // Allocate seq INSIDE the transaction (F-1): the channel row captured in
+    // authenticate() may be stale after the body-parse await point under
+    // concurrent sends; UPDATE ... RETURNING reads the live counter instead.
+    const allocated = stmtAllocSeq.get(channelId) as { seq: number } | undefined;
+    if (!allocated) {
+      // unreachable: channel existence verified in authenticate()
+      return jsonError(500, "internal error");
+    }
+    stmtInsertMessage.run(channelId, allocated.seq, nonce, ciphertext, idemKey, new Date().toISOString());
+    return json({ seq: allocated.seq, deduped: false });
   });
 
   async function handle(req: Request): Promise<Response> {
@@ -283,7 +289,7 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
           if (Buffer.from(ciphertext, "base64").length > MAX_CIPHERTEXT_BYTES) {
             return jsonError(413, "message too large: ciphertext must be at most 8192 bytes");
           }
-          return storeMessage(channelId, auth.channel, shape.values.nonce, ciphertext, shape.values.idemKey);
+          return storeMessage(channelId, shape.values.nonce, ciphertext, shape.values.idemKey);
         }
         if (method === "GET") {
           const auth = authenticate(channelId, req);
