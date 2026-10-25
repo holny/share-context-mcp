@@ -43,3 +43,22 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
     },
   };
 }
+
+if (import.meta.main) {
+  // CLI: bun run packages/relay/src/index.ts --port 8787 --db relay.db
+  const args = process.argv.slice(2);
+  const flag = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+  const port = Number(flag("--port") ?? 8787);
+  const dbPath = flag("--db") ?? "relay.db";
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    console.error(`invalid --port: ${flag("--port")}`);
+    process.exit(1);
+  }
+  const relay = await startRelay({ port, dbPath });
+  console.error(
+    `share-context relay: http://127.0.0.1:${relay.port} (db: ${dbPath}) — blind, stores ciphertext only`,
+  );
+}
