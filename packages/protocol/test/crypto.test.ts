@@ -86,6 +86,11 @@ describe("hmacProof", () => {
     expect(hmacProof(key, n1)).not.toBe(hmacProof(key, n2));
   });
 
+  test("throws on a wrongly-sized key (16 bytes)", () => {
+    const shortKey = new Uint8Array(16);
+    expect(() => hmacProof(shortKey, Buffer.alloc(12).toString("base64"))).toThrow("32 bytes");
+  });
+
   test("is base64 of HMAC-SHA256 over the raw nonce bytes", async () => {
     const { createHmac } = await import("node:crypto");
     const key = deriveChannelKey("pw1", "ch1");

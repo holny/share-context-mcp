@@ -46,10 +46,19 @@ export const LIMITS = {
   detailMax: 2048,
   topicMax: 64,
   scopeMaxKeys: 5,
+  scopeKeyMax: 64,
   scopeValueMax: 120,
   toMax: 32,
   memberMax: 32,
+  provenanceOptionalMax: 120,
 } as const;
+
+export interface CredentialPattern {
+  pattern: RegExp;
+  /** Human-readable pattern name — used in rejection reasons so the
+   * matched secret text itself is never echoed into errors/logs. */
+  label: string;
+}
 
 /**
  * Credentials blacklist — reject on match with an actionable reason.
@@ -57,13 +66,13 @@ export const LIMITS = {
  * At minimum catches: password=... assignments, PEM private keys,
  * AWS access keys (AKIA...), GitHub tokens (ghp_/ghs_), and sk- keys.
  */
-export const CREDENTIAL_PATTERNS: RegExp[] = [
-  /(?:password|passwd|pwd|api[_-]?key)\s*[=:]\s*\S+/i,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /AKIA[0-9A-Z]{16}/,
-  /gh[ps]_[A-Za-z0-9]{20,}/,
-  /github_pat_[A-Za-z0-9_]{20,}/,
-  /sk-[A-Za-z0-9]{16,}/,
+export const CREDENTIAL_PATTERNS: CredentialPattern[] = [
+  { pattern: /(?:password|passwd|pwd|api[_-]?key)\s*[=:]\s*\S+/i, label: "password or API-key assignment" },
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/, label: "private key" },
+  { pattern: /AKIA[0-9A-Z]{16}/, label: "AWS access key" },
+  { pattern: /gh[ps]_[A-Za-z0-9]{20,}/, label: "GitHub token" },
+  { pattern: /github_pat_[A-Za-z0-9_]{20,}/, label: "GitHub token" },
+  { pattern: /sk-[A-Za-z0-9]{16,}/, label: "generic secret key" },
 ];
 
 export function idempotencyKey(statement: string, kind: ClaimKind, topic: string): string {
@@ -72,16 +81,11 @@ export function idempotencyKey(statement: string, kind: ClaimKind, topic: string
 
 import { createHash } from "node:crypto";
 
-interface ScanHit {
-  field: string;
-  label: string;
-}
-
-function scanForCredentials(text: string, field: string): ScanHit | null {
-  for (const pattern of CREDENTIAL_PATTERNS) {
-    const m = pattern.exec(text);
-    if (m) {
-      return { field, label: `pattern '${m[0].slice(0, 12)}…'` };
+/** Returns the matching pattern's LABEL (never the matched text) or null. */
+function scanForCredentials(text: string): string | null {
+  for (const { pattern, label } of CREDENTIAL_PATTERNS) {
+    if (pattern.test(text)) {
+      return label;
     }
   }
   return null;
@@ -161,7 +165,11 @@ export function validateClaim(input: unknown): ValidateResult {
     };
   }
 
-  // scope
+  // scope — field names in errors/scan use index only, never the key text
+  // (a scope key could itself carry a credential; see scan below)
+  const scanned: Array<[string, string]> = [["statement", statement]];
+  if (detail !== undefined) scanned.push(["detail", detail]);
+  scanned.push(["topic", topic]);
   let scope: Record<string, string> | undefined;
   if (input.scope !== undefined && input.scope !== null) {
     if (!isRecord(input.scope)) {
@@ -175,18 +183,26 @@ export function validateClaim(input: unknown): ValidateResult {
       };
     }
     scope = {};
-    for (const k of keys) {
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (k.length > LIMITS.scopeKeyMax) {
+        return {
+          ok: false,
+          reason: `scope key #${i} must be at most ${LIMITS.scopeKeyMax} characters (got ${k.length})`,
+        };
+      }
       const v = input.scope[k];
       if (typeof v !== "string") {
-        return { ok: false, reason: `scope.${k} must be a string` };
+        return { ok: false, reason: `scope key #${i} value must be a string` };
       }
       if (v.length > LIMITS.scopeValueMax) {
         return {
           ok: false,
-          reason: `scope.${k} must be at most ${LIMITS.scopeValueMax} characters (got ${v.length})`,
+          reason: `scope key #${i} value must be at most ${LIMITS.scopeValueMax} characters (got ${v.length})`,
         };
       }
       scope[k] = v;
+      scanned.push([`scope key #${i}`, k], [`scope key #${i} value`, v]);
     }
   }
 
@@ -205,6 +221,7 @@ export function validateClaim(input: unknown): ValidateResult {
     }
     if (trimmedTo.length > 0) to = trimmedTo;
   }
+  if (to !== undefined) scanned.push(["to", to]);
 
   // provenance
   if (!isRecord(input.provenance)) {
@@ -224,27 +241,35 @@ export function validateClaim(input: unknown): ValidateResult {
     };
   }
   const provenance: ClaimProvenance = { member: prov.member.trim(), source: prov.source };
+  scanned.push(["provenance.member", provenance.member]);
   if (typeof prov.agent === "string" && prov.agent.trim().length > 0) {
-    provenance.agent = prov.agent.trim();
-  }
-  if (typeof prov.session_ref === "string" && prov.session_ref.trim().length > 0) {
-    provenance.session_ref = prov.session_ref.trim();
-  }
-
-  // credentials blacklist — statement, detail, topic and scope values
-  const scanned: Array<[string, string | undefined]> = [
-    ["statement", statement],
-    ["detail", detail],
-    ["topic", topic],
-    ...Object.entries(scope ?? {}).map(([k, v]) => [`scope.${k}`, v] as [string, string]),
-  ];
-  for (const [field, text] of scanned) {
-    if (text === undefined) continue;
-    const hit = scanForCredentials(text, field);
-    if (hit) {
+    if (prov.agent.trim().length > LIMITS.provenanceOptionalMax) {
       return {
         ok: false,
-        reason: `${field} rejected: looks like a credential (${hit.label}). Remove the secret and re-send; never share credentials on the channel`,
+        reason: `provenance.agent must be at most ${LIMITS.provenanceOptionalMax} characters (got ${prov.agent.trim().length})`,
+      };
+    }
+    provenance.agent = prov.agent.trim();
+    scanned.push(["provenance.agent", provenance.agent]);
+  }
+  if (typeof prov.session_ref === "string" && prov.session_ref.trim().length > 0) {
+    if (prov.session_ref.trim().length > LIMITS.provenanceOptionalMax) {
+      return {
+        ok: false,
+        reason: `provenance.session_ref must be at most ${LIMITS.provenanceOptionalMax} characters (got ${prov.session_ref.trim().length})`,
+      };
+    }
+    provenance.session_ref = prov.session_ref.trim();
+    scanned.push(["provenance.session_ref", provenance.session_ref]);
+  }
+
+  // credentials blacklist — EVERY string field of the claim
+  for (const [field, text] of scanned) {
+    const label = scanForCredentials(text);
+    if (label) {
+      return {
+        ok: false,
+        reason: `${field} rejected: looks like a credential (${label}). Remove the secret and re-send; never share credentials on the channel`,
       };
     }
   }

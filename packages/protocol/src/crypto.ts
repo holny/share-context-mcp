@@ -34,6 +34,10 @@ function assertKey(key: Uint8Array): void {
   }
 }
 
+/**
+ * Sealed envelope — WIRE FORMAT LOCKED (controller ruling on F-5):
+ * field names are `nonce` and `ciphertext`, both base64. Do not rename.
+ */
 export interface SealedEnvelope {
   /** base64 of the 12-byte AES-GCM nonce */
   nonce: string;
@@ -56,7 +60,8 @@ export function seal(msg: ClaimMessage, key: Uint8Array): SealedEnvelope {
 }
 
 /**
- * Open a sealed envelope back into a ClaimMessage.
+ * Open a sealed envelope back into a ClaimMessage. Envelope fields are the
+ * locked wire format: `nonce` and `ciphertext`, both base64 (see SealedEnvelope).
  * Throws Error("decrypt failed") on auth-tag failure or malformed payload —
  * never leak why (tampered key/ciphertext vs. garbage are indistinguishable).
  */
@@ -84,6 +89,7 @@ export function open(env: { nonce: string; ciphertext: string }, key: Uint8Array
  * base64(HMAC-SHA256(key, raw nonce bytes decoded from nonceB64)).
  */
 export function hmacProof(key: Uint8Array, nonceB64: string): string {
+  assertKey(key);
   return createHmac("sha256", Buffer.from(key))
     .update(Buffer.from(nonceB64, "base64"))
     .digest("base64");

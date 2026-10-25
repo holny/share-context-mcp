@@ -79,9 +79,52 @@ describe("validateClaim — credentials blacklist", () => {
     expect(r.ok).toBe(false);
   });
 
+  test("rejects a credential hidden in a scope value", () => {
+    const r = validateClaim({
+      ...base(),
+      scope: { note: "rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWXyz1234 soon" },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("rejects a credential hidden in a scope key without echoing it", () => {
+    const secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXyz1234";
+    const r = validateClaim({ ...base(), scope: { [secret]: "v" } });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).not.toContain("ghp_");
+  });
+
+  test("rejects a credential hidden in the to field", () => {
+    const r = validateClaim({ ...base(), to: "ghp_ABCDEFGHIJKLMNOPQRSTUVWXyz1234" });
+    expect(r.ok).toBe(false);
+  });
+
+  test("rejects a credential hidden in provenance.agent", () => {
+    const r = validateClaim({
+      ...base(),
+      provenance: { member: "a", agent: "sk-abcdefghijklmnop1234", source: "agent" },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("rejection reason names the pattern label and never echoes the secret", () => {
+    const secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXyz1234";
+    const r = validateClaim({ ...base(), statement: `use ${secret} now` });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toContain("GitHub token");
+      expect(r.reason).not.toContain("ghp_");
+      expect(r.reason).not.toContain("ABCDEFGHIJKLMNOP");
+    }
+  });
+
   test("blacklist is exported for reuse by the server", () => {
     expect(Array.isArray(CREDENTIAL_PATTERNS)).toBe(true);
     expect(CREDENTIAL_PATTERNS.length).toBeGreaterThanOrEqual(5);
+    for (const entry of CREDENTIAL_PATTERNS) {
+      expect(typeof entry.pattern).toBe("object"); // RegExp
+      expect(typeof entry.label).toBe("string");
+    }
   });
 });
 
@@ -122,6 +165,28 @@ describe("validateClaim — other fields", () => {
     expect(validateClaim({ ...base(), scope: six }).ok).toBe(false);
     expect(validateClaim({ ...base(), scope: { repo: 123 as unknown as string } }).ok).toBe(false);
     expect(validateClaim({ ...base(), scope: { repo: "v".repeat(121) } }).ok).toBe(false);
+  });
+
+  test("rejects an oversize scope key (over 64 chars)", () => {
+    const r = validateClaim({ ...base(), scope: { ["k".repeat(65)]: "v" } });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toContain("64");
+      expect(r.reason).not.toContain("kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk");
+    }
+  });
+
+  test("rejects oversize provenance.agent and session_ref (over 120 chars)", () => {
+    const long = "z".repeat(121);
+    expect(
+      validateClaim({ ...base(), provenance: { member: "a", agent: long, source: "agent" } }).ok,
+    ).toBe(false);
+    expect(
+      validateClaim({
+        ...base(),
+        provenance: { member: "a", session_ref: long, source: "agent" },
+      }).ok,
+    ).toBe(false);
   });
 
   test("rejects a to field over 32 characters", () => {
