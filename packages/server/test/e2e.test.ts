@@ -9,7 +9,9 @@
  * Lifecycle under test: create → out-of-band password handoff → join card →
  * share ×3 → fetch → topic catch_up → search → rotate (old token dies) →
  * re-join with the new password → keep fetching. Also asserts that neither
- * server process ever logs a plaintext password to stderr.
+ * server process ever logs a plaintext password to stderr — an assertion made
+ * meaningful by a negative-path child (missing relay URL) that provably bails
+ * through the same stderr capture.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -229,11 +231,43 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       expect(resumed.messages.some((m) => m.statement.startsWith("back in business"))).toBe(true);
 
       // ---- security: no plaintext password in either server's stderr ----
+      // (meaningful only because the test below proves the capture is live)
       for (const p of procs) {
         expect(p.stderr).not.toContain(password);
         expect(p.stderr).not.toContain(newPassword);
       }
     },
     60_000,
+  );
+
+  test(
+    "stderr capture is live: a child missing SHARE_CONTEXT_RELAY_URL bails to stderr",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "scm-e2e-noenv-"));
+      const stderrChunks: string[] = [];
+      // The happy-path children above emit zero stderr bytes, so their no-leak
+      // assertion alone proves nothing. This child deterministically hits the
+      // startup bail (packages/server/src/index.ts:37): with the env var
+      // deleted (a merely unreachable URL would write nothing on a fresh
+      // store) it console.errors the bail line and exits(1) before the MCP
+      // handshake, over the SAME StdioClientTransport("pipe") capture path.
+      const env = { ...process.env, SHARE_CONTEXT_DB_PATH: join(dir, "state.db") };
+      delete env.SHARE_CONTEXT_RELAY_URL;
+      const transport = new StdioClientTransport({
+        command: "bun",
+        args: ["run", ENTRY_PATH],
+        env,
+        stderr: "pipe",
+      });
+      transport.stderr!.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString()));
+      const client = new Client({ name: "e2e-noenv", version: "0.0.0" });
+      // no relay URL → process exits before answering `initialize` → rejects
+      await expect(client.connect(transport)).rejects.toThrow();
+      await Bun.sleep(300); // let stderr drain
+      expect(stderrChunks.join("")).toContain("SHARE_CONTEXT_RELAY_URL is not set");
+      await transport.close().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    },
+    30_000,
   );
 });
