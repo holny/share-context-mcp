@@ -15,6 +15,17 @@ export interface MailboxMeta {
   nextSeq: number;
 }
 
+export interface PollResult {
+  /** Decrypted messages from the window, in relay (seq ASC) order. */
+  messages: ClaimMessage[];
+  /**
+   * Envelopes in the fetched window that could not be decrypted with any held
+   * key (e.g. other-epoch ciphertext after a rotate). The cursor advances over
+   * them regardless — they must never block the stream (spec §5.7).
+   */
+  skipped: number;
+}
+
 export interface Mailbox {
   /** Create a channel and join it as `memberName`. Returns the human-shareable secret. */
   createChannel(opts: { name?: string; memberName: string }): Promise<{ channelId: string; password: string }>;
@@ -22,8 +33,8 @@ export interface Mailbox {
   join(channelId: string, password: string, memberName: string): Promise<void>;
   /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimMessage, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
-  /** Fetch envelopes since a seq, decrypt them, cache + advance the cursor. */
-  poll(channelId: string, since: number): Promise<ClaimMessage[]>;
+  /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
+  poll(channelId: string, since: number): Promise<PollResult>;
   meta(channelId: string): Promise<MailboxMeta>;
   /** Open a new epoch with a new password; invalidates all tokens (caller must re-join). */
   rotate(channelId: string, newPassword: string): Promise<void>;

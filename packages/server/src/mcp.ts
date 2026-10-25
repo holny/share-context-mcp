@@ -297,13 +297,10 @@ Also re-check after a break and before finalizing work others depend on. Returns
     safe(async ({ since, channelId }) => {
       const ch = resolveChannel(store, channelId);
       const start = since ?? store.getCursor(ch);
-      const messages = await mailbox.poll(ch, start);
-      const meta = await mailbox.meta(ch);
-      // Undecryptable envelopes (e.g. old-epoch ciphertext after a rotate) are
-      // swallowed by poll; surface them so agents can see channel churn.
-      // The relay's nextSeq is the next seq to assign (= last assigned + 1),
-      // so the envelope window since `start` is nextSeq - 1 - start.
-      const skipped = Math.max(0, meta.nextSeq - 1 - start - messages.length);
+      // skipped counts envelopes of the fetched window that no held key could
+      // open (e.g. old-epoch ciphertext after a rotate); the cursor already
+      // advanced past them inside poll (high-water, C-1).
+      const { messages, skipped } = await mailbox.poll(ch, start);
       setActiveChannel(store, ch);
       return quoteWrap(JSON.stringify({ messages, skipped, cursor: store.getCursor(ch) }));
     }),

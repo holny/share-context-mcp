@@ -3,12 +3,16 @@
  * (spec §5.5). Owns the E2E side: validates claims locally, seals/open with
  * the password-derived channel key, and keeps tokens in memory only.
  *
- * Poll delivery order (task-4 brief Step 3): fetch → decrypt → cacheMessages →
- * advance cursor. A crash between steps can re-deliver; downstream dedupe by
- * (channel_id, seq) cache upsert + monotonic cursor absorbs it.
+ * Poll delivery order: fetch → decrypt with the best held key (current epoch
+ * first, then retained old-epoch keys) → cacheMessages → advance the cursor
+ * over the whole RETURNED window (high-water, C-1: undecryptable envelopes
+ * must never re-fetch forever). A crash between steps can re-deliver;
+ * downstream dedupe by (channel_id, seq) cache upsert + monotonic cursor
+ * absorbs it.
  */
 import { createHmac, randomBytes } from "node:crypto";
 import {
+  LIMITS,
   deriveChannelKey,
   hmacProof,
   open,
@@ -18,7 +22,7 @@ import {
   type SealedEnvelope,
 } from "@share-context-mcp/protocol";
 import type { Store } from "../store";
-import type { Mailbox, MailboxMember, MailboxMeta } from "./types";
+import type { Mailbox, MailboxMember, MailboxMeta, PollResult } from "./types";
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -266,26 +270,47 @@ export class RelayMailbox implements Mailbox {
     return { seq: res.seq as number, deduped: res.deduped === true };
   }
 
-  async poll(channelId: string, since: number): Promise<ClaimMessage[]> {
+  async poll(channelId: string, since: number): Promise<PollResult> {
     const data = (await this.request(`/channels/${channelId}/messages?since=${since}`, {
       method: "GET",
       headers: this.authHeaders(channelId),
     })) as { messages?: EnvelopeRow[] };
-    const key = this.channelKey(channelId);
+    const envelopes = data.messages ?? [];
+    // Candidate keys, current epoch first (C-1/I-2): an envelope sealed in an
+    // earlier epoch is opened with its RETAINED old password (spec §5.5 —
+    // local holders of the old key keep reading old-epoch ciphertext). A
+    // member who never held the old password simply fails to open it.
+    const secret = this.store.getChannelSecret(channelId);
+    if (!secret) throw new Error(`unknown channel: ${channelId}`);
+    const keys: Uint8Array[] = [deriveChannelKey(secret.password, channelId)];
+    for (const { password } of this.store.epochPasswords(channelId)) {
+      keys.push(deriveChannelKey(password, channelId));
+    }
     const out: ClaimMessage[] = [];
-    for (const env of data.messages ?? []) {
-      try {
-        // v1: envelopes from another epoch (undecryptable with the current key)
-        // are skipped silently; they stay readable to whoever held the old key.
-        const msg = open({ nonce: env.nonce, ciphertext: env.ciphertext }, key);
-        out.push({ ...msg, seq: env.seq });
-      } catch {
-        // skip undecryptable envelope
+    let best = 0; // index of the last key that opened an envelope
+    for (const env of envelopes) {
+      for (let i = 0; i < keys.length; i++) {
+        try {
+          const msg = open({ nonce: env.nonce, ciphertext: env.ciphertext }, keys[(best + i) % keys.length]);
+          // Spec §5.9 server-side clamp: truncate (never drop) overlong
+          // content so the cache stays truthful to the cursor.
+          msg.statement = msg.statement.slice(0, LIMITS.statementMax);
+          if (msg.detail !== undefined) msg.detail = msg.detail.slice(0, LIMITS.detailMax);
+          out.push({ ...msg, seq: env.seq });
+          best = (best + i) % keys.length;
+          break;
+        } catch {
+          // wrong epoch key — try the next candidate before giving up
+        }
       }
     }
     if (out.length > 0) this.store.cacheMessages(channelId, out);
-    this.store.recordCursorFromMessages(channelId, out);
-    return out;
+    // Cursor high-water over the RETURNED WINDOW, not over what decrypted
+    // (C-1): an undecryptable page prefix (old-epoch ciphertext after a
+    // rotate) must advance the cursor, or it would re-fetch forever and
+    // permanently block every newer message behind it.
+    this.store.recordCursorFromMessages(channelId, envelopes);
+    return { messages: out, skipped: envelopes.length - out.length };
   }
 
   async meta(channelId: string): Promise<MailboxMeta> {

@@ -19,6 +19,8 @@ const MACHINE_KEY_BYTES = 32;
 const GCM_NONCE_BYTES = 12;
 const GCM_TAG_BYTES = 16;
 const SECRET_FORMAT = "v1";
+/** Old-epoch passwords retained per channel (spec §5.5); older ones are pruned. */
+const EPOCH_KEY_RETENTION = 5;
 
 interface ChannelRow {
   channel_id: string;
@@ -170,6 +172,12 @@ export class Store {
         provenance_json TEXT NOT NULL,
         PRIMARY KEY (channel_id, seq)
       );
+      CREATE TABLE IF NOT EXISTS epoch_keys (
+        channel_id   TEXT NOT NULL,
+        epoch        INTEGER NOT NULL,
+        password_enc TEXT NOT NULL,
+        PRIMARY KEY (channel_id, epoch)
+      );
       CREATE TABLE IF NOT EXISTS kvs (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -179,8 +187,36 @@ export class Store {
 
   // ---- channels ----
 
-  /** Insert or update a locally-held channel. On conflict the local cursor is preserved. */
+  /**
+   * Insert or update a locally-held channel. On conflict the local cursor is
+   * preserved. When the password changes, the previous one is retired under
+   * its epoch (spec §5.5: "旧 epoch 密文仍由中继保留，只有持有过旧密码的人能解
+   * （本地已存旧钥的可继续读）") so this machine keeps local readability of
+   * old-epoch ciphertext; retention is bounded to the last 5 epochs.
+   */
   upsertChannel(ch: ChannelSecretInput): void {
+    const existing = this.db
+      .prepare("SELECT password_enc, epoch FROM channels WHERE channel_id = ?")
+      .get(ch.channelId) as { password_enc: string; epoch: number } | undefined;
+    if (existing) {
+      let oldPassword: string | null = null;
+      try {
+        oldPassword = decryptSecret(this.machineKey, existing.password_enc);
+      } catch {
+        oldPassword = null; // undecryptable residue — nothing to retire
+      }
+      if (oldPassword !== null && oldPassword !== ch.password) {
+        this.db
+          .prepare(
+            `INSERT INTO epoch_keys(channel_id, epoch, password_enc) VALUES (?, ?, ?)
+             ON CONFLICT(channel_id, epoch) DO UPDATE SET password_enc = excluded.password_enc`,
+          )
+          .run(ch.channelId, existing.epoch, existing.password_enc);
+        this.db
+          .prepare("DELETE FROM epoch_keys WHERE channel_id = ? AND epoch <= ?")
+          .run(ch.channelId, ch.epoch - EPOCH_KEY_RETENTION);
+      }
+    }
     this.db
       .prepare(
         `INSERT INTO channels(channel_id, password_enc, member_name, epoch, cursor, joined_at)
@@ -198,6 +234,26 @@ export class Store {
         ch.cursor ?? 0,
         new Date().toISOString(),
       );
+  }
+
+  /**
+   * Retired old-epoch passwords for a channel, ascending by epoch (current
+   * password excluded). Used by poll to open envelopes sealed in earlier
+   * epochs; bounded by EPOCH_KEY_RETENTION at write time.
+   */
+  epochPasswords(channelId: string): Array<{ epoch: number; password: string }> {
+    const rows = this.db
+      .prepare("SELECT epoch, password_enc FROM epoch_keys WHERE channel_id = ? ORDER BY epoch ASC")
+      .all(channelId) as Array<{ epoch: number; password_enc: string }>;
+    const out: Array<{ epoch: number; password: string }> = [];
+    for (const r of rows) {
+      try {
+        out.push({ epoch: r.epoch, password: decryptSecret(this.machineKey, r.password_enc) });
+      } catch {
+        // undecryptable residue — skip that epoch
+      }
+    }
+    return out;
   }
 
   /** Decrypt and return the channel secret; null if the channel is not held locally. */
@@ -231,6 +287,7 @@ export class Store {
   /** Forget a channel locally (relay-side membership record is untouched in v1). */
   removeChannel(channelId: string): void {
     this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(channelId);
+    this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(channelId);
     this.db.prepare("DELETE FROM messages WHERE channel_id = ?").run(channelId);
   }
 
