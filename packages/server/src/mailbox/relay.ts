@@ -97,17 +97,43 @@ export class RelayMailbox implements Mailbox {
   private loadToken(channelId: string): string | null {
     const mem = this.tokens.get(channelId);
     if (mem) return mem;
-    const saved = this.store.getSecret(`token:${channelId}`);
-    if (saved) this.tokens.set(channelId, saved);
-    return saved;
+    const session = this.loadStoredSession(channelId);
+    if (session) {
+      this.tokens.set(channelId, session.token);
+      return session.token;
+    }
+    return null;
   }
 
   /**
-   * Adopt the persisted session token for a channel, if any. Returns true
-   * when a token was loaded (the caller must verify it with an authed call).
+   * The persisted session: token AND the memberName it was issued for.
+   * The name rides with the token so adoption can never cross identities
+   * (a 409 for a DIFFERENT live member name must surface, not adopt).
    */
-  private adoptStoredToken(channelId: string): boolean {
-    return this.loadToken(channelId) !== null;
+  private loadStoredSession(channelId: string): { token: string; memberName: string } | null {
+    const raw = this.store.getSecret(`token:${channelId}`);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { token?: unknown; memberName?: unknown };
+      if (typeof parsed.token === "string" && typeof parsed.memberName === "string") {
+        return { token: parsed.token, memberName: parsed.memberName };
+      }
+    } catch {
+      // corrupt/foreign entry — treat as no stored session
+    }
+    return null;
+  }
+
+  /**
+   * Adopt the persisted session for a channel ONLY when it was issued for
+   * the requested memberName. Returns true when a matching session was
+   * loaded (the caller must verify it with an authed call).
+   */
+  private adoptStoredSession(channelId: string, memberName: string): boolean {
+    const session = this.loadStoredSession(channelId);
+    if (!session || session.memberName !== memberName) return false;
+    this.tokens.set(channelId, session.token);
+    return true;
   }
 
   private forgetToken(channelId: string): void {
@@ -148,10 +174,12 @@ export class RelayMailbox implements Mailbox {
     })) as { token?: string; epoch?: number };
     if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
     this.tokens.set(channelId, joined.token);
-    // Persist (encrypted) so a restart or a second process sharing the SQLite
-    // can adopt this session instead of failing the 409 live-name check.
+    // Persist (encrypted) TOGETHER WITH the memberName so a restart or a
+    // second process sharing the SQLite can adopt this session — but only
+    // ever under the SAME member name (adoption across identities would
+    // silently ride someone else's session).
     try {
-      this.store.putSecret(`token:${channelId}`, joined.token);
+      this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: joined.token, memberName }));
     } catch {
       // token persistence is best-effort; memory still works this session
     }
@@ -192,10 +220,12 @@ export class RelayMailbox implements Mailbox {
       await this.challengeJoin(channelId, key, memberName);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // A live session already holds this member name (restart within the
-      // token TTL, or a concurrent instance sharing the store). Adopt its
-      // persisted token; the meta verification below proves it still works.
-      if (!msg.includes("member name already taken") || !this.adoptStoredToken(channelId)) {
+      // A live session already holds the requested member name (restart
+      // within the token TTL, or a concurrent instance sharing the store).
+      // Adopt the persisted session ONLY for the SAME member name — with a
+      // different name the live session is someone else's identity, and the
+      // relay's 409 must surface so the agent picks another name.
+      if (!msg.includes("member name already taken") || !this.adoptStoredSession(channelId, memberName)) {
         throw err;
       }
     }
@@ -204,6 +234,12 @@ export class RelayMailbox implements Mailbox {
       method: "GET",
       headers: this.authHeaders(channelId),
     });
+    // Defense in depth: the live session must actually be this member name.
+    const members = (meta.members as MailboxMember[] | undefined) ?? [];
+    if (!members.some((m) => m.memberName === memberName)) {
+      this.forgetToken(channelId);
+      throw new Error("member name already taken");
+    }
     this.store.upsertChannel({
       channelId,
       password,

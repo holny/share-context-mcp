@@ -15,6 +15,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
+import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
 import { buildMcpServer, TOOL_NAMES } from "../src/mcp";
 import { RelayMailbox } from "../src/mailbox/relay";
 import { Store } from "../src/store";
@@ -381,8 +382,107 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
   });
 });
 
-describe("MCP stdio entry", () => {
+describe("session-token adoption on 409 (identity binding)", () => {
   let relay: RelayHandle;
+  let baseUrl: string;
+  const dirs: string[] = [];
+
+  beforeAll(async () => {
+    relay = await startRelay({ port: 0 });
+    baseUrl = `http://127.0.0.1:${relay.port}`;
+  });
+
+  afterAll(async () => {
+    await relay.stop();
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  function claimFor(statement: string, member: string): ClaimMessage {
+    const r = validateClaim({
+      statement,
+      kind: "progress",
+      topic: "t",
+      provenance: { member, source: "agent" },
+    });
+    if (!r.ok) throw new Error(`test helper claim invalid: ${r.reason}`);
+    return r.msg;
+  }
+
+  async function makeAgent(label: string): Promise<Agent> {
+    const dir = mkdtempSync(join(tmpdir(), `scm-mcp-${label}-`));
+    dirs.push(dir);
+    const store = new Store(join(dir, "state.db"));
+    const mailbox = new RelayMailbox({ baseUrl, store });
+    const server = buildMcpServer({ store, mailbox });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `test-${label}`, version: "0.0.0" });
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    return { client, store };
+  }
+
+  test("re-join with the SAME memberName on 409 adopts the live session and works", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "scm-mcp-adopt-"));
+    dirs.push(dir);
+    const store = new Store(join(dir, "state.db"));
+    const m1 = new RelayMailbox({ baseUrl, store });
+    const { channelId, password } = await m1.createChannel({ memberName: "alice" });
+
+    // fresh instance over the SAME store, memory empty → restart simulation;
+    // relay 409s (alice's token is live) → adoption must kick in
+    const m2 = new RelayMailbox({ baseUrl, store });
+    await m2.join(channelId, password, "alice");
+    const sent = await m2.send(claimFor("sent through the adopted session", "alice"), channelId);
+    expect(sent.seq).toBeGreaterThan(0);
+    expect(store.getChannelSecret(channelId)?.memberName).toBe("alice");
+    store.close();
+  });
+
+  test("re-join with a DIFFERENT live memberName surfaces 409, local identity unchanged", async () => {
+    // machine A: live session as alice; machine B: live session as bob
+    const dirA = mkdtempSync(join(tmpdir(), "scm-mcp-adopt-a-"));
+    const dirB = mkdtempSync(join(tmpdir(), "scm-mcp-adopt-b-"));
+    dirs.push(dirA, dirB);
+    const storeA = new Store(join(dirA, "state.db"));
+    const storeB = new Store(join(dirB, "state.db"));
+    const mA = new RelayMailbox({ baseUrl, store: storeA });
+    const { channelId, password } = await mA.createChannel({ memberName: "alice" });
+    const mB = new RelayMailbox({ baseUrl, store: storeB });
+    await mB.join(channelId, password, "bob");
+
+    // restart simulation on machine A, but requesting bob's (live) name:
+    // adoption must refuse (stored session is alice's) and the 409 surfaces
+    const mA2 = new RelayMailbox({ baseUrl, store: storeA });
+    expect(mA2.join(channelId, password, "bob")).rejects.toThrow("member name already taken");
+    expect(storeA.getChannelSecret(channelId)?.memberName).toBe("alice");
+    storeA.close();
+    storeB.close();
+  });
+
+  test("join_channel tool: mismatched live memberName → readable error, identity preserved", async () => {
+    const a = await makeAgent("a");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    const b = await makeAgent("b");
+    await b.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "b" } });
+
+    // second server over agent A's store, requesting the live "b" name
+    const server2 = buildMcpServer({ store: a.store, mailbox: new RelayMailbox({ baseUrl, store: a.store }) });
+    const [ct2, st2] = InMemoryTransport.createLinkedPair();
+    const client2 = new Client({ name: "test-a2", version: "0.0.0" });
+    await Promise.all([client2.connect(ct2), server2.connect(st2)]);
+    const res = await client2.callTool({
+      name: "join_channel",
+      arguments: { channelId, password, memberName: "b" },
+    });
+    expect(isError(res)).toBe(true);
+    expect(textOf(res)).toContain("member name already taken");
+    expect(a.store.getChannelSecret(channelId)?.memberName).toBe("a");
+    await client2.close();
+  });
+});
+
+describe("MCP stdio entry", () => {  let relay: RelayHandle;
   let baseUrl: string;
   const dirs: string[] = [];
 
