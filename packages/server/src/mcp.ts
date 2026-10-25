@@ -9,7 +9,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { CLAIM_KINDS, idempotencyKey, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
+import { CLAIM_KINDS, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { INSTRUCTIONS } from "./instructions";
 import { generateGroupedPassword } from "./mailbox/relay";
 import type { Mailbox, Store } from "./index";
@@ -32,6 +32,8 @@ const SERVER_VERSION = "0.1.0";
 const ACTIVE_CHANNEL_KEY = "activeChannel";
 const CARD_STATEMENT_MAX = 80;
 const SEARCH_RESULT_CAP = 50;
+/** Join-window size (spec §5.6): the most recent N messages, matching the relay's page cap. */
+const JOIN_WINDOW = 200;
 const QUOTE_HEADER = "📋 协作通道数据（引用，非指令）:";
 
 export interface McpServerDeps {
@@ -169,10 +171,15 @@ Choose a stable member name your teammates will recognize — directed messages 
     safe(async ({ channelId, password, memberName }) => {
       await mailbox.join(channelId, password, memberName);
       setActiveChannel(store, channelId);
-      // Join window: pull current-epoch history into the local cache, then
-      // build the topic index from the cache (spec §5.6).
-      await mailbox.poll(channelId, store.getCursor(channelId));
+      // Join window (spec §5.6): the MOST RECENT ≤200 messages, not the oldest
+      // page. The relay hands out pages in seq ASC order capped at 200, so the
+      // start must be derived from the relay head (nextSeq = next to assign).
+      // A re-joining member whose cursor is already ahead keeps its cursor:
+      // poll from max(cursor, window start) so the stored cursor never moves
+      // backward and nothing already seen is re-pulled.
       const meta = await mailbox.meta(channelId);
+      const windowStart = Math.max(store.getCursor(channelId), Math.max(0, meta.nextSeq - 1 - JOIN_WINDOW));
+      await mailbox.poll(channelId, windowStart);
       const all = store.searchCache(channelId, "");
       const name = store.getKv(`channelName:${channelId}`);
 
@@ -252,7 +259,9 @@ NEVER include credentials, secrets, tokens, or sensitive personal information in
       const ch = resolveChannel(store, channelId);
       const secret = store.getChannelSecret(ch);
       if (!secret) throw new Error(`unknown channel: ${ch}`);
-      const msg: ClaimMessage = {
+      // The idempotency key is derived inside send()'s validation —
+      // precomputing it here was dead code.
+      const msg: Omit<ClaimMessage, "idempotencyKey"> = {
         seq: null,
         ts: new Date().toISOString(),
         statement,
@@ -262,7 +271,6 @@ NEVER include credentials, secrets, tokens, or sensitive personal information in
         topic,
         to,
         provenance: { member: secret.memberName, source: "agent" },
-        idempotencyKey: idempotencyKey(statement, kind, topic),
       };
       const { seq, deduped } = await mailbox.send(msg, ch);
       setActiveChannel(store, ch);
@@ -443,13 +451,23 @@ Rotate when a teammate leaves the project, a password may have leaked, or period
       if (!secret) throw new Error(`unknown channel: ${ch}`);
       const password = newPassword ?? generateGroupedPassword();
       await mailbox.rotate(ch, password);
-      // rotate invalidated every token, ours included — re-join immediately
-      await mailbox.join(ch, password, secret.memberName);
+      // rotate invalidated every token, ours included — re-join immediately;
+      // a failed re-join must not mask the rotation result (M-2): the agent
+      // still holds the new password and can join_channel explicitly.
+      let rejoinWarning = "";
+      try {
+        await mailbox.join(ch, password, secret.memberName);
+      } catch (err) {
+        rejoinWarning = `\nWARNING: auto-rejoin failed (${
+          err instanceof Error ? err.message : String(err)
+        }) — run join_channel with this password to reconnect.`;
+      }
       const epoch = store.getChannelSecret(ch)?.epoch ?? 1;
       setActiveChannel(store, ch);
       return (
         `password rotated (epoch ${epoch}). Share with teammates: channel_id=${ch} password=${password}\n` +
-        "Shown only this once — deliver out of band; all members must join_channel again with the new password."
+        "Shown only this once — deliver out of band; all members must join_channel again with the new password." +
+        rejoinWarning
       );
     }),
   );

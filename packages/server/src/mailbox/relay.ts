@@ -18,11 +18,11 @@ import {
   open,
   seal,
   validateClaim,
-  type ClaimMessage,
   type SealedEnvelope,
 } from "@share-context-mcp/protocol";
+import type { ClaimMessage } from "@share-context-mcp/protocol";
 import type { Store } from "../store";
-import type { Mailbox, MailboxMember, MailboxMeta, PollResult } from "./types";
+import type { ClaimInput, Mailbox, MailboxMember, MailboxMeta, PollResult } from "./types";
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -145,7 +145,7 @@ export class RelayMailbox implements Mailbox {
     this.store.deleteKv(`token:${channelId}`);
   }
 
-  private channelIdFor(msg: ClaimMessage, channelId?: string): string {
+  private channelIdFor(msg: ClaimInput, channelId?: string): string {
     const ch = channelId ?? this.defaultChannelId;
     if (!ch) throw new Error("no channel: create or join a channel first");
     return ch;
@@ -253,7 +253,7 @@ export class RelayMailbox implements Mailbox {
     this.defaultChannelId = channelId;
   }
 
-  async send(msg: ClaimMessage, channelId?: string): Promise<{ seq: number; deduped: boolean }> {
+  async send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }> {
     const ch = this.channelIdFor(msg, channelId);
     const validated = validateClaim(msg);
     if (!validated.ok) throw new Error(validated.reason);

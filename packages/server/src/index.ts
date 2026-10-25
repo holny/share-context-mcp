@@ -16,7 +16,7 @@ import { Store } from "./store";
 
 export { Store } from "./store";
 export { RelayMailbox, generateGroupedPassword } from "./mailbox/relay";
-export type { Mailbox, MailboxMember, MailboxMeta } from "./mailbox/types";
+export type { Mailbox, MailboxMember, MailboxMeta, PollResult, ClaimInput } from "./mailbox/types";
 export { buildMcpServer, TOOL_NAMES } from "./mcp";
 export { INSTRUCTIONS } from "./instructions";
 export type { McpServerDeps } from "./mcp";

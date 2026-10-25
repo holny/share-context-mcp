@@ -5,6 +5,12 @@
  */
 import type { ClaimMessage } from "@share-context-mcp/protocol";
 
+/**
+ * Claim input to send(): the idempotency key is derived from
+ * (statement, kind, topic) during validation, so callers need not precompute it.
+ */
+export type ClaimInput = Omit<ClaimMessage, "idempotencyKey"> & { idempotencyKey?: string };
+
 export interface MailboxMember {
   memberName: string;
   joinedAt: string;
@@ -32,7 +38,7 @@ export interface Mailbox {
   /** Join an existing channel with a password (challenge → proof → token). */
   join(channelId: string, password: string, memberName: string): Promise<void>;
   /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
-  send(msg: ClaimMessage, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
+  send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
   poll(channelId: string, since: number): Promise<PollResult>;
   meta(channelId: string): Promise<MailboxMeta>;

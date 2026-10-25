@@ -317,8 +317,11 @@ export class Store {
 
   // ---- decrypted message cache ----
 
-  /** Upsert decrypted messages keyed by (channel_id, seq). */
-  cacheMessages(channelId: string, msgs: ReadonlyArray<ClaimMessage>): void {
+  /**
+   * Upsert decrypted messages keyed by (channel_id, seq). The idempotency key
+   * is not persisted — searchCache re-derives it on read — so inputs may omit it.
+   */
+  cacheMessages(channelId: string, msgs: ReadonlyArray<Omit<ClaimMessage, "idempotencyKey">>): void {
     const stmt = this.db.prepare(
       `INSERT INTO messages(channel_id, seq, ts, statement, detail, kind, scope_json, topic, "to", provenance_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -332,7 +335,7 @@ export class Store {
          "to" = excluded."to",
          provenance_json = excluded.provenance_json`,
     );
-    const insertAll = this.db.transaction((rows: ReadonlyArray<ClaimMessage>) => {
+    const insertAll = this.db.transaction((rows: ReadonlyArray<Omit<ClaimMessage, "idempotencyKey">>) => {
       for (const m of rows) {
         stmt.run(
           channelId,
