@@ -251,8 +251,15 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       // deleted (a merely unreachable URL would write nothing on a fresh
       // store) it console.errors the bail line and exits(1) before the MCP
       // handshake, over the SAME StdioClientTransport("pipe") capture path.
-      const env = { ...process.env, SHARE_CONTEXT_DB_PATH: join(dir, "state.db") };
-      delete env.SHARE_CONTEXT_RELAY_URL;
+      // Typed clone of the parent env (Bun's process.env has no open index
+      // signature, so a spread + delete does not typecheck): build the child
+      // env explicitly, dropping SHARE_CONTEXT_RELAY_URL to force the
+      // startup bail below.
+      const env: Record<string, string> = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (key !== "SHARE_CONTEXT_RELAY_URL" && value !== undefined) env[key] = value;
+      }
+      env.SHARE_CONTEXT_DB_PATH = join(dir, "state.db");
       const transport = new StdioClientTransport({
         command: "bun",
         args: ["run", ENTRY_PATH],
