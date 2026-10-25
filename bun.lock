@@ -22,6 +22,12 @@
     "packages/server": {
       "name": "@share-context-mcp/server",
       "version": "0.0.0",
+      "dependencies": {
+        "@share-context-mcp/protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "@share-context-mcp/relay": "workspace:*",
+      },
     },
     "packages/spike": {
       "name": "@share-context-mcp/spike",
