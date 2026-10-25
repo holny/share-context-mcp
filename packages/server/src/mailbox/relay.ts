@@ -37,7 +37,7 @@ function generateChannelId(): string {
 }
 
 /** Human-copyable grouped password: 20 chars of [a-z0-9] in 4-char dash groups. */
-function generatePassword(): string {
+export function generateGroupedPassword(): string {
   const raw = randomString(PASSWORD_ALPHABET, PASSWORD_CHARS);
   return raw.match(/.{4}/g)!.join("-");
 }
@@ -60,7 +60,7 @@ interface EnvelopeRow {
 export class RelayMailbox implements Mailbox {
   private readonly baseUrl: string;
   private readonly store: Store;
-  /** Session tokens per channel — memory only, re-join after restart/rotate. */
+  /** Session tokens per channel — memory first, encrypted fallback in the store. */
   private readonly tokens = new Map<string, string>();
   /** Default channel for the brief's `send(msg)` form; set on create/join. */
   private defaultChannelId: string | null = null;
@@ -84,9 +84,35 @@ export class RelayMailbox implements Mailbox {
   }
 
   private authHeaders(channelId: string): Record<string, string> {
-    const token = this.tokens.get(channelId);
+    const token = this.loadToken(channelId);
     if (!token) throw new Error(`not joined: ${channelId}`);
     return { authorization: `Bearer ${token}` };
+  }
+
+  /**
+   * Token lookup: memory first, then the encrypted store slot written at
+   * join time. Lets a restarted (or second, SQLite-sharing) process adopt
+   * the session of the member name it holds without re-challenging.
+   */
+  private loadToken(channelId: string): string | null {
+    const mem = this.tokens.get(channelId);
+    if (mem) return mem;
+    const saved = this.store.getSecret(`token:${channelId}`);
+    if (saved) this.tokens.set(channelId, saved);
+    return saved;
+  }
+
+  /**
+   * Adopt the persisted session token for a channel, if any. Returns true
+   * when a token was loaded (the caller must verify it with an authed call).
+   */
+  private adoptStoredToken(channelId: string): boolean {
+    return this.loadToken(channelId) !== null;
+  }
+
+  private forgetToken(channelId: string): void {
+    this.tokens.delete(channelId);
+    this.store.deleteKv(`token:${channelId}`);
   }
 
   private channelIdFor(msg: ClaimMessage, channelId?: string): string {
@@ -122,6 +148,13 @@ export class RelayMailbox implements Mailbox {
     })) as { token?: string; epoch?: number };
     if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
     this.tokens.set(channelId, joined.token);
+    // Persist (encrypted) so a restart or a second process sharing the SQLite
+    // can adopt this session instead of failing the 409 live-name check.
+    try {
+      this.store.putSecret(`token:${channelId}`, joined.token);
+    } catch {
+      // token persistence is best-effort; memory still works this session
+    }
   }
 
   // ---- Mailbox ----
@@ -130,7 +163,7 @@ export class RelayMailbox implements Mailbox {
     // `name` is a local display label in v1; the blind relay stores no title.
     void opts.name;
     const channelId = generateChannelId();
-    const password = generatePassword();
+    const password = generateGroupedPassword();
     const key = deriveChannelKey(password, channelId);
     const created = await this.request("/channels", {
       method: "POST",
@@ -154,8 +187,18 @@ export class RelayMailbox implements Mailbox {
 
   async join(channelId: string, password: string, memberName: string): Promise<void> {
     const key = deriveChannelKey(password, channelId);
-    // On 401/409 the relay's error propagates verbatim BEFORE anything is persisted.
-    await this.challengeJoin(channelId, key, memberName);
+    // On 401 the relay's error propagates verbatim BEFORE anything is persisted.
+    try {
+      await this.challengeJoin(channelId, key, memberName);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // A live session already holds this member name (restart within the
+      // token TTL, or a concurrent instance sharing the store). Adopt its
+      // persisted token; the meta verification below proves it still works.
+      if (!msg.includes("member name already taken") || !this.adoptStoredToken(channelId)) {
+        throw err;
+      }
+    }
     // Verify the session actually works before recording the channel locally.
     const meta = await this.request(`/channels/${channelId}/meta`, {
       method: "GET",
@@ -236,13 +279,13 @@ export class RelayMailbox implements Mailbox {
       epoch: typeof res.epoch === "number" ? res.epoch : secret.epoch + 1,
     });
     // All tokens (including ours) are dead after rotate; re-join to continue.
-    this.tokens.delete(channelId);
+    this.forgetToken(channelId);
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
   }
 
   async leave(channelId: string): Promise<void> {
     this.store.removeChannel(channelId);
-    this.tokens.delete(channelId);
+    this.forgetToken(channelId);
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
   }
 }

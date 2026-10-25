@@ -324,6 +324,43 @@ export class Store {
     return rows.map(rowToClaim);
   }
 
+  // ---- key-value scratch space (active channel, subscriptions, labels) ----
+
+  /**
+   * Encrypted kv slot for bearer secrets (relay session tokens) under the
+   * same machine-key GCM scheme as channel passwords. Null when absent.
+   */
+  getSecret(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM kvs WHERE key = ?").get(key) as { value: string } | undefined;
+    if (!row) return null;
+    try {
+      return decryptSecret(this.machineKey, row.value);
+    } catch {
+      return null; // corrupt/foreign entry — treat as absent
+    }
+  }
+
+  putSecret(key: string, plaintext: string): void {
+    this.db
+      .prepare("INSERT INTO kvs(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(key, encryptSecret(this.machineKey, plaintext));
+  }
+
+  getKv(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM kvs WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setKv(key: string, value: string): void {
+    this.db
+      .prepare("INSERT INTO kvs(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(key, value);
+  }
+
+  deleteKv(key: string): void {
+    this.db.prepare("DELETE FROM kvs WHERE key = ?").run(key);
+  }
+
   /** Close the database (WAL checkpoints on close). */
   close(): void {
     this.db.close();
