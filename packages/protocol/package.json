@@ -1,0 +1,9 @@
+{
+  "name": "@share-context-mcp/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test --pass-with-no-tests"
+  }
+}
