@@ -46,10 +46,10 @@ export function startFakeS3(port: number): { stop: () => void; url: string } {
           // ListObjectsV2 (subset): prefix + start-after
           const listType = url.searchParams.get("list-type");
           if (listType !== "2") return new Response("bad list", { status: 400 });
-          const prefix = join(bucket, url.searchParams.get("prefix") ?? "").replaceAll("\\", "/");
+          const prefix = url.searchParams.get("prefix") ?? "";
           const startAfter = url.searchParams.get("start-after") ?? "";
           const keys = [...objects.keys()]
-            .filter((k) => k.startsWith(prefix) && (!startAfter || k > startAfter.replaceAll("\\", "/")))
+            .filter((k) => k.startsWith(prefix) && (!startAfter || k > startAfter))
             .sort();
           const xml =
             `<?xml version="1.0" encoding="UTF-8"?>\n<ListBucketResult>\n` +
@@ -57,7 +57,7 @@ export function startFakeS3(port: number): { stop: () => void; url: string } {
             `\n</ListBucketResult>`;
           return new Response(xml, { headers: { "content-type": "application/xml" } });
         }
-        const obj = objects.get(`${bucket}/${key}`);
+        const obj = objects.get(key);
         if (!obj) return new Response("NoSuchKey", { status: 404 });
         return new Response(obj.body as unknown as BodyInit, { headers: { etag: obj.etag } });
       }

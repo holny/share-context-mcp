@@ -57,6 +57,8 @@ describe("S3Bridge", () => {
     expect(new Set(seqs).size).toBe(3); // distinct seqs under concurrency (conditional head write)
 
     const poll = await bob.poll(channelId, 0);
+    console.log("POLL1:", JSON.stringify(poll.messages.map((m) => ({ seq: m.seq, kind: m.kind }))));
+    console.log("POLL1:", JSON.stringify(poll.messages.map((m) => ({ seq: m.seq, kind: m.kind, statement: m.statement.slice(0, 25) }))));
     expect(poll.messages.map((m) => m.seq as number).sort((x, y) => x - y)).toEqual([1, 2, 3]);
     expect(poll.skipped).toBe(0);
     expect(poll.messages.every((m) => m.provenance.member.length > 0)).toBe(true);
@@ -70,7 +72,9 @@ describe("S3Bridge", () => {
 
   test("meta lists both members", async () => {
     const meta = await alice.meta(channelId);
+    console.log("META1:", JSON.stringify(meta));
     const names = meta.members.map((m) => m.memberName).sort();
+    console.log("META:", JSON.stringify(names));
     expect(names).toEqual(["alice", "bob"]);
   });
 
