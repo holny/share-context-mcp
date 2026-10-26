@@ -70,7 +70,7 @@ export class GitBridge implements ChannelBridge {
   }
 
   /** Write files, commit, push — with pull-rebase-retry on a racing push. */
-  private writeAndPush(s: ChannelSecret, files: Array<{ path: string; content: string }>, message: string): void {
+  private writeAndPush(s: ChannelSecret, files: Array<{ path: string; content: string }>, message: string): { raced: boolean } {
     const cwd = this.workCopy(s.channelId);
     for (const f of files) {
       mkdirSync(join(cwd, f.path, ".."), { recursive: true });
@@ -78,11 +78,18 @@ export class GitBridge implements ChannelBridge {
     }
     this.git(cwd, ["add", "-A"]);
     this.git(cwd, ["commit", "-m", message]);
+    let raced = false;
     for (let attempt = 1; attempt <= RETRY_LIMIT; attempt++) {
       const push = spawnSync("git", ["push", "origin", "main"], { cwd, encoding: "utf8" });
-      if (push.status === 0) return;
-      // someone pushed first — integrate (head.json may have moved) and retry
-      this.git(cwd, ["pull", "--rebase", "--autostash", "origin", "main"]);
+      if (push.status === 0) return { raced };
+      // someone pushed first — integrate (head.json may have moved) and retry.
+      // A failed rebase must be aborted or the working copy stays wedged (I1).
+      const pull = spawnSync("git", ["pull", "--rebase", "--autostash", "origin", "main"], { cwd, encoding: "utf8" });
+      if (pull.status !== 0) {
+        spawnSync("git", ["rebase", "--abort"], { cwd });
+        throw new Error(`git pull --rebase failed: ${(pull.stderr || pull.stdout || "").trim().slice(0, 300)}`);
+      }
+      raced = true;
     }
     throw new Error(`git push rejected after ${RETRY_LIMIT} attempts — re-send this update`);
   }
@@ -167,7 +174,10 @@ export class GitBridge implements ChannelBridge {
       const seq = head.nextSeq;
       const key = this.keyFor(s, head.epoch);
       const env = seal(claim, key);
-      this.writeAndPush(
+      // C2: a racing push with identical head.json content auto-merges — the
+      // caller MUST re-run syncHead when raced, or two members can claim the
+      // same seq. The retry loop rebuilds the seq from the integrated remote.
+      const pushResult = this.writeAndPush(
         s,
         [
           { path: `${epochDir}/${seq}-${claim.idempotencyKey.slice(0, 8)}.enc`, content: JSON.stringify(env) },
@@ -175,7 +185,12 @@ export class GitBridge implements ChannelBridge {
         ],
         `send seq ${seq} (${claim.kind})`,
       );
-      return { seq, deduped: false };
+      if (!pushResult.raced) return { seq, deduped: false };
+      // raced → re-read the integrated remote and re-derive the seq
+      const synced = this.syncHead(s);
+      const reseq = this.nextSeqFor(s, claim);
+      if (reseq !== null) return { seq: reseq, deduped: false };
+      continue;
     }
     throw new Error(`send failed after ${RETRY_LIMIT} attempts — try again`);
   }
@@ -208,6 +223,17 @@ export class GitBridge implements ChannelBridge {
     }
     out.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     return { messages: out, skipped };
+  }
+
+  /** After a raced push, find the seq our claim actually landed at (by idemKey file suffix). */
+  private nextSeqFor(s: ChannelSecret, claim: ClaimMessage): number | null {
+    const dir = join(this.workCopy(s.channelId), `channels/${s.channelId}/messages/epoch-${s.epoch}`);
+    if (!existsSync(dir)) return null;
+    const suffix = claim.idempotencyKey.slice(0, 8);
+    for (const f of readdirSync(dir)) {
+      if (f.endsWith(`-${suffix}.enc`)) return Number(f.split("-")[0]);
+    }
+    return null;
   }
 
   async meta(channelId: string): Promise<ChannelMeta> {

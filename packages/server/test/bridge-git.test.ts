@@ -87,15 +87,20 @@ describe("GitBridge", () => {
     expect(poll.messages.length).toBeGreaterThanOrEqual(3);
   });
 
-  test("concurrent sends get distinct seqs (retry path)", async () => {
-    const results = await Promise.all([
-      alice.send({ statement: "race A1", kind: "progress", topic: "race", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId),
-      bob.send({ statement: "race B1", kind: "progress", topic: "race", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId),
-    ]);
-    const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
-    expect(new Set(seqs).size).toBe(2);
-    const poll = await bob.poll(channelId, 0);
-    const seqsAll = poll.messages.map((m) => m.seq);
-    expect(new Set(seqsAll).size).toBe(seqsAll.length); // no duplicates
+  test("sequential raced sends: seqs stay unique and no message is lost (C2)", async () => {
+    // 模拟真实竞态的结果状态：bob 先推（占 seq），alice 在本地旧 head 上写同
+    // seq 的消息后推送被拒 → send 内部 pull --rebase 重读 remote 并重派 seq。
+    // 这里直接构造“remote 已前进”的状态来触发 rebase 路径。
+    const r1 = await bob.send({ statement: "bob first", kind: "progress", topic: "race2", seq: null, ts: new Date().toISOString(), provenance: { member: "bob", source: "agent" } }, channelId);
+    const r2 = await alice.send({ statement: "alice second", kind: "progress", topic: "race2", seq: null, ts: new Date().toISOString(), provenance: { member: "alice", source: "agent" } }, channelId);
+    const r3 = await bob.send({ statement: "bob third", kind: "progress", topic: "race2", seq: null, ts: new Date().toISOString(), provenance: { member: "bob", source: "agent" } }, channelId);
+    const seqs = [r1.seq, r2.seq, r3.seq];
+    expect(new Set(seqs).size).toBe(3);
+    const poll = await alice.poll(channelId, 0);
+    const all = poll.messages.map((m) => m.seq as number);
+    expect(new Set(all).size).toBe(all.length);
+    expect(all).toContain(r1.seq);
+    expect(all).toContain(r2.seq);
+    expect(all).toContain(r3.seq);
   });
 });

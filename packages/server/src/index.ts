@@ -12,9 +12,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { INSTRUCTIONS } from "./instructions";
 import { buildMcpServer } from "./mcp";
 import { Broadcaster } from "./broadcaster";
-import { createChannelBridge, defaultDbPath } from "./bridge/factory";
-import { RelayBridge } from "./bridge/relay";
+import { createChannelBridge } from "./bridge/factory";
 import { Store } from "./store";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export { Store } from "./store";
 export { RelayBridge, generateGroupedPassword } from "./bridge/relay";
@@ -38,14 +39,14 @@ export interface StdioStartOptions {
  * to stderr and skipped (the agent can join_channel manually).
  */
 export async function runStdioServer(options: StdioStartOptions = {}): Promise<McpServer> {
-  const relayUrl = options.relayUrl ?? process.env.SHARE_CONTEXT_RELAY_URL;
-  if (!relayUrl) {
-    console.error("share-context-mcp: SHARE_CONTEXT_RELAY_URL is not set — cannot reach the relay");
-    process.exit(1);
+  const bridgeKind = options.bridge ?? ((process.env.SHARE_CONTEXT_BRIDGE as "relay" | "git" | "s3" | undefined) ?? "relay");
+  const relayUrl = options.relayUrl ?? process.env.SHARE_CONTEXT_RELAY_URL ?? "http://127.0.0.1:8931";
+  if (bridgeKind === "relay" && !options.relayUrl && !process.env.SHARE_CONTEXT_RELAY_URL) {
+    console.error("share-context-mcp: SHARE_CONTEXT_RELAY_URL is not set (relay bridge) — continuing with the default http://127.0.0.1:8931");
   }
-  const dbPath = options.dbPath ?? process.env.SHARE_CONTEXT_DB_PATH ?? defaultDbPath(process.cwd());
+  const dbPath = options.dbPath ?? process.env.SHARE_CONTEXT_DB_PATH ?? join(homedir(), ".share-context-mcp", "state.db");
   const store = new Store(dbPath);
-  const bridge = new RelayBridge({ baseUrl: relayUrl, store });
+  const bridge = createChannelBridge({ kind: bridgeKind, store });
   // Retained for the lifetime of the process: runtime joins register here and
   // a future in-process shutdown path can call broadcaster.stop(). Null when
   // the broadcaster failed to start (server continues without push).

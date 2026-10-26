@@ -210,7 +210,7 @@ export class S3Bridge implements ChannelBridge {
       const fileName = full.split("/").pop()!;
       const seq = Number(fileName.split("-")[0]);
       if (!Number.isFinite(seq) || seq <= since || seq > high) continue;
-      const r = await this.request(s, "GET", full.slice(`${conn.bucket}/`.length).replace(`${conn.prefix}/`, ""));
+      const r = await this.request(s, "GET", full.replace(`${conn.prefix}/`, ""));
       if (r.status !== 200) { skipped++; continue; }
       // try every epoch key the member holds (spec §5.5: old-key holders keep reading)
       let delivered = false;

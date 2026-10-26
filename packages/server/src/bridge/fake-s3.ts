@@ -30,7 +30,7 @@ export function startFakeS3(port: number): { stop: () => void; url: string } {
         if (parts.length < 2 || !key) return new Response("no key", { status: 400 });
         const ifMatch = req.headers.get("if-match");
         const ifNoneMatch = req.headers.get("if-none-match");
-        const storeKey = `${bucket}/${key}`;
+        const storeKey = key;
         const existing = objects.get(storeKey);
         if (ifNoneMatch === "*" && existing) return new Response("Precondition Failed", { status: 412 });
         if (ifMatch && (!existing || existing.etag.replace(/"/g, "") !== ifMatch.replace(/"/g, ""))) {
@@ -49,7 +49,7 @@ export function startFakeS3(port: number): { stop: () => void; url: string } {
           const prefix = join(bucket, url.searchParams.get("prefix") ?? "").replaceAll("\\", "/");
           const startAfter = url.searchParams.get("start-after") ?? "";
           const keys = [...objects.keys()]
-            .filter((k) => k.startsWith(prefix) && (!startAfter || k > join(bucket, startAfter).replaceAll("\\", "/")))
+            .filter((k) => k.startsWith(prefix) && (!startAfter || k > startAfter.replaceAll("\\", "/")))
             .sort();
           const xml =
             `<?xml version="1.0" encoding="UTF-8"?>\n<ListBucketResult>\n` +

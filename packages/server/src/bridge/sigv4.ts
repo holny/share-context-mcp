@@ -12,6 +12,10 @@ export interface SigV4Params {
   accessKeyId: string;
   secretAccessKey: string;
   body?: Uint8Array | string;
+  /** TEST-ONLY: fixed x-amz-date for known-answer tests. */
+  amzDate?: string;
+  /** Additional headers to sign (e.g. range), lowercase name → value. */
+  extraSignedHeaders?: Record<string, string>;
 }
 
 const sha256Hex = (data: Uint8Array | string): string => createHash("sha256").update(data).digest("hex");
@@ -19,7 +23,7 @@ const hmac = (key: Uint8Array | string, data: string): Buffer => createHmac("sha
 
 export function sigv4Headers(params: SigV4Params): Record<string, string> {
   const url = new URL(params.url);
-  const amzDate = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const amzDate = params.amzDate ?? new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
   const dateStamp = amzDate.slice(0, 8);
   const payloadHash = sha256Hex(params.body ?? "");
 
@@ -33,11 +37,15 @@ export function sigv4Headers(params: SigV4Params): Record<string, string> {
   const canonicalQuery = pairs.map(([k, v]) => `${k}=${v}`).join("&");
 
   const host = url.host;
-  const canonicalHeaders =
-    `host:${host}\n` +
-    `x-amz-content-sha256:${payloadHash}\n` +
-    `x-amz-date:${amzDate}\n`;
-  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  const headerMap: Record<string, string> = {
+    host: url.host,
+    "x-amz-content-sha256": payloadHash,
+    "x-amz-date": amzDate,
+    ...params.extraSignedHeaders,
+  };
+  const signedNames = Object.keys(headerMap).map((n) => n.toLowerCase()).sort();
+  const canonicalHeaders = signedNames.map((n) => `${n}:${headerMap[n]}\n`).join("");
+  const signedHeaders = signedNames.join(";");
 
   const canonicalRequest = [params.method, canonicalUri, canonicalQuery, canonicalHeaders, signedHeaders, payloadHash].join("\n");
 
