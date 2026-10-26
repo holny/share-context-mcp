@@ -51,10 +51,11 @@ export interface PollResult {
 }
 
 export interface ChannelBridge {
-  /** Create a channel and join it as `memberName`. Returns the human-shareable secret. */
-  createChannel(opts: { name?: string; memberName: string }): Promise<{ channelId: string; password: string }>;
-  /** Join an existing channel with a password (challenge → proof → token). */
-  join(channelId: string, password: string, memberName: string): Promise<void>;
+  /** Create a channel and join it as `memberName`. Returns the human-shareable secret.
+   * gitUrl (GitBridge only): the remote repo URL for this channel. */
+  createChannel(opts: { name?: string; memberName: string; gitUrl?: string }): Promise<{ channelId: string; password: string }>;
+  /** Join an existing channel with a password. gitUrl (GitBridge only): the remote repo URL. */
+  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string }): Promise<void>;
   /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
