@@ -1,5 +1,5 @@
 /**
- * Broadcaster — the local IPC bridge between the ChannelBackend transport and the
+ * Broadcaster — the local IPC bridge between the ChannelBridge transport and the
  * opencode companion plugin (spec §5.4). Per rejoinable channel it listens
  * for wake hints, polls the increment since the cursor (poll itself decrypts,
  * caches, and advances the cursor — coalescing NEVER gates the cursor),
@@ -23,7 +23,7 @@ import { mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ClaimMessage } from "@share-context-mcp/protocol";
-import type { PollResult } from "./backend/types";
+import type { PollResult } from "./bridge/types";
 import type { Store, SubscriptionFilter } from "./store";
 
 /** Statement text cap in digest lines (locked event format). */
@@ -31,8 +31,8 @@ const STATEMENT_MAX = 80;
 const DEFAULT_SOCKET_PATH = join(homedir(), ".share-context-mcp", "ipc.sock");
 const DEFAULT_WINDOW_MS = 2500;
 
-/** The slice of ChannelBackend the broadcaster needs (keeps tests fakes minimal). */
-export interface BroadcasterBackend {
+/** The slice of ChannelBridge the broadcaster needs (keeps tests fakes minimal). */
+export interface BroadcasterBridge {
   /**
    * markActivity is agent-scoped (Review F3): the broadcaster's background
    * poll is NOT agent activity and passes { markActivity: false } — marking
@@ -70,7 +70,7 @@ export interface BroadcasterOptions {
 
 export interface BroadcasterDeps {
   store: Store;
-  backend: BroadcasterBackend;
+  bridge: BroadcasterBridge;
 }
 
 export interface BroadcasterHandle {
@@ -188,7 +188,7 @@ export class Broadcaster {
     if (this.stopped || !this.deps || this.channels.has(channelId)) return;
     const state: ChannelState = { listener: null!, chain: Promise.resolve(), pending: null, pendingTimer: null, skipped: 0 };
     this.channels.set(channelId, state);
-    state.listener = this.deps.backend.listen(channelId, () => {
+    state.listener = this.deps.bridge.listen(channelId, () => {
       // Wake hint only (spec §5.7): the seq may be stale — poll since cursor.
       state.chain = state.chain
         .then(() => this.pollAndProcess(channelId, state))
@@ -208,10 +208,10 @@ export class Broadcaster {
   /** One serialized cycle: poll → filter → coalesce/emit. Cursor advances inside poll, before any filtering. */
   private async pollAndProcess(channelId: string, state: ChannelState): Promise<void> {
     if (this.stopped || !this.deps) return;
-    const { store, backend } = this.deps;
+    const { store, bridge } = this.deps;
     const since = store.getCursor(channelId);
     // Background consumption is not agent activity (Review F3): never mark.
-    const result = await backend.poll(channelId, since, { markActivity: false });
+    const result = await bridge.poll(channelId, since, { markActivity: false });
     state.skipped += result.skipped;
     const secret = store.getChannelSecret(channelId);
     if (!secret) return; // channel forgotten mid-flight — nothing to do

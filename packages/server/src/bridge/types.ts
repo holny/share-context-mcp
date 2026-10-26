@@ -1,6 +1,6 @@
 /**
- * ChannelBackend abstraction (spec §5.5): the storage seam behind the MCP tool layer.
- * The blind relay is the first implementation (RelayBackend); git/cloud-storage
+ * ChannelBridge abstraction (spec §5.5): the storage seam behind the MCP tool layer.
+ * The blind relay is the first implementation (RelayBridge); git/cloud-storage
  * backends are v2 candidates that plug in here with zero tool-layer changes.
  */
 import type { ClaimMessage } from "@share-context-mcp/protocol";
@@ -13,12 +13,12 @@ import type { TransportState, TransportTuning } from "../transport";
 export type ClaimInput = Omit<ClaimMessage, "idempotencyKey"> & { idempotencyKey?: string };
 
 /**
- * Handle for a live notification channel (backend.listen). The transport is
+ * Handle for a live notification channel (bridge.listen). The transport is
  * WS-first with automatic poll downgrade (spec §5.7); every notification it
  * fires is a wake hint, and the caller's poll-since-cursor is the correctness
  * source.
  */
-export interface BackendListener {
+export interface BridgeListener {
   /** Tear down the transport: clears every timer and closes the socket. Idempotent. */
   stop(): Promise<void>;
   /** Mark caller activity so poll mode uses the fast (active) interval (spec §5.8). */
@@ -50,7 +50,7 @@ export interface PollResult {
   skipped: number;
 }
 
-export interface ChannelBackend {
+export interface ChannelBridge {
   /** Create a channel and join it as `memberName`. Returns the human-shareable secret. */
   createChannel(opts: { name?: string; memberName: string }): Promise<{ channelId: string; password: string }>;
   /** Join an existing channel with a password (challenge → proof → token). */
@@ -65,7 +65,7 @@ export interface ChannelBackend {
    * onNotify(seq) is a WAKE HINT — respond by polling (channelId, cursor);
    * the seq may be stale or 0 in poll mode and must never gate correctness.
    */
-  listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): BackendListener;
+  listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): BridgeListener;
   meta(channelId: string): Promise<ChannelMeta>;
   /** Open a new epoch with a new password; invalidates all tokens (caller must re-join). */
   rotate(channelId: string, newPassword: string): Promise<void>;

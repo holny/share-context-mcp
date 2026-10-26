@@ -1,11 +1,11 @@
 /**
  * Transport state-machine tests (spec §5.7/§5.8, M2 task-2 brief Step 1):
- * backend.listen() WS-first auto downgrade against a REAL relay.
+ * bridge.listen() WS-first auto downgrade against a REAL relay.
  *
  * CORRECTNESS INVARIANT UNDER TEST (Review Focus #1): ZERO message loss
  * across any WS failure. The test's onNotify handler plays the Task-3
  * broadcaster role — it responds to every notification with
- * backend.poll(channelId, store cursor) — and the no-loss scenario drives
+ * bridge.poll(channelId, store cursor) — and the no-loss scenario drives
  * a WS drop, sends messages into the gap, and asserts the poll catch-up
  * delivers them before WS re-upgrade resumes realtime.
  */
@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
-import { RelayBackend } from "../src/backend/relay";
+import { RelayBridge } from "../src/bridge/relay";
 import { Store } from "../src/store";
 import { ChannelTransport } from "../src/transport";
 
@@ -23,14 +23,14 @@ import { ChannelTransport } from "../src/transport";
 // keep a WS alive pass wsDeathTimeoutMs ≥ 2×100ms explicitly.
 const PING_MS = 100;
 
-describe("backend.listen transport (ws-first auto downgrade)", () => {
+describe("bridge.listen transport (ws-first auto downgrade)", () => {
   let relay: RelayHandle;
   let baseUrl: string;
   /** Relay lifecycle dir (beforeAll/afterAll) and per-test store dir (beforeEach/afterEach). */
   let relayDir: string;
   let storeDir: string;
   let store: Store;
-  let backend: RelayBackend;
+  let bridge: RelayBridge;
   let ch: string;
   /** Listener opened by the current test; stopped in afterEach. */
   let currentListener: { stop(): Promise<void>; markActivity(): void; readonly state: "ws" | "poll"; closeForTest(): void } | null =
@@ -58,17 +58,17 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   // ---- helpers ----
 
-  /** Fresh backend + channel per test (fresh store dir per test). */
+  /** Fresh bridge + channel per test (fresh store dir per test). */
   async function freshChannel(): Promise<Store> {
     storeDir = mkdtempSync(join(tmpdir(), "scm-transport-store-"));
     store = new Store(join(storeDir, "state.db"));
-    backend = new RelayBackend({ baseUrl, store });
-    const created = await backend.createChannel({ memberName: "self" });
+    bridge = new RelayBridge({ baseUrl, store });
+    const created = await bridge.createChannel({ memberName: "self" });
     ch = created.channelId;
     return store;
   }
 
-  async function sendOk(statement: string, target: RelayBackend = backend, targetCh: string = ch): Promise<number> {
+  async function sendOk(statement: string, target: RelayBridge = bridge, targetCh: string = ch): Promise<number> {
     const v = validateClaim({
       statement,
       kind: "progress",
@@ -95,10 +95,10 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
   /**
    * Task-3-shaped notify handler: on EVERY notification poll since the
    * persisted cursor (the seq is only a wake hint — spec §5.7). Dedupes by
-   * seq so overlapping polls are absorbed. `ch`/`backend` are captured at
-   * call time (pass the channel + backend the listener belongs to).
+   * seq so overlapping polls are absorbed. `ch`/`bridge` are captured at
+   * call time (pass the channel + bridge the listener belongs to).
    */
-  function makeHandler(targetCh: string, targetBackend: RelayBackend, targetStore: Store): Handler {
+  function makeHandler(targetCh: string, targetBackend: RelayBridge, targetStore: Store): Handler {
     const delivered: ClaimMessage[] = [];
     const seen = new Set<number>();
     const notifyLog: NotifyRec[] = [];
@@ -133,8 +133,8 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   test("auto: WS-first — realtime notifications with relay seqs", async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
-    currentListener = backend.listen(ch, h.onNotify, { wsDeathTimeoutMs: 1000 });
+    const h = makeHandler(ch, bridge, store);
+    currentListener = bridge.listen(ch, h.onNotify, { wsDeathTimeoutMs: 1000 });
     await waitFor(() => currentListener!.state === "ws", 3000, "ws mode");
 
     expect(await sendOk("first")).toBe(1);
@@ -149,8 +149,8 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   test("NO-LOSS invariant: messages sent during a WS drop are caught up by poll, realtime resumes after re-upgrade", async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
-    currentListener = backend.listen(ch, h.onNotify, {
+    const h = makeHandler(ch, bridge, store);
+    currentListener = bridge.listen(ch, h.onNotify, {
       wsDeathTimeoutMs: 1000,
       probeIntervalMs: 150,
       pollActiveMs: 40,
@@ -187,7 +187,7 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
     // sees no frames at all — death detection must fire on its own
     const relay2 = await startRelay({ port: 0, dbPath: join(storeDir, "relay2.db"), pingIntervalMs: 0 });
     try {
-      const mb2 = new RelayBackend({ baseUrl: `http://127.0.0.1:${relay2.port}`, store });
+      const mb2 = new RelayBridge({ baseUrl: `http://127.0.0.1:${relay2.port}`, store });
       const created = await mb2.createChannel({ memberName: "quiet" });
       const ch2 = created.channelId;
       const h = makeHandler(ch2, mb2, store);
@@ -208,8 +208,8 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   test('mode "poll": pure timer — never touches WS', async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
-    currentListener = backend.listen(ch, h.onNotify, {
+    const h = makeHandler(ch, bridge, store);
+    currentListener = bridge.listen(ch, h.onNotify, {
       mode: "poll",
       pollActiveMs: 40,
       pollIdleMs: 40,
@@ -227,8 +227,8 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   test('mode "ws": never downgrades to poll, reconnects after a drop', async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
-    currentListener = backend.listen(ch, h.onNotify, {
+    const h = makeHandler(ch, bridge, store);
+    currentListener = bridge.listen(ch, h.onNotify, {
       mode: "ws",
       wsDeathTimeoutMs: 1000,
       probeIntervalMs: 100,
@@ -251,7 +251,7 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   test("auto: WS connect failure degrades to poll (standalone transport)", async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
+    const h = makeHandler(ch, bridge, store);
     // real relay, but the token never authenticates → every upgrade is rejected
     const t = new ChannelTransport({
       channelId: ch,
@@ -272,7 +272,7 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
 
   test("auto: a failed probe is rescheduled — probes retry across a sustained outage", async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
+    const h = makeHandler(ch, bridge, store);
     // unreachable port: initial connect fails → poll mode; the probe must
     // keep retrying every interval for the transport to ever re-upgrade
     // after an outage longer than one probe interval (I-1 regression).
@@ -295,10 +295,10 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
     }
   });
 
-  test("activity hook: markActivity() and backend.send() both pull the poll interval down to the active one", async () => {
+  test("activity hook: markActivity() and bridge.send() both pull the poll interval down to the active one", async () => {
     await freshChannel();
-    const h = makeHandler(ch, backend, store);
-    currentListener = backend.listen(ch, h.onNotify, {
+    const h = makeHandler(ch, bridge, store);
+    currentListener = bridge.listen(ch, h.onNotify, {
       mode: "poll",
       pollActiveMs: 40,
       pollIdleMs: 1500,
@@ -330,7 +330,7 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
   test("stop() clears all timers: no notifications afterwards, idempotent", async () => {
     await freshChannel();
     let after = 0;
-    const l = backend.listen(
+    const l = bridge.listen(
       ch,
       () => {
         after++;
