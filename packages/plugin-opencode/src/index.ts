@@ -14,7 +14,7 @@
  *   judged (an idle-boundary reset CAN: idle events are delivered
  *   asynchronously and raced the next turn's hooks in testing)
  *
- * Module contract (opencode v2 loader, core/src/plugin/module.ts): the
+ * Module contract (bocomcode_v2 loader, core/src/plugin/module.ts): the
  * default export must be { id, setup }. The plugin imports NOTHING from the
  * host — the promise-plugin Context is matched structurally, so this file
  * stays loadable as a local path plugin with a self-contained import graph.

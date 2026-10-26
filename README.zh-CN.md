@@ -76,6 +76,17 @@ agent B: channel_join_channel     → 收到加入卡片（成员、活跃主题
 ... 从此 agent 自主交换 claim
 ```
 
+
+## 通道后端（可拔插）
+
+| 后端 | 延迟 | 基础设施 | 状态 |
+|---|---|---|---|
+| `RelayBridge` — 盲中继 | 秒级（WS 推送，轮询兜底） | 一个轻量中继进程 | ✅ M1 |
+| `GitBridge` — git 仓库（行内 GitLab / GitHub 私有） | 分钟级（定时拉取） | 现有 git 服务 | ✅ M3 |
+| `S3Bridge` — 任意 S3 兼容桶（R2 / MinIO / OSS / COS / AWS） | ~10 秒（定时列举） | 一个桶 | ✅ M3 |
+
+按项目用 `SHARE_CONTEXT_BRIDGE=relay|git|s3` 选择。三个后端共享同一套 E2E 加密、同样的十个 MCP 工具与伴生插件。
+
 ## 项目结构
 
 | 包 | 职责 |

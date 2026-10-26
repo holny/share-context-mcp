@@ -150,10 +150,18 @@ Use this to start a collaboration space: one channel per project or workstream (
           .min(1)
           .max(32)
           .describe("Your member name on the channel, shown to teammates (must be unique per channel), e.g. \"alice\"."),
+        gitUrl: z
+          .string()
+          .optional()
+          .describe("GitBridge only: the git repo URL that backs this channel (one repo per channel; created via your git credentials)."),
+        s3: z
+          .record(z.unknown())
+          .optional()
+          .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
       },
     },
-    safe(async ({ name, memberName }) => {
-      const { channelId, password } = await bridge.createChannel({ name, memberName });
+    safe(async ({ name, memberName, gitUrl, s3 }) => {
+      const { channelId, password } = await bridge.createChannel({ name, memberName, gitUrl, s3 });
       setActiveChannel(store, channelId);
       onChannelJoined?.(channelId); // create joins implicitly — start broadcasting
       if (name) store.setKv(`channelName:${channelId}`, name);
@@ -179,10 +187,18 @@ Choose a stable member name your teammates will recognize — directed messages 
           .min(1)
           .max(32)
           .describe("Your member name, unique within the channel, e.g. \"bob\"."),
+        gitUrl: z
+          .string()
+          .optional()
+          .describe("GitBridge only: the git repo URL backing the channel."),
+        s3: z
+          .record(z.unknown())
+          .optional()
+          .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
       },
     },
-    safe(async ({ channelId, password, memberName }) => {
-      await bridge.join(channelId, password, memberName);
+    safe(async ({ channelId, password, memberName, gitUrl, s3 }) => {
+      await bridge.join(channelId, password, memberName, { gitUrl, s3 });
       setActiveChannel(store, channelId);
       onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
       // Join window (spec §5.6): the MOST RECENT ≤200 messages, not the oldest

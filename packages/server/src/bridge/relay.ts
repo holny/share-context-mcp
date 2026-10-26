@@ -195,7 +195,7 @@ export class RelayBridge implements ChannelBridge {
 
   // ---- ChannelBridge ----
 
-  async createChannel(opts: { name?: string; memberName: string }): Promise<{ channelId: string; password: string }> {
+  async createChannel(opts: { name?: string; memberName: string; gitUrl?: string }): Promise<{ channelId: string; password: string }> {
     // `name` is a local display label in v1; the blind relay stores no title.
     void opts.name;
     const channelId = generateChannelId();
@@ -221,7 +221,7 @@ export class RelayBridge implements ChannelBridge {
     return { channelId, password };
   }
 
-  async join(channelId: string, password: string, memberName: string): Promise<void> {
+  async join(channelId: string, password: string, memberName: string, _opts?: { gitUrl?: string }): Promise<void> {
     const key = deriveChannelKey(password, channelId);
     // On 401 the relay's error propagates verbatim BEFORE anything is persisted.
     try {
