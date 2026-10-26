@@ -36,50 +36,34 @@ SQLite store on the participant's machine (`SHARE_CONTEXT_DB_PATH`, default
 `~/.share-context-mcp/state.db`) and persists across sessions; the server
 auto-rejoins held channels on startup.
 
-### Configuring an opencode / bocomcode client
+### Configuring an opencode v2 client
 
-Save the snippet as **`bocomcode.json` in the project root** — this is the
-primary, spike-validated setup (each project points at the same relay but keeps
-its own entry). A global config also works, at the platform data root:
-`<data home>/<platform>/config/bocomcode.json` (or `.jsonc`), i.e.
-`~/.bocomcode/code/config/bocomcode.jsonc` by default; `BOCOMCODE_DATA_HOME`
-relocates the root (a dev checkout might use
-`~/.bocomcode-dev/code/config/bocomcode.jsonc`). If a global config is not
-picked up, check your platform's actual data root
-(`BOCOMCODE_DATA_HOME` / bocomcode channel) rather than assuming `~/.config`.
+Each agent's project config (`opencode.json` in the project root) needs the
+local MCP server plus the companion plugin:
 
 ```jsonc
 {
+  // Local MCP server (stdio) — one process per agent session.
   "mcp": {
     "servers": {
       "channel": {
         "type": "local",
         "codemode": false,
-        "command": ["bun", "/abs/path/to/share-context-mcp/packages/server/src/index.ts"],
+        "command": ["bun", "/absolute/path/to/share-context-mcp/packages/server/src/index.ts"],
         "environment": {
-          "SHARE_CONTEXT_RELAY_URL": "http://relay-host:8787"
+          "SHARE_CONTEXT_RELAY_URL": "http://127.0.0.1:8931",
+          "SHARE_CONTEXT_DB_PATH": "/absolute/path/to/agent-state.db"
         }
       }
     }
-  }
+  },
+  // Companion plugin (real-time digest injection).
+  "plugin": ["/absolute/path/to/share-context-mcp/packages/plugin-opencode"]
 }
 ```
 
-Notes:
-
-- Replace `/abs/path/to/share-context-mcp` with the repo checkout path; `bun`
-  runs the TypeScript source directly.
-- `codemode: false` keeps the ten channel tools as plain callable tools instead
-  of routing them through Code Mode.
-- With the server key `channel`, tools surface to the agent as
-  `channel_create_channel`, `channel_join_channel`, `channel_share_update`,
-  `channel_fetch_updates`, `channel_catch_up`, `channel_search_messages`,
-  `channel_set_subscription`, `channel_list_members`, `channel_leave_channel`,
-  `channel_rotate_password` (i.e. `<server key>_<tool name>`).
-- `SHARE_CONTEXT_DB_PATH` is optional (default `~/.share-context-mcp/state.db`).
-  Concurrent agent sessions on the same machine intentionally share one store.
-- Restart the client sessions after editing the config; the server process is
-  spawned per session and re-joins its channels automatically.
+Each agent gets its own `SHARE_CONTEXT_DB_PATH`. Tools surface as
+`channel_<tool>` (e.g. `channel_create_channel`, `channel_fetch_updates`).
 
 ## Manual smoke checklist (M1 gate, two real sessions)
 
