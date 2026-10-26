@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { INSTRUCTIONS } from "./instructions";
 import { buildMcpServer } from "./mcp";
+import { Broadcaster } from "./broadcaster";
 import { RelayMailbox } from "./mailbox/relay";
 import { Store } from "./store";
 
@@ -20,6 +21,8 @@ export type { Mailbox, MailboxMember, MailboxMeta, PollResult, ClaimInput } from
 export { buildMcpServer, TOOL_NAMES } from "./mcp";
 export { INSTRUCTIONS } from "./instructions";
 export type { McpServerDeps } from "./mcp";
+export { Broadcaster } from "./broadcaster";
+export type { BroadcasterHandle, BroadcasterOptions, DigestEvent, DigestLine } from "./broadcaster";
 
 export interface StdioStartOptions {
   relayUrl?: string;
@@ -40,6 +43,10 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
   const dbPath = options.dbPath ?? process.env.SHARE_CONTEXT_DB_PATH;
   const store = new Store(dbPath || undefined);
   const mailbox = new RelayMailbox({ baseUrl: relayUrl, store });
+  // Retained for the lifetime of the process: runtime joins register here and
+  // a future in-process shutdown path can call broadcaster.stop(). Null when
+  // the broadcaster failed to start (server continues without push).
+  let broadcaster: Broadcaster | null = null;
   for (const channelId of store.rejoinable()) {
     const secret = store.getChannelSecret(channelId);
     if (!secret) continue;
@@ -51,8 +58,47 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
       );
     }
   }
-  const server = buildMcpServer({ store, mailbox });
-  await server.connect(new StdioServerTransport());
+  const server = buildMcpServer({
+    store,
+    mailbox,
+    // Runtime joins (join_channel / create_channel) must start broadcasting —
+    // addChannel is idempotent, and channels joined before the broadcaster
+    // starts below are picked up by start() via store.rejoinable() anyway.
+    onChannelJoined: (channelId) => broadcaster?.addChannel(channelId),
+  });
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  // Server lifetime = stdio session. The broadcaster's socket server and WS
+  // listeners hold the event loop open, so without this the process would
+  // linger after the client closes the stream — hanging any transport.close()
+  // that waits for child exit (e.g. StdioClientTransport in tests), and
+  // spamming I/O errors after the test tmpdir is deleted. The SDK's onclose
+  // alone proved unreliable when the client destroys the streams, hence the
+  // stdin end/close + signal fallbacks all funneling into one exit.
+  const exit = () => {
+    void broadcaster?.stop();
+    process.exit(0);
+  };
+  transport.onclose = exit;
+  process.stdin.once("end", exit);
+  process.stdin.once("close", exit);
+  process.once("SIGTERM", exit);
+  process.once("SIGINT", exit);
+  // Local IPC broadcaster (spec §5.4): always started — with no plugin
+  // connected the events are simply unconsumed and the server keeps updating
+  // its cache regardless. Path override: SHARE_CONTEXT_IPC_SOCKET.
+  // Retained so runtime joins can register and shutdown can stop it.
+  try {
+    broadcaster = new Broadcaster({
+      socketPath: process.env.SHARE_CONTEXT_IPC_SOCKET || undefined,
+    });
+    await broadcaster.start({ store, mailbox });
+  } catch (err) {
+    broadcaster = null;
+    console.error(
+      `share-context-mcp: ipc broadcaster failed to start (server continues without push): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return server;
 }
 

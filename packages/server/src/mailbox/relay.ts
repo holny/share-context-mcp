@@ -22,7 +22,9 @@ import {
 } from "@share-context-mcp/protocol";
 import type { ClaimMessage } from "@share-context-mcp/protocol";
 import type { Store } from "../store";
-import type { ClaimInput, Mailbox, MailboxMember, MailboxMeta, PollResult } from "./types";
+import { ChannelTransport } from "../transport";
+import type { TransportTuning } from "../transport";
+import type { ClaimInput, Mailbox, MailboxListener, MailboxMember, MailboxMeta, PollResult } from "./types";
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -68,6 +70,8 @@ export class RelayMailbox implements Mailbox {
   private readonly tokens = new Map<string, string>();
   /** Default channel for the brief's `send(msg)` form; set on create/join. */
   private defaultChannelId: string | null = null;
+  /** Live listeners per channel, marked active by send/poll (spec §5.8). */
+  private readonly listeners = new Map<string, Set<ChannelTransport>>();
 
   constructor(opts: { baseUrl: string; store: Store }) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -258,7 +262,7 @@ export class RelayMailbox implements Mailbox {
     const validated = validateClaim(msg);
     if (!validated.ok) throw new Error(validated.reason);
     const envelope: SealedEnvelope = seal(validated.msg, this.channelKey(ch));
-    const res = await this.request(`/channels/${ch}/messages`, {
+    const res = (await this.request(`/channels/${ch}/messages`, {
       method: "POST",
       headers: { ...this.authHeaders(ch), "content-type": "application/json" },
       body: JSON.stringify({
@@ -266,11 +270,14 @@ export class RelayMailbox implements Mailbox {
         ciphertext: envelope.ciphertext,
         idemKey: validated.msg.idempotencyKey,
       }),
-    });
+    })) as { seq?: unknown; deduped?: unknown };
+    // A successful send is activity (spec §5.8): poll-mode listeners of this
+    // channel drop to the active interval.
+    this.markListeners(ch);
     return { seq: res.seq as number, deduped: res.deduped === true };
   }
 
-  async poll(channelId: string, since: number): Promise<PollResult> {
+  async poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult> {
     const data = (await this.request(`/channels/${channelId}/messages?since=${since}`, {
       method: "GET",
       headers: this.authHeaders(channelId),
@@ -310,7 +317,59 @@ export class RelayMailbox implements Mailbox {
     // rotate) must advance the cursor, or it would re-fetch forever and
     // permanently block every newer message behind it.
     this.store.recordCursorFromMessages(channelId, envelopes);
+    // A fetch is activity (spec §5.8) — usually triggered BY a listener's
+    // wake (already marked), but direct poll() calls count too. AGENT-SCOPED
+    // (Review F3): the broadcaster's background poll passes markActivity:
+    // false — self-marking would keep poll mode at the active pace forever.
+    if (opts?.markActivity !== false) this.markListeners(channelId);
     return { messages: out, skipped: envelopes.length - out.length };
+  }
+
+  /**
+   * Live notifications (spec §5.7): WS-first auto downgrade. The transport
+   * never pulls messages — onNotify is a wake hint and the CALLER polls
+   * (channelId, cursor). The token is resolved lazily per connect attempt so
+   * re-join (e.g. after rotate) is adopted without re-listen.
+   */
+  listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): MailboxListener {
+    if (!this.store.getChannelSecret(channelId)) throw new Error(`unknown channel: ${channelId}`);
+    const wsBase = this.baseUrl.replace(/^http/i, "ws");
+    const transport = new ChannelTransport({
+      channelId,
+      buildWsUrl: (token) => `${wsBase}/channels/${channelId}/ws?token=${encodeURIComponent(token)}`,
+      getToken: () => this.loadToken(channelId),
+      onNotify,
+      tuning,
+    });
+    let set = this.listeners.get(channelId);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(channelId, set);
+    }
+    set.add(transport);
+    transport.start();
+    const listeners = this.listeners;
+    return {
+      stop: async () => {
+        await transport.stop();
+        const s = listeners.get(channelId);
+        if (s) {
+          s.delete(transport);
+          if (s.size === 0) listeners.delete(channelId);
+        }
+      },
+      markActivity: () => transport.markActivity(),
+      get state() {
+        return transport.state;
+      },
+      closeForTest: () => transport.closeForTest(),
+    };
+  }
+
+  private markListeners(channelId: string): void {
+    const set = this.listeners.get(channelId);
+    if (!set) return;
+    for (const t of set) t.markActivity();
   }
 
   async meta(channelId: string): Promise<MailboxMeta> {

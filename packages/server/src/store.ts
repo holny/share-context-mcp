@@ -138,6 +138,14 @@ export interface ChannelSecretInput {
   cursor?: number;
 }
 
+export interface SubscriptionFilter {
+  kinds?: string[];
+  scopePrefix?: string;
+  topic?: string;
+}
+
+const SUBSCRIPTION_KEY_PREFIX = "subscription:";
+
 export class Store {
   private readonly db: Database;
   private readonly machineKey: Buffer;
@@ -229,8 +237,7 @@ export class Store {
       .run(
         ch.channelId,
         encryptSecret(this.machineKey, ch.password),
-        ch.memberName,
-        ch.epoch,
+        ch.memberName,        ch.epoch,
         ch.cursor ?? 0,
         new Date().toISOString(),
       );
@@ -384,6 +391,42 @@ export class Store {
     return rows.map(rowToClaim);
   }
 
+  /**
+   * Cached messages with since < seq <= until, ascending. Serves fetch_updates
+   * when the broadcaster (M2) already consumed a window: its poll cached the
+   * messages and advanced the cursor before the tool ran, so a relay poll
+   * returns empty while the content is locally available.
+   */
+  cachedRange(channelId: string, since: number, until: number): ClaimMessage[] {
+    const rows = this.db
+      .prepare(
+        `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
+         FROM messages WHERE channel_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC`,
+      )
+      .all(channelId, since, until) as MessageRow[];
+    return rows.map(rowToClaim);
+  }
+
+  /**
+   * Delivered cursor: the seq up to which fetch_updates has SERVED messages to
+   * this agent. Separate from the high-water cursor (which the broadcaster
+   * advances by consuming windows ahead of the agent) — fetch_updates serves
+   * cachedRange(delivered, highWater) and then moves delivered forward.
+   */
+  getDelivered(channelId: string): number {
+    const raw = this.getKv(`delivered:${channelId}`);
+    // Deliberately defaults to 0 (review F4 rejected): the join card only
+    // SUMMARIZES pre-join history (80 chars per topic) — the full messages of
+    // the join window are meant to be delivered by the first fetch_updates.
+    // An M1→M2 upgrade re-serves its cache once, bounded by SERVE_WINDOW.
+    const n = raw === null ? 0 : Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  setDelivered(channelId: string, seq: number): void {
+    this.setKv(`delivered:${channelId}`, String(seq));
+  }
+
   // ---- key-value scratch space (active channel, subscriptions, labels) ----
 
   /**
@@ -419,6 +462,27 @@ export class Store {
 
   deleteKv(key: string): void {
     this.db.prepare("DELETE FROM kvs WHERE key = ?").run(key);
+  }
+
+  // ---- subscriptions (consumed by the IPC broadcaster, spec §5.4) ----
+
+  /**
+   * Per-channel push filters, as set by the `set_subscription` tool. Null when
+   * no subscription was declared (the broadcaster then passes everything).
+   */
+  getSubscription(channelId: string): SubscriptionFilter[] | null {
+    const raw = this.getKv(SUBSCRIPTION_KEY_PREFIX + channelId);
+    if (raw === null) return null;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed as SubscriptionFilter[]) : null;
+    } catch {
+      return null; // corrupt entry — treat as absent
+    }
+  }
+
+  setSubscription(channelId: string, filters: SubscriptionFilter[]): void {
+    this.setKv(SUBSCRIPTION_KEY_PREFIX + channelId, JSON.stringify(filters));
   }
 
   /** Close the database (WAL checkpoints on close). */

@@ -64,12 +64,12 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
   });
 
-  async function makeAgent(label: string): Promise<Agent> {
+  async function makeAgent(label: string, opts: { onChannelJoined?: (channelId: string) => void } = {}): Promise<Agent> {
     const dir = mkdtempSync(join(tmpdir(), `scm-mcp-${label}-`));
     dirs.push(dir);
     const store = new Store(join(dir, "state.db"));
     const mailbox = new RelayMailbox({ baseUrl, store });
-    const server = buildMcpServer({ store, mailbox });
+    const server = buildMcpServer({ store, mailbox, onChannelJoined: opts.onChannelJoined });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: `test-${label}`, version: "0.0.0" });
     // Both ends must connect concurrently: client.connect() sends `initialize`
@@ -78,10 +78,30 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     return { client, store };
   }
 
+  test("onChannelJoined fires for create_channel and join_channel (broadcaster wiring)", async () => {
+    const joined: string[] = [];
+    const a = await makeAgent("a", { onChannelJoined: (id) => joined.push(id) });
+    const b = await makeAgent("b", { onChannelJoined: (id) => joined.push(id) });
+
+    const created = await a.client.callTool({
+      name: "create_channel",
+      arguments: { memberName: "a", name: "wire" },
+    });
+    const createdText = textOf(created);
+    const channelId = createdText.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = createdText.match(/password=([a-z0-9-]+)/)![1];
+    expect(joined).toEqual([channelId]); // create_channel joins implicitly
+
+    await b.client.callTool({
+      name: "join_channel",
+      arguments: { channelId, password, memberName: "b" },
+    });
+    expect(joined).toEqual([channelId, channelId]); // once per joining agent
+  });
+
   test("create → join card → share → fetch round trip", async () => {
     const a = await makeAgent("a");
     const b = await makeAgent("b");
-
     const created = await a.client.callTool({
       name: "create_channel",
       arguments: { memberName: "a", name: "demo" },

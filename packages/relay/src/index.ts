@@ -2,30 +2,70 @@
  * Blind relay entry point (spec §5.5): Bun.serve + SQLite.
  * The relay stores and forwards ENCRYPTED messages only — it never sees
  * plaintext (see routes.ts for the blindness rules).
+ *
+ * M2 task-1: WS push endpoint at GET /channels/:id/ws?token=<token>.
+ * Push frames are seq-only ({type, seq, epoch}); poll GET ?since= remains
+ * the correctness fallback (spec §5.7).
  */
 import { openDb } from "./db";
-import { createRelayHandler, jsonError } from "./routes";
+import { authenticateUpgradeToken, createRelayHandler, jsonError } from "./routes";
+import { createWsHub, type WsConnData } from "./ws";
+
+const DEFAULT_PING_INTERVAL_MS = 25_000;
 
 export interface RelayOptions {
   /** Port to listen on; 0 (default) picks an ephemeral port. */
   port?: number;
   /** SQLite file path; ":memory:" (default) for ephemeral instances. */
   dbPath?: string;
+  /**
+   * Server→client heartbeat interval in ms (spec §5.7: 25s default).
+   * 0 disables the heartbeat. Tests use a short interval to observe pings.
+   */
+  pingIntervalMs?: number;
 }
 
 export interface RelayHandle {
   /** The actual bound port (resolved when port 0 was requested). */
   port: number;
-  /** Stop the server and close the database. */
+  /** Stop the server (closing all WS connections) and close the database. */
   stop(): Promise<void>;
 }
 
 export async function startRelay(options: RelayOptions = {}): Promise<RelayHandle> {
   const db = openDb(options.dbPath ?? ":memory:");
-  const handle = createRelayHandler(db);
-  const server = Bun.serve({
+  const hub = createWsHub();
+  const handle = createRelayHandler(db, hub);
+  const stmtChannelInfo = db.prepare("SELECT epoch, next_seq FROM channels WHERE id = ?");
+
+  const server = Bun.serve<WsConnData>({
     port: options.port ?? 0,
-    fetch: async (req) => {
+    websocket: {
+      open(ws) {
+        const d = ws.data;
+        hub.add(d.channelId, ws);
+        // hello = last allocated seq (poll catch-up starts at since=seq).
+        const ch = stmtChannelInfo.get(d.channelId) as { next_seq: number } | undefined;
+        ws.send(JSON.stringify({ type: "hello", seq: (ch?.next_seq ?? 1) - 1 }));
+      },
+      message() {
+        // The push channel is server→client only; client frames are ignored
+        // (and the relay is blind to client content anyway).
+      },
+      close(ws) {
+        hub.remove(ws.data.channelId, ws);
+      },
+    },
+    fetch: async (req, server) => {
+      const url = new URL(req.url);
+      const wsMatch = url.pathname.match(/^\/channels\/([^/]+)\/ws\/?$/);
+      if (wsMatch && req.method === "GET") {
+        const identity = authenticateUpgradeToken(db, wsMatch[1], url.searchParams.get("token"));
+        if (!identity) return jsonError(401, "unauthorized");
+        const upgraded = server.upgrade(req, { data: identity });
+        if (!upgraded) return jsonError(400, "upgrade failed");
+        return undefined; // upgraded: fetch must not return a Response
+      }
       try {
         return await handle(req);
       } catch {
@@ -35,9 +75,16 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
       }
     },
   });
+
+  // Per-server heartbeat (not per-connection): one timer, cleared on stop().
+  const pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+  const pingTimer = pingIntervalMs > 0 ? setInterval(() => hub.pingAll(), pingIntervalMs) : null;
+
   return {
     port: server.port ?? 0,
     async stop() {
+      if (pingTimer) clearInterval(pingTimer);
+      hub.closeAll();
       server.stop(true);
       db.close();
     },

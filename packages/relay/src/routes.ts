@@ -14,6 +14,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import type { Database } from "bun:sqlite";
 import { hmacProof } from "@share-context-mcp/protocol";
 import type { ChannelRow, MemberRow } from "./db";
+import type { WsHub } from "./ws";
 
 // ---- tunables (spec §5.5: token TTL 24h default) ----
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
@@ -70,7 +71,7 @@ function validMemberName(v: unknown): v is string {
   return typeof v === "string" && v.trim().length >= 1 && v.trim().length <= MEMBER_NAME_MAX;
 }
 
-function isLiveToken(m: MemberRow, channel: ChannelRow, now: number): boolean {
+function isLiveToken(m: MemberRow, channel: { epoch: number }, now: number): boolean {
   return (
     m.token_hash !== null &&
     m.token_expires_at !== null &&
@@ -88,7 +89,7 @@ function bearerToken(req: Request): string | null {
 
 // ---- route factory ----
 
-export function createRelayHandler(db: Database): (req: Request) => Promise<Response> {
+export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) => Promise<Response> {
   // pending challenges, in-memory only: (channelId, memberName) → nonce
   const challenges = new Map<string, PendingChallenge>();
   const challengeKey = (channelId: string, memberName: string) => `${channelId}\n${memberName}`;
@@ -111,7 +112,10 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
   const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, nonce, ciphertext, idem_key, created_at) VALUES (?, ?, ?, ?, ?, ?)");
   const stmtMessageByIdem = db.prepare("SELECT seq FROM messages WHERE channel_id = ? AND idem_key = ?");
   const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
-  const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq");
+  // Returns the LIVE epoch alongside the allocated seq so push notifications
+  // are allocated atomically with the message (a concurrent rotate cannot
+  // split seq from its epoch).
+  const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
 
   /** Returns channel+member for a valid Bearer token, or null (caller answers 401). */
   function authenticate(channelId: string, req: Request): { channel: ChannelRow; member: MemberRow } | null {
@@ -141,22 +145,24 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
     return { ok: true, values };
   }
 
-  const storeMessage = db.transaction((channelId: string, nonce: string, ciphertext: string, idemKey: string): Response => {
-    const existing = stmtMessageByIdem.get(channelId, idemKey) as { seq: number } | undefined;
-    if (existing) {
-      return json({ seq: existing.seq, deduped: true });
-    }
-    // Allocate seq INSIDE the transaction (F-1): the channel row captured in
-    // authenticate() may be stale after the body-parse await point under
-    // concurrent sends; UPDATE ... RETURNING reads the live counter instead.
-    const allocated = stmtAllocSeq.get(channelId) as { seq: number } | undefined;
-    if (!allocated) {
-      // unreachable: channel existence verified in authenticate()
-      return jsonError(500, "internal error");
-    }
-    stmtInsertMessage.run(channelId, allocated.seq, nonce, ciphertext, idemKey, new Date().toISOString());
-    return json({ seq: allocated.seq, deduped: false });
-  });
+  const storeMessage = db.transaction(
+    (channelId: string, nonce: string, ciphertext: string, idemKey: string): { seq: number; epoch: number; deduped: boolean } => {
+      const existing = stmtMessageByIdem.get(channelId, idemKey) as { seq: number } | undefined;
+      if (existing) {
+        return { seq: existing.seq, epoch: 0, deduped: true };
+      }
+      // Allocate seq INSIDE the transaction (F-1): the channel row captured in
+      // authenticate() may be stale after the body-parse await point under
+      // concurrent sends; UPDATE ... RETURNING reads the live counter instead.
+      const allocated = stmtAllocSeq.get(channelId) as { seq: number; epoch: number } | undefined;
+      if (!allocated) {
+        // unreachable: channel existence verified in authenticate()
+        throw new Error("channel vanished mid-transaction");
+      }
+      stmtInsertMessage.run(channelId, allocated.seq, nonce, ciphertext, idemKey, new Date().toISOString());
+      return { seq: allocated.seq, epoch: allocated.epoch, deduped: false };
+    },
+  );
 
   async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -289,7 +295,14 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
           if (Buffer.from(ciphertext, "base64").length > MAX_CIPHERTEXT_BYTES) {
             return jsonError(413, "message too large: ciphertext must be at most 8192 bytes");
           }
-          return storeMessage(channelId, shape.values.nonce, ciphertext, shape.values.idemKey);
+          const stored = storeMessage(channelId, shape.values.nonce, ciphertext, shape.values.idemKey);
+          if (!stored.deduped) {
+            // Push-wake only (spec §5.7): notifications carry seq+epoch, never
+            // content. Dedup re-sends nothing (the original insert already
+            // notified); poll GET ?since= remains the correctness fallback.
+            wsHub?.notifyMessage(channelId, stored.seq, stored.epoch);
+          }
+          return json({ seq: stored.seq, deduped: stored.deduped });
         }
         if (method === "GET") {
           const auth = authenticate(channelId, req);
@@ -356,6 +369,10 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
         for (const k of challenges.keys()) {
           if (k.startsWith(`${channelId}\n`)) challenges.delete(k);
         }
+        // Evict live WS connections of this channel: one seq-free frame
+        // naming the new epoch, then a policy close. Old-epoch tokens cannot
+        // re-upgrade (auth check rejects them).
+        wsHub?.invalidateChannel(channelId, auth.channel.epoch + 1);
         return json({ epoch: auth.channel.epoch + 1 });
       }
     }
@@ -363,4 +380,31 @@ export function createRelayHandler(db: Database): (req: Request) => Promise<Resp
   }
 
   return handle;
+}
+
+// ---- WS upgrade auth (M2 task-1) ----
+
+/** Identity attached to an upgraded socket (server-side only, never pushed). */
+export interface UpgradeIdentity {
+  channelId: string;
+  memberName: string;
+  epoch: number;
+}
+
+/**
+ * Authenticate a WS-upgrade token from the `?token=` query param.
+ * Same rules as Bearer HTTP: sha256 lookup, TTL, epoch must match the
+ * channel's current epoch — so old-epoch tokens are rejected at upgrade.
+ */
+export function authenticateUpgradeToken(db: Database, channelId: string, token: string | null): UpgradeIdentity | null {
+  if (!token) return null;
+  const channel = db.prepare("SELECT id, epoch FROM channels WHERE id = ?").get(channelId) as
+    | Pick<ChannelRow, "id" | "epoch">
+    | undefined;
+  if (!channel) return null;
+  const member = db.prepare(
+    "SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND token_hash = ?",
+  ).get(channelId, sha256Hex(token)) as MemberRow | undefined;
+  if (!member || !isLiveToken(member, channel, Date.now())) return null;
+  return { channelId, memberName: member.name, epoch: channel.epoch };
 }
