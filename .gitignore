@@ -9,3 +9,4 @@ session-exit.txt
 probe-out.txt
 probe-err.txt
 probe-out.jsonl
+dist/
