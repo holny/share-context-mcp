@@ -60,8 +60,11 @@ alice: share_update(contract)
 ```bash
 bun install && bun test        # 158 个测试，tsc 干净
 
-# 1. 启动中继（双方都能访问的任意机器即可——局域网也行）
-bun packages/relay/src/index.ts --port 8931 --db relay.db
+# 构建两个单文件可执行程序（中继 + MCP server）
+scripts/build-binaries.sh      # → dist/bin/share-context-{relay,server}-<platform>
+
+# 2. 启动中继（双方都能访问的任意机器即可——局域网也行）
+./dist/bin/share-context-relay-darwin-arm64
 ```
 
 把每个 agent 指向本地 MCP server 与伴生插件——精确配置见
