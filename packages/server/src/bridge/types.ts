@@ -6,6 +6,17 @@
 import type { ClaimMessage } from "@share-context-mcp/protocol";
 import type { TransportState, TransportTuning } from "../transport";
 
+/** S3-compatible connection params (S3Bridge). Defined here so the ChannelBridge
+ * interface can accept them without depending on the s3 module. */
+export interface S3ConnectionParams {
+  endpoint: string;
+  bucket: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  prefix: string;
+}
+
 /**
  * Claim input to send(): the idempotency key is derived from
  * (statement, kind, topic) during validation, so callers need not precompute it.
@@ -53,9 +64,9 @@ export interface PollResult {
 export interface ChannelBridge {
   /** Create a channel and join it as `memberName`. Returns the human-shareable secret.
    * gitUrl (GitBridge only): the remote repo URL for this channel. */
-  createChannel(opts: { name?: string; memberName: string; gitUrl?: string }): Promise<{ channelId: string; password: string }>;
+  createChannel(opts: { name?: string; memberName: string; gitUrl?: string; s3?: S3ConnectionParams }): Promise<{ channelId: string; password: string }>;
   /** Join an existing channel with a password. gitUrl (GitBridge only): the remote repo URL. */
-  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string }): Promise<void>;
+  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;
   /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
