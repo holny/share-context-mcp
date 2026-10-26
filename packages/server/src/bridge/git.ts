@@ -66,9 +66,7 @@ export class GitBridge implements ChannelBridge {
 
   private keyFor(s: ChannelSecret, epoch = s.epoch): Uint8Array {
     const pw = epoch === s.epoch ? s.password : (s.priorPasswords.find((p) => p.epoch === epoch)?.password ?? s.password);
-    const k = deriveChannelKey(pw, `${s.channelId}/epoch/${epoch}`);
-    if (process.env.SCM_GIT_DEBUG) console.error(`[key] member=${s.memberName} epoch=${epoch} pw=${s.password.slice(0,8)}… pwLen=${pw.length} key=${Buffer.from(k).toString("hex").slice(0, 16)}`);
-    return k;
+    return deriveChannelKey(pw, `${s.channelId}/epoch/${epoch}`);
   }
 
   /** Write files, commit, push — with pull-rebase-retry on a racing push. */
@@ -206,13 +204,6 @@ export class GitBridge implements ChannelBridge {
     const s = this.secret(channelId);
     this.syncHead(s);
     const base = join(this.workCopy(channelId), `channels/${channelId}/messages`);
-    if (process.env.SCM_GIT_DEBUG) {
-      console.error("[gitpoll] workCopy:", this.workCopy(channelId));
-      try { console.error("[gitpoll] dirs:", readdirSync(base).join(",")); } catch (e) { console.error("[gitpoll] no base dir"); }
-      for (const d of readdirSync(base)) {
-        try { console.error(`[gitpoll] ${d}:`, readdirSync(join(base, d)).join(",")); } catch {}
-      }
-    }
     if (!existsSync(base)) return { messages: [], skipped: 0 };
     const out: ClaimMessage[] = [];
     let skipped = 0;
@@ -230,8 +221,7 @@ export class GitBridge implements ChannelBridge {
           const msg = sealOpen(JSON.parse(readFileSync(join(full, f), "utf8")), key);
           msg.seq = seq; // the filename carries the seq — the sealed payload has none
           out.push(msg);
-        } catch (e) {
-          console.error(`[gitpoll-FAIL] ${f}:`, e instanceof Error ? e.message.slice(0, 80) : e);
+        } catch {
           skipped++;
         }
       }

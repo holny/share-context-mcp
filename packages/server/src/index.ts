@@ -12,7 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { INSTRUCTIONS } from "./instructions";
 import { buildMcpServer } from "./mcp";
 import { Broadcaster } from "./broadcaster";
-import { createChannelBridge } from "./bridge/factory";
+import { createChannelBridge, resolveBridgeKind } from "./bridge/factory";
 import { Store } from "./store";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -39,7 +39,8 @@ export interface StdioStartOptions {
  * to stderr and skipped (the agent can join_channel manually).
  */
 export async function runStdioServer(options: StdioStartOptions = {}): Promise<McpServer> {
-  const bridgeKind = options.bridge ?? ((process.env.SHARE_CONTEXT_BRIDGE as "relay" | "git" | "s3" | undefined) ?? "relay");
+  // env-driven kind goes through the factory's validation (invalid values throw)
+  const bridgeKind = options.bridge ?? resolveBridgeKind();
   const relayUrl = options.relayUrl ?? process.env.SHARE_CONTEXT_RELAY_URL ?? "http://127.0.0.1:8931";
   if (bridgeKind === "relay" && !options.relayUrl && !process.env.SHARE_CONTEXT_RELAY_URL) {
     console.error("share-context-mcp: SHARE_CONTEXT_RELAY_URL is not set (relay bridge) — continuing with the default http://127.0.0.1:8931");
