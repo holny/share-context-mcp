@@ -66,6 +66,7 @@ const plugin = {
   async setup(ctx: PluginContext): Promise<(() => Promise<void>) | undefined> {
     // Env switch: SHARE_CONTEXT_PLUGIN=off disables everything (no hooks, no socket).
     const enabled = !["off", "0", "false", "no"].includes((process.env.SHARE_CONTEXT_PLUGIN ?? "").toLowerCase());
+    console.error(`share-context-mcp: plugin setup enabled=${enabled} socket=${process.env.SHARE_CONTEXT_IPC_SOCKET || DEFAULT_SOCKET_PATH}`);
     if (!enabled) return undefined;
 
     const socketPath = process.env.SHARE_CONTEXT_IPC_SOCKET || DEFAULT_SOCKET_PATH;

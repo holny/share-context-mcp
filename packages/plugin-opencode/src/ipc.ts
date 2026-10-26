@@ -87,6 +87,7 @@ export class IpcClient {
   private connect(): void {
     if (this.state === "stopped") return;
     this.stats_.attempts++;
+    console.error(`share-context-mcp: ipc connect attempt ${this.stats_.attempts} → ${this.opts.socketPath}`);
     const socket = net.connect(this.opts.socketPath);
     this.socket = socket;
     socket.setNoDelay(true);
