@@ -1,0 +1,15 @@
+node_modules
+*.db
+.superpowers/
+.opencode/
+.DS_Store
+session-out.txt
+session-err.txt
+session-exit.txt
+probe-out.txt
+probe-err.txt
+probe-out.jsonl
+.env
+.env.*
+*.sqlite
+*.sqlite3
