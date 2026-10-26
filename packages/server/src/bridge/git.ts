@@ -66,7 +66,9 @@ export class GitBridge implements ChannelBridge {
 
   private keyFor(s: ChannelSecret, epoch = s.epoch): Uint8Array {
     const pw = epoch === s.epoch ? s.password : (s.priorPasswords.find((p) => p.epoch === epoch)?.password ?? s.password);
-    return deriveChannelKey(pw, `${s.channelId}/epoch/${epoch}`);
+    const k = deriveChannelKey(pw, `${s.channelId}/epoch/${epoch}`);
+    if (process.env.SCM_GIT_DEBUG) console.error(`[key] member=${s.memberName} epoch=${epoch} pw=${s.password.slice(0,8)}… pwLen=${pw.length} key=${Buffer.from(k).toString("hex").slice(0, 16)}`);
+    return k;
   }
 
   /** Write files, commit, push — with pull-rebase-retry on a racing push. */
@@ -138,7 +140,11 @@ export class GitBridge implements ChannelBridge {
   }
 
   async join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string }): Promise<void> {
-    const url = opts?.gitUrl ?? this.secrets.get(channelId)?.gitUrl;
+    // Retain older-epoch knowledge (spec §5.5): a re-joining member keeps
+    // reading epochs it held keys for.
+    const existing = this.secrets.get(channelId);
+    const priorPasswords: Array<{ epoch: number; password: string }> = existing ? [...existing.priorPasswords] : [];
+    const url = opts?.gitUrl ?? existing?.gitUrl;
     if (!url) throw new Error("GitBridge.join requires gitUrl for a channel not yet known locally");
     const cwd = this.workCopy(channelId);
     rmSync(cwd, { recursive: true, force: true });
@@ -147,10 +153,11 @@ export class GitBridge implements ChannelBridge {
     this.git(cwd, ["remote", "add", "origin", url]);
     const pull = spawnSync("git", ["pull", "origin", "main"], { cwd, encoding: "utf8" });
     if (pull.status !== 0) throw new Error("join failed: cannot read the channel repo (check gitUrl and git credentials)");
-    const secret: ChannelSecret = { channelId, password, memberName, epoch: 1, gitUrl: url, priorPasswords: [] };
-    this.secrets.set(channelId, secret);
     const headPath = join(cwd, `channels/${channelId}/state/head.json`);
-    if (existsSync(headPath)) secret.epoch = (JSON.parse(readFileSync(headPath, "utf8")) as { epoch: number }).epoch;
+    const epoch = existsSync(headPath) ? (JSON.parse(readFileSync(headPath, "utf8")) as { epoch: number }).epoch : 1;
+    if (existing && existing.epoch < epoch) priorPasswords.push({ epoch: existing.epoch, password: existing.password });
+    const secret: ChannelSecret = { channelId, password, memberName, epoch, gitUrl: url, priorPasswords };
+    this.secrets.set(channelId, secret);
     const membersPath = join(cwd, `channels/${channelId}/members.json`);
     const members = existsSync(membersPath) ? (JSON.parse(readFileSync(membersPath, "utf8")) as ChannelMember[]) : [];
     if (!members.some((m) => m.memberName === memberName)) {
@@ -199,6 +206,13 @@ export class GitBridge implements ChannelBridge {
     const s = this.secret(channelId);
     this.syncHead(s);
     const base = join(this.workCopy(channelId), `channels/${channelId}/messages`);
+    if (process.env.SCM_GIT_DEBUG) {
+      console.error("[gitpoll] workCopy:", this.workCopy(channelId));
+      try { console.error("[gitpoll] dirs:", readdirSync(base).join(",")); } catch (e) { console.error("[gitpoll] no base dir"); }
+      for (const d of readdirSync(base)) {
+        try { console.error(`[gitpoll] ${d}:`, readdirSync(join(base, d)).join(",")); } catch {}
+      }
+    }
     if (!existsSync(base)) return { messages: [], skipped: 0 };
     const out: ClaimMessage[] = [];
     let skipped = 0;
@@ -216,7 +230,8 @@ export class GitBridge implements ChannelBridge {
           const msg = sealOpen(JSON.parse(readFileSync(join(full, f), "utf8")), key);
           msg.seq = seq; // the filename carries the seq — the sealed payload has none
           out.push(msg);
-        } catch {
+        } catch (e) {
+          console.error(`[gitpoll-FAIL] ${f}:`, e instanceof Error ? e.message.slice(0, 80) : e);
           skipped++;
         }
       }

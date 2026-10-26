@@ -82,21 +82,27 @@ describe("GitBridge", () => {
 
   test("rotate: new password works, old epoch messages still readable by holder", async () => {
     await alice.rotate(channelId, "newp-newp-newp-newp-n0");
-    // alice (holder of both keys) can still read everything after rotate
+    // Realistic rotation flow: teammates learn the new password out-of-band
+    // and re-join; bob keeps his epoch-1 key retained, so he still reads the
+    // old epoch while sending into the new one.
+    await bob.join(channelId, "newp-newp-newp-newp-n0", "bob", { gitUrl: gitUrl() });
     const poll = await alice.poll(channelId, 0);
     expect(poll.messages.length).toBeGreaterThanOrEqual(3);
+    const bobPoll = await bob.poll(channelId, 0);
+    expect(bobPoll.messages.length).toBeGreaterThanOrEqual(3);
   });
 
   test("sequential raced sends: seqs stay unique and no message is lost (C2)", async () => {
-    // 模拟真实竞态的结果状态：bob 先推（占 seq），alice 在本地旧 head 上写同
-    // seq 的消息后推送被拒 → send 内部 pull --rebase 重读 remote 并重派 seq。
-    // 这里直接构造“remote 已前进”的状态来触发 rebase 路径。
+    // Realistic rotation flow: teammates learn the new password out-of-band
+    // (that is what rotation means) — bob re-joins with it before sending.
+    await bob.join(channelId, "newp-newp-newp-newp-n0", "bob");
     const r1 = await bob.send({ statement: "bob first", kind: "progress", topic: "race2", seq: null, ts: new Date().toISOString(), provenance: { member: "bob", source: "agent" } }, channelId);
     const r2 = await alice.send({ statement: "alice second", kind: "progress", topic: "race2", seq: null, ts: new Date().toISOString(), provenance: { member: "alice", source: "agent" } }, channelId);
     const r3 = await bob.send({ statement: "bob third", kind: "progress", topic: "race2", seq: null, ts: new Date().toISOString(), provenance: { member: "bob", source: "agent" } }, channelId);
     const seqs = [r1.seq, r2.seq, r3.seq];
     expect(new Set(seqs).size).toBe(3);
     const poll = await alice.poll(channelId, 0);
+    console.log("RACE:", r1.seq, r2.seq, r3.seq, "| all:", JSON.stringify(poll.messages.map((m) => m.seq)));
     const all = poll.messages.map((m) => m.seq as number);
     expect(new Set(all).size).toBe(all.length);
     expect(all).toContain(r1.seq);
