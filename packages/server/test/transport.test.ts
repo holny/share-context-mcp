@@ -270,6 +270,31 @@ describe("mailbox.listen transport (ws-first auto downgrade)", () => {
     }
   });
 
+  test("auto: a failed probe is rescheduled — probes retry across a sustained outage", async () => {
+    await freshChannel();
+    const h = makeHandler(ch, mailbox, store);
+    // unreachable port: initial connect fails → poll mode; the probe must
+    // keep retrying every interval for the transport to ever re-upgrade
+    // after an outage longer than one probe interval (I-1 regression).
+    const t = new ChannelTransport({
+      channelId: ch,
+      buildWsUrl: () => "ws://127.0.0.1:1/unreachable/ws",
+      getToken: () => "some-token",
+      onNotify: h.onNotify,
+      tuning: { pollActiveMs: 40, pollIdleMs: 40, probeIntervalMs: 100 },
+    });
+    t.start();
+    try {
+      await waitFor(() => t.state === "poll", 3000, "degrade on unreachable relay");
+      await waitFor(() => t.probeAttempts >= 2, 3000, "at least two probe attempts");
+      // sustained outage: attempts keep growing well past the first probe
+      await new Promise((r) => setTimeout(r, 400));
+      expect(t.probeAttempts).toBeGreaterThanOrEqual(3);
+    } finally {
+      await t.stop();
+    }
+  });
+
   test("activity hook: markActivity() and mailbox.send() both pull the poll interval down to the active one", async () => {
     await freshChannel();
     const h = makeHandler(ch, mailbox, store);

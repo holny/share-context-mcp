@@ -89,6 +89,8 @@ export class ChannelTransport {
   private stopped = false;
   /** True only while a probe connect is in flight (probe failure keeps poll running). */
   private probing = false;
+  /** TEST-ONLY diagnostic: how many re-upgrade probes have been attempted. */
+  private _probeAttempts = 0;
   /** Last seq seen on the wire (hello/message) — the wake hint in poll mode. */
   private lastSeq = 0;
   private lastActivity = Date.now();
@@ -117,6 +119,11 @@ export class ChannelTransport {
   /** Current static leg: "ws" | "poll" (spec §5.7). */
   get state(): TransportState {
     return this._state;
+  }
+
+  /** TEST-ONLY: number of re-upgrade probe connect attempts so far. */
+  get probeAttempts(): number {
+    return this._probeAttempts;
   }
 
   start(): void {
@@ -180,7 +187,18 @@ export class ChannelTransport {
       return;
     }
     this.probing = why === "probe";
-    const ws = new WebSocket(this.buildWsUrl(token));
+    if (why === "probe") this._probeAttempts++;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(this.buildWsUrl(token));
+    } catch (err) {
+      // A synchronous throw (e.g. invalid URL) must not surface unhandled
+      // from a timer callback — route it through the same failure path as
+      // async connect errors (M-3).
+      this.log(`ws construct failed (${why}): ${err instanceof Error ? err.message : String(err)}`);
+      this.failConnect(why);
+      return;
+    }
     this.ws = ws;
     ws.addEventListener("open", () => this.handleOpen(ws, why));
     ws.addEventListener("message", (ev) => this.handleMessage(ws, ev));
@@ -249,17 +267,29 @@ export class ChannelTransport {
     this.ws = null;
     this.clearDeathTimer();
     if (this.stopped) return;
+    this.failConnect(why);
+  }
+
+  /**
+   * Single funnel for every connect failure (async close or sync throw):
+   * "ws" mode reconnects; a failed PROBE must stay in poll AND reschedule
+   * the next probe (I-1 — without this, one probe per poll episode leaves
+   * the transport permanently degraded after any outage longer than one
+   * probe interval); any other auto-mode failure enters poll mode.
+   */
+  private failConnect(why: "initial" | "probe" | "retry"): void {
     if (this.mode === "ws") {
-      this.log(`ws closed (${why}) — reconnecting`);
+      this.log(`ws lost (${why}) — reconnecting`);
       this.scheduleRetry();
       return;
     }
     if (this.probing) {
       this.probing = false;
-      this.log(`ws probe failed (${why}) — staying in poll`);
+      this.log(`ws probe failed (${why}) — staying in poll, probe rescheduled`);
+      this.scheduleProbe();
       return; // poll timer untouched
     }
-    this.enterPoll(`ws closed (${why})`);
+    this.enterPoll(`ws lost (${why})`);
   }
 
   private armDeathTimer(): void {
@@ -304,6 +334,9 @@ export class ChannelTransport {
   }
 
   private schedulePoll(delayMs: number): void {
+    // stop() may run from inside onNotify (the poll-tick callback reschedules
+    // after safeNotify returns) — never leave a stray timer behind (M-1).
+    if (this.stopped) return;
     if (this.pollTimer !== null) clearTimeout(this.pollTimer);
     this.pollDeadline = Date.now() + delayMs;
     this.pollTimer = setTimeout(() => {

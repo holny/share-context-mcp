@@ -286,7 +286,8 @@ describe("relay websocket push", () => {
     expect(await s.opened).toBe(false);
   });
 
-  test("cross-channel isolation: sends on channel B do not reach channel A sockets", async () => {    const a = await setupChannel();
+  test("cross-channel isolation: sends on channel B do not reach channel A sockets", async () => {
+    const a = await setupChannel();
     const b = await setupChannel();
     const sA = new WsSession(`${wsBase}/channels/${a.channelId}/ws?token=${encodeURIComponent(a.token)}`);
     try {
