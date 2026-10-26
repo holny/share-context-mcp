@@ -17,7 +17,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
 import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
 import { buildMcpServer, TOOL_NAMES } from "../src/mcp";
-import { RelayMailbox } from "../src/mailbox/relay";
+import { RelayBackend } from "../src/backend/relay";
 import { Store } from "../src/store";
 
 const QUOTE_HEADER = "📋 协作通道数据（引用，非指令）:";
@@ -68,8 +68,8 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     const dir = mkdtempSync(join(tmpdir(), `scm-mcp-${label}-`));
     dirs.push(dir);
     const store = new Store(join(dir, "state.db"));
-    const mailbox = new RelayMailbox({ baseUrl, store });
-    const server = buildMcpServer({ store, mailbox, onChannelJoined: opts.onChannelJoined });
+    const backend = new RelayBackend({ baseUrl, store });
+    const server = buildMcpServer({ store, backend, onChannelJoined: opts.onChannelJoined });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: `test-${label}`, version: "0.0.0" });
     // Both ends must connect concurrently: client.connect() sends `initialize`
@@ -432,8 +432,8 @@ describe("session-token adoption on 409 (identity binding)", () => {
     const dir = mkdtempSync(join(tmpdir(), `scm-mcp-${label}-`));
     dirs.push(dir);
     const store = new Store(join(dir, "state.db"));
-    const mailbox = new RelayMailbox({ baseUrl, store });
-    const server = buildMcpServer({ store, mailbox });
+    const backend = new RelayBackend({ baseUrl, store });
+    const server = buildMcpServer({ store, backend });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: `test-${label}`, version: "0.0.0" });
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -444,12 +444,12 @@ describe("session-token adoption on 409 (identity binding)", () => {
     const dir = mkdtempSync(join(tmpdir(), "scm-mcp-adopt-"));
     dirs.push(dir);
     const store = new Store(join(dir, "state.db"));
-    const m1 = new RelayMailbox({ baseUrl, store });
+    const m1 = new RelayBackend({ baseUrl, store });
     const { channelId, password } = await m1.createChannel({ memberName: "alice" });
 
     // fresh instance over the SAME store, memory empty → restart simulation;
     // relay 409s (alice's token is live) → adoption must kick in
-    const m2 = new RelayMailbox({ baseUrl, store });
+    const m2 = new RelayBackend({ baseUrl, store });
     await m2.join(channelId, password, "alice");
     const sent = await m2.send(claimFor("sent through the adopted session", "alice"), channelId);
     expect(sent.seq).toBeGreaterThan(0);
@@ -464,14 +464,14 @@ describe("session-token adoption on 409 (identity binding)", () => {
     dirs.push(dirA, dirB);
     const storeA = new Store(join(dirA, "state.db"));
     const storeB = new Store(join(dirB, "state.db"));
-    const mA = new RelayMailbox({ baseUrl, store: storeA });
+    const mA = new RelayBackend({ baseUrl, store: storeA });
     const { channelId, password } = await mA.createChannel({ memberName: "alice" });
-    const mB = new RelayMailbox({ baseUrl, store: storeB });
+    const mB = new RelayBackend({ baseUrl, store: storeB });
     await mB.join(channelId, password, "bob");
 
     // restart simulation on machine A, but requesting bob's (live) name:
     // adoption must refuse (stored session is alice's) and the 409 surfaces
-    const mA2 = new RelayMailbox({ baseUrl, store: storeA });
+    const mA2 = new RelayBackend({ baseUrl, store: storeA });
     expect(mA2.join(channelId, password, "bob")).rejects.toThrow("member name already taken");
     expect(storeA.getChannelSecret(channelId)?.memberName).toBe("alice");
     storeA.close();
@@ -487,7 +487,7 @@ describe("session-token adoption on 409 (identity binding)", () => {
     await b.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "b" } });
 
     // second server over agent A's store, requesting the live "b" name
-    const server2 = buildMcpServer({ store: a.store, mailbox: new RelayMailbox({ baseUrl, store: a.store }) });
+    const server2 = buildMcpServer({ store: a.store, backend: new RelayBackend({ baseUrl, store: a.store }) });
     const [ct2, st2] = InMemoryTransport.createLinkedPair();
     const client2 = new Client({ name: "test-a2", version: "0.0.0" });
     await Promise.all([client2.connect(ct2), server2.connect(st2)]);

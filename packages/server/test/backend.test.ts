@@ -1,6 +1,6 @@
 /**
- * RelayMailbox integration tests (task-4 brief Step 1): run a REAL relay on an
- * ephemeral port, drive two independent mailbox instances (store A / store B)
+ * RelayBackend integration tests (task-4 brief Step 1): run a REAL relay on an
+ * ephemeral port, drive two independent backend instances (store A / store B)
  * through create → join → send → poll, plus failure paths (wrong password,
  * duplicate member, validation, rotate epoch transition).
  */
@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
 import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
-import { RelayMailbox } from "../src/mailbox/relay";
+import { RelayBackend } from "../src/backend/relay";
 import { Store } from "../src/store";
 
 function claim(statement: string, member: string, extra: Record<string, unknown> = {}): ClaimMessage {
@@ -25,15 +25,15 @@ function claim(statement: string, member: string, extra: Record<string, unknown>
   return result.msg;
 }
 
-describe("RelayMailbox against a real relay", () => {
+describe("RelayBackend against a real relay", () => {
   let relay: RelayHandle;
   let baseUrl: string;
   let dirA: string;
   let dirB: string;
   let storeA: Store;
   let storeB: Store;
-  let mbA: RelayMailbox;
-  let mbB: RelayMailbox;
+  let mbA: RelayBackend;
+  let mbB: RelayBackend;
 
   beforeEach(async () => {
     relay = await startRelay({ port: 0 });
@@ -42,8 +42,8 @@ describe("RelayMailbox against a real relay", () => {
     dirB = mkdtempSync(join(tmpdir(), "scm-mb-b-"));
     storeA = new Store(join(dirA, "state.db"));
     storeB = new Store(join(dirB, "state.db"));
-    mbA = new RelayMailbox({ baseUrl, store: storeA });
-    mbB = new RelayMailbox({ baseUrl, store: storeB });
+    mbA = new RelayBackend({ baseUrl, store: storeA });
+    mbB = new RelayBackend({ baseUrl, store: storeB });
   });
 
   afterEach(async () => {
@@ -101,7 +101,7 @@ describe("RelayMailbox against a real relay", () => {
 
     const storeC = new Store(join(mkdtempSync(join(tmpdir(), "scm-mb-c-")), "state.db"));
     try {
-      const mbC = new RelayMailbox({ baseUrl, store: storeC });
+      const mbC = new RelayBackend({ baseUrl, store: storeC });
       await expect(mbC.join(channelId, password, "b")).rejects.toThrow("member name already taken");
       expect(storeC.listChannels()).toEqual([]);
     } finally {
@@ -217,7 +217,7 @@ describe("RelayMailbox against a real relay", () => {
     const dirC = mkdtempSync(join(tmpdir(), "scm-mb-c1-"));
     const storeC = new Store(join(dirC, "state.db"));
     try {
-      const mbC = new RelayMailbox({ baseUrl, store: storeC });
+      const mbC = new RelayBackend({ baseUrl, store: storeC });
       await mbC.join(channelId, "brand-new-password", "c");
 
       // page cap: the relay returns at most 200 envelopes per window. Page 1
