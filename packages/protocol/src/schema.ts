@@ -72,7 +72,7 @@ export const CREDENTIAL_PATTERNS: CredentialPattern[] = [
   { pattern: /AKIA[0-9A-Z]{16}/, label: "AWS access key" },
   { pattern: /gh[ps]_[A-Za-z0-9]{20,}/, label: "GitHub token" },
   { pattern: /github_pat_[A-Za-z0-9_]{20,}/, label: "GitHub token" },
-  { pattern: /sk-[A-Za-z0-9]{16,}/, label: "generic secret key" },
+  { pattern: /sk-[A-Za-z0-9][A-Za-z0-9_-]{15,}/, label: "generic secret key" },
 ];
 
 export function idempotencyKey(statement: string, kind: ClaimKind, topic: string): string {

@@ -36,7 +36,7 @@ export interface IpcClientOptions {
 export class IpcClient {
   private readonly opts: Required<Pick<IpcClientOptions, "socketPath" | "onEvent">> & IpcClientOptions;
   private socket: net.Socket | null = null;
-  private buffer = "";
+  private bufferBytes: Buffer | null = null;
   private attempt = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private state: "stopped" | "connecting" | "connected" | "reconnecting" = "stopped";
@@ -81,7 +81,7 @@ export class IpcClient {
       this.socket.destroy();
       this.socket = null;
     }
-    this.buffer = "";
+    this.bufferBytes = null;
   }
 
   private connect(): void {
@@ -95,22 +95,26 @@ export class IpcClient {
       if (this.socket !== socket) return;
       if (this.attempt > 0) this.stats_.reconnects++;
       this.attempt = 0;
-      this.buffer = "";
+      this.bufferBytes = null;
       this.setState("connected");
     });
     socket.on("data", (chunk: Buffer) => {
-      this.buffer += chunk.toString("utf8");
+      // Byte-level line buffering (OCR review): decoding each chunk
+      // independently corrupts multi-byte UTF-8 characters that span chunk
+      // boundaries — accumulate bytes and decode only complete lines.
+      this.bufferBytes = this.bufferBytes ? Buffer.concat([this.bufferBytes, chunk]) : chunk;
       let idx: number;
-      while ((idx = this.buffer.indexOf("\n")) >= 0) {
-        const line = this.buffer.slice(0, idx).trim();
-        this.buffer = this.buffer.slice(idx + 1);
+      while ((idx = this.bufferBytes.indexOf(0x0a)) >= 0) {
+        const lineBytes = this.bufferBytes.subarray(0, idx);
+        this.bufferBytes = this.bufferBytes.subarray(idx + 1);
+        const line = lineBytes.toString("utf8").trim();
         if (line) this.handleLine(line);
       }
     });
     const retry = () => {
       if (this.socket !== socket) return; // superseded or stopped
       this.socket = null;
-      this.buffer = "";
+      this.bufferBytes = null;
       if (this.state === "stopped") return;
       this.setState("reconnecting");
       const delay = nextBackoffMs(this.attempt, this.opts.backoff) + Math.floor(Math.random() * nextBackoffMs(this.attempt, this.opts.backoff) * 0.25);

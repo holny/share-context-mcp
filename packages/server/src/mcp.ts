@@ -45,6 +45,12 @@ export interface McpServerDeps {
    * Broadcaster.addChannel so runtime joins start broadcasting immediately.
    */
   onChannelJoined?: (channelId: string) => void;
+  /**
+   * Called when a tool leaves a channel (leave_channel). The stdio entrypoint
+   * wires this to Broadcaster.removeChannel so the plugin stops receiving
+   * events for channels the agent has left.
+   */
+  onChannelLeft?: (channelId: string) => void;
 }
 
 /** Wrap channel content in the injection-defense reference block. */
@@ -123,7 +129,7 @@ const channelIdParam = {
 };
 
 export function buildMcpServer(deps: McpServerDeps): McpServer {
-  const { store, mailbox, onChannelJoined } = deps;
+  const { store, mailbox, onChannelJoined, onChannelLeft } = deps;
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
 
   // ---- create_channel ----
@@ -446,6 +452,7 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
     safe(async ({ channelId }) => {
       const ch = resolveChannel(store, channelId);
       await mailbox.leave(ch);
+      onChannelLeft?.(ch); // detach from the broadcaster — plugin stops receiving
       store.deleteKv(`subscription:${ch}`);
       store.deleteKv(`channelName:${ch}`);
       if (store.getKv(ACTIVE_CHANNEL_KEY) === ch) store.deleteKv(ACTIVE_CHANNEL_KEY);

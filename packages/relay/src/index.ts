@@ -40,6 +40,14 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
 
   const server = Bun.serve<WsConnData>({
     port: options.port ?? 0,
+    // Bun.serve's default idleTimeout (10s) applies to upgraded WebSocket
+    // sockets too and would kill connections during the 25s heartbeat gap —
+    // hold connections well beyond the heartbeat interval (Bun counts this
+    // option in SECONDS, hard-capped at 255).
+    idleTimeout: Math.min(
+      255,
+      Math.max(60, ((options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS) / 1000) * 3),
+    ),
     websocket: {
       open(ws) {
         const d = ws.data;

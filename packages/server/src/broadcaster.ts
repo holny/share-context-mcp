@@ -104,7 +104,7 @@ function buildLine(msg: ClaimMessage): DigestLine {
     seq: typeof msg.seq === "number" ? msg.seq : 0,
     kind: msg.kind,
     topic: sanitizeLineText(msg.topic),
-    from: msg.provenance.member,
+    from: sanitizeLineText(msg.provenance.member),
     statement: "",
   };
   // Sanitize BEFORE truncating so the cap applies to what is actually sent.
@@ -194,6 +194,15 @@ export class Broadcaster {
         .then(() => this.pollAndProcess(channelId, state))
         .catch((err) => console.error(`share-context-mcp: broadcaster poll failed for ${channelId}: ${err instanceof Error ? err.message : String(err)}`));
     });
+  }
+
+  /** Stop listening on a channel left via leave_channel (OCR review: leave must detach). */
+  removeChannel(channelId: string): void {
+    const state = this.channels.get(channelId);
+    if (!state) return;
+    this.channels.delete(channelId);
+    if (state.pendingTimer) clearTimeout(state.pendingTimer);
+    void state.listener.stop();
   }
 
   /** One serialized cycle: poll → filter → coalesce/emit. Cursor advances inside poll, before any filtering. */

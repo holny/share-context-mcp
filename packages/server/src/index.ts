@@ -65,6 +65,7 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
     // addChannel is idempotent, and channels joined before the broadcaster
     // starts below are picked up by start() via store.rejoinable() anyway.
     onChannelJoined: (channelId) => broadcaster?.addChannel(channelId),
+    onChannelLeft: (channelId) => broadcaster?.removeChannel(channelId),
   });
   const transport = new StdioServerTransport();
   await server.connect(transport);

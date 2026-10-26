@@ -110,25 +110,38 @@ const plugin = {
     // ---- tool hooks (piggyback + action tracking) ----
     await ctx.tool.hook("execute.before", (event) => {
       lastActiveSessionID = event.sessionID;
-      const state = stateFor(event.sessionID);
-      if (isShareTool(event.tool)) state.sharedThisTurn = true;
+      stateFor(event.sessionID);
+      // NOTE (OCR review): share marking moved to execute.after — marking in
+      // .before suppressed the reminder even when the call failed.
     });
 
     await ctx.tool.hook("execute.after", (event) => {
       lastActiveSessionID = event.sessionID;
       const state = stateFor(event.sessionID);
       if (event.status === "completed") {
+        if (isShareTool(event.tool)) state.sharedThisTurn = true;
         if (isActionTool(event.tool)) state.actions++;
-        // Piggyback: append the pending card to the tool result the model sees.
+        // Piggyback: append pending cards to the tool result the model sees.
+        // Grouped per channel (OCR review H1): mergeCards collapses by
+        // cards[0].channelId, so cross-channel pending must never be merged
+        // into one card — one merged card per channel instead.
         if (state.pending.length > 0) {
-          const merged = mergeCards(state.pending);
+          const byChannel = new Map<string, typeof state.pending>();
+          for (const card of state.pending) {
+            const list = byChannel.get(card.channelId) ?? [];
+            list.push(card);
+            byChannel.set(card.channelId, list);
+          }
           state.pending = [];
-          if (merged && merged.lines.length > 0) {
-            const cardText = CARD_SEPARATOR + renderDigestCard(merged);
-            const result = event.result;
-            if (typeof result.content === "string") result.content = result.content + cardText;
-            else if (Array.isArray(result.content)) result.content = [...result.content, { type: "text", text: cardText }];
-            else result.content = cardText;
+          for (const cards of byChannel.values()) {
+            const merged = mergeCards(cards);
+            if (merged && merged.lines.length > 0) {
+              const cardText = CARD_SEPARATOR + renderDigestCard(merged);
+              const result = event.result;
+              if (typeof result.content === "string") result.content = result.content + cardText;
+              else if (Array.isArray(result.content)) result.content = [...result.content, { type: "text", text: cardText }];
+              else result.content = cardText;
+            }
           }
         }
       }
@@ -163,23 +176,39 @@ const plugin = {
     client.start();
 
     // ---- turn boundary: judge the previous turn when the next one starts ----
-    const events = ctx.event.subscribe();
+    let events = ctx.event.subscribe();
+    let unloaded = false;
     const pump = (async () => {
-      try {
-        for await (const event of events) {
-          // The fork publishes execution events (core/src/session/execution.ts):
-          // started = a turn begins, so everything counted so far is the
-          // finished previous turn. This is the anti-forget judge point.
-          if (event.type === "session.execution.started" && event.data?.sessionID) {
-            await judgePreviousTurn(event.data.sessionID);
+      // Restart loop (OCR review H2): a transient stream error must not
+      // permanently silence the anti-forget judge — log, resubscribe, continue.
+      // `unloaded` stops the loop when the host tears the plugin down.
+      while (!unloaded) {
+        try {
+          for await (const event of events) {
+            // The fork publishes execution events (core/src/session/execution.ts):
+            // started = a turn begins, so everything counted so far is the
+            // finished previous turn. This is the anti-forget judge point.
+            if (event.type === "session.execution.started" && event.data?.sessionID) {
+              // Also the earliest session-presence signal — urgent cards that
+              // arrive before the first tool call need a target session.
+              lastActiveSessionID = event.data.sessionID;
+              await judgePreviousTurn(event.data.sessionID);
+            }
           }
+          break; // stream ended normally (unload path)
+        } catch (err) {
+          if (unloaded) break;
+          console.error(
+            `share-context-mcp: event stream error, resubscribing in 1s: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          await new Promise((r) => setTimeout(r, 1000));
+          events = ctx.event.subscribe();
         }
-      } catch {
-        // Event stream closed (plugin unload) — cleanup below owns the rest.
       }
     })();
 
     return async () => {
+      unloaded = true;
       client.stop();
       // The host closes the event stream on plugin unload; don't wait on the
       // pump here — some hosts (and our smoke fakes) keep the iterator open,
