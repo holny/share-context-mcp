@@ -247,19 +247,16 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       const stderrChunks: string[] = [];
       // The happy-path children above emit zero stderr bytes, so their no-leak
       // assertion alone proves nothing. This child deterministically hits the
-      // startup bail (packages/server/src/index.ts:37): with the env var
-      // deleted (a merely unreachable URL would write nothing on a fresh
-      // store) it console.errors the bail line and exits(1) before the MCP
-      // handshake, over the SAME StdioClientTransport("pipe") capture path.
-      // Typed clone of the parent env (Bun's process.env has no open index
-      // signature, so a spread + delete does not typecheck): build the child
-      // env explicitly, dropping SHARE_CONTEXT_RELAY_URL to force the
-      // startup bail below.
+      // startup bail: an invalid SHARE_CONTEXT_BRIDGE kind makes the bridge
+      // factory throw ("must be relay|git|s3") before the MCP handshake, over
+      // the SAME StdioClientTransport("pipe") capture path — proving the
+      // capture is live so the happy-path no-leak assertions mean something.
       const env: Record<string, string> = {};
       for (const [key, value] of Object.entries(process.env)) {
-        if (key !== "SHARE_CONTEXT_RELAY_URL" && value !== undefined) env[key] = value;
+        if (value !== undefined) env[key] = value;
       }
       env.SHARE_CONTEXT_DB_PATH = join(dir, "state.db");
+      env.SHARE_CONTEXT_BRIDGE = "carrier-pigeon";
       const transport = new StdioClientTransport({
         command: "bun",
         args: ["run", ENTRY_PATH],
@@ -271,7 +268,7 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       // no relay URL → process exits before answering `initialize` → rejects
       await expect(client.connect(transport)).rejects.toThrow();
       await Bun.sleep(300); // let stderr drain
-      expect(stderrChunks.join("")).toContain("SHARE_CONTEXT_RELAY_URL is not set");
+      expect(stderrChunks.join("")).toContain("SHARE_CONTEXT_BRIDGE must be relay|git|s3");
       await transport.close().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
     },

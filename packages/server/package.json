@@ -17,5 +17,13 @@
   },
   "devDependencies": {
     "@share-context-mcp/relay": "workspace:*"
-  }
+  },
+  "bin": {
+    "share-context-server": "./src/bin.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "mcpName": "io.github.holny/share-context-mcp"
 }
