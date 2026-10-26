@@ -12,12 +12,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { INSTRUCTIONS } from "./instructions";
 import { buildMcpServer } from "./mcp";
 import { Broadcaster } from "./broadcaster";
-import { RelayBackend } from "./backend/relay";
+import { RelayBridge } from "./bridge/relay";
 import { Store } from "./store";
 
 export { Store } from "./store";
-export { RelayBackend, generateGroupedPassword } from "./backend/relay";
-export type { ChannelBackend, ChannelMember, ChannelMeta, PollResult, ClaimInput } from "./backend/types";
+export { RelayBridge, generateGroupedPassword } from "./bridge/relay";
+export type { ChannelBridge, ChannelMember, ChannelMeta, PollResult, ClaimInput } from "./bridge/types";
 export { buildMcpServer, TOOL_NAMES } from "./mcp";
 export { INSTRUCTIONS } from "./instructions";
 export type { McpServerDeps } from "./mcp";
@@ -42,7 +42,7 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
   }
   const dbPath = options.dbPath ?? process.env.SHARE_CONTEXT_DB_PATH;
   const store = new Store(dbPath || undefined);
-  const backend = new RelayBackend({ baseUrl: relayUrl, store });
+  const bridge = new RelayBridge({ baseUrl: relayUrl, store });
   // Retained for the lifetime of the process: runtime joins register here and
   // a future in-process shutdown path can call broadcaster.stop(). Null when
   // the broadcaster failed to start (server continues without push).
@@ -51,7 +51,7 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
     const secret = store.getChannelSecret(channelId);
     if (!secret) continue;
     try {
-      await backend.join(channelId, secret.password, secret.memberName);
+      await bridge.join(channelId, secret.password, secret.memberName);
     } catch (err) {
       console.error(
         `share-context-mcp: rejoin failed for ${channelId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -60,7 +60,7 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
   }
   const server = buildMcpServer({
     store,
-    backend,
+    bridge,
     // Runtime joins (join_channel / create_channel) must start broadcasting —
     // addChannel is idempotent, and channels joined before the broadcaster
     // starts below are picked up by start() via store.rejoinable() anyway.
@@ -93,7 +93,7 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
     broadcaster = new Broadcaster({
       socketPath: process.env.SHARE_CONTEXT_IPC_SOCKET || undefined,
     });
-    await broadcaster.start({ store, backend });
+    await broadcaster.start({ store, bridge });
   } catch (err) {
     broadcaster = null;
     console.error(

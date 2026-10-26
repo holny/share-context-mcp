@@ -11,19 +11,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRelay } from "@share-context-mcp/relay";
-import { RelayBackend } from "../../src/backend/relay";
+import { RelayBridge } from "../../src/bridge/relay";
 import { Store } from "../../src/store";
 
 const dir = mkdtempSync(join(tmpdir(), "scm-leak-probe-"));
 const relay = await startRelay({ port: 0, dbPath: join(dir, "relay.db"), pingIntervalMs: 50 });
 const store = new Store(join(dir, "state.db"));
-const backend = new RelayBackend({ baseUrl: `http://127.0.0.1:${relay.port}`, store });
-const { channelId } = await backend.createChannel({ memberName: "leak" });
+const bridge = new RelayBridge({ baseUrl: `http://127.0.0.1:${relay.port}`, store });
+const { channelId } = await bridge.createChannel({ memberName: "leak" });
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 for (let i = 0; i < 40; i++) {
-  const l = backend.listen(channelId, () => {}, {
+  const l = bridge.listen(channelId, () => {}, {
     wsDeathTimeoutMs: 100,
     probeIntervalMs: 50,
     pollActiveMs: 20,

@@ -1,5 +1,5 @@
 /**
- * RelayBackend — ChannelBackend implementation over the blind relay's HTTP API
+ * RelayBridge — ChannelBridge implementation over the blind relay's HTTP API
  * (spec §5.5). Owns the E2E side: validates claims locally, seals/open with
  * the password-derived channel key, and keeps tokens in memory only.
  *
@@ -24,7 +24,7 @@ import type { ClaimMessage } from "@share-context-mcp/protocol";
 import type { Store } from "../store";
 import { ChannelTransport } from "../transport";
 import type { TransportTuning } from "../transport";
-import type { ClaimInput, ChannelBackend, BackendListener, ChannelMember, ChannelMeta, PollResult } from "./types";
+import type { ClaimInput, ChannelBridge, BridgeListener, ChannelMember, ChannelMeta, PollResult } from "./types";
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -63,7 +63,7 @@ interface EnvelopeRow {
   ciphertext: string;
 }
 
-export class RelayBackend implements ChannelBackend {
+export class RelayBridge implements ChannelBridge {
   private readonly baseUrl: string;
   private readonly store: Store;
   /** Session tokens per channel — memory first, encrypted fallback in the store. */
@@ -193,7 +193,7 @@ export class RelayBackend implements ChannelBackend {
     }
   }
 
-  // ---- ChannelBackend ----
+  // ---- ChannelBridge ----
 
   async createChannel(opts: { name?: string; memberName: string }): Promise<{ channelId: string; password: string }> {
     // `name` is a local display label in v1; the blind relay stores no title.
@@ -331,7 +331,7 @@ export class RelayBackend implements ChannelBackend {
    * (channelId, cursor). The token is resolved lazily per connect attempt so
    * re-join (e.g. after rotate) is adopted without re-listen.
    */
-  listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): BackendListener {
+  listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): BridgeListener {
     if (!this.store.getChannelSecret(channelId)) throw new Error(`unknown channel: ${channelId}`);
     const wsBase = this.baseUrl.replace(/^http/i, "ws");
     const transport = new ChannelTransport({
