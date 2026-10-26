@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { INSTRUCTIONS } from "./instructions";
 import { buildMcpServer } from "./mcp";
 import { Broadcaster } from "./broadcaster";
+import { createChannelBridge, defaultDbPath } from "./bridge/factory";
 import { RelayBridge } from "./bridge/relay";
 import { Store } from "./store";
 
@@ -27,6 +28,8 @@ export type { BroadcasterHandle, BroadcasterOptions, DigestEvent, DigestLine } f
 export interface StdioStartOptions {
   relayUrl?: string;
   dbPath?: string;
+  /** ChannelBackend kind (spec M3): "relay" | "git" | "s3". Default: SHARE_CONTEXT_BRIDGE env or relay. */
+  bridge?: "relay" | "git" | "s3";
 }
 
 /**
@@ -40,8 +43,8 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
     console.error("share-context-mcp: SHARE_CONTEXT_RELAY_URL is not set — cannot reach the relay");
     process.exit(1);
   }
-  const dbPath = options.dbPath ?? process.env.SHARE_CONTEXT_DB_PATH;
-  const store = new Store(dbPath || undefined);
+  const dbPath = options.dbPath ?? process.env.SHARE_CONTEXT_DB_PATH ?? defaultDbPath(process.cwd());
+  const store = new Store(dbPath);
   const bridge = new RelayBridge({ baseUrl: relayUrl, store });
   // Retained for the lifetime of the process: runtime joins register here and
   // a future in-process shutdown path can call broadcaster.stop(). Null when
