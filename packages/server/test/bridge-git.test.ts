@@ -56,9 +56,9 @@ describe("GitBridge", () => {
 
     await bob.join(channelId, alicePassword, "bob", { gitUrl: gitUrl() });
 
-    const r1 = await alice.send({ statement: "contract v1", kind: "contract", topic: "auth", seq: null, ts: new Date().toISOString() }, channelId);
-    const r2 = await bob.send({ statement: "question about seq 1", kind: "question", topic: "auth", seq: null, ts: new Date().toISOString() }, channelId);
-    const r3 = await alice.send({ statement: "pitfall: node 26 breaks X", kind: "negative-result", topic: "env", seq: null, ts: new Date().toISOString() }, channelId);
+    const r1 = await alice.send({ statement: "contract v1", kind: "contract", topic: "auth", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId);
+    const r2 = await bob.send({ statement: "question about seq 1", kind: "question", topic: "auth", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId);
+    const r3 = await alice.send({ statement: "pitfall: node 26 breaks X", kind: "negative-result", topic: "env", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId);
     expect(r1.seq).toBe(1);
     expect(r2.seq).toBe(2);
     expect(r3.seq).toBe(3);
@@ -76,7 +76,7 @@ describe("GitBridge", () => {
 
   test("send validates and rejects an oversized statement", async () => {
     await expect(
-      alice.send({ statement: "x".repeat(501), kind: "progress", topic: "t", seq: null, ts: new Date().toISOString() }, channelId),
+      alice.send({ statement: "x".repeat(501), kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId),
     ).rejects.toThrow("500");
   });
 
@@ -89,8 +89,8 @@ describe("GitBridge", () => {
 
   test("concurrent sends get distinct seqs (retry path)", async () => {
     const results = await Promise.all([
-      alice.send({ statement: "race A1", kind: "progress", topic: "race", seq: null, ts: new Date().toISOString() }, channelId),
-      bob.send({ statement: "race B1", kind: "progress", topic: "race", seq: null, ts: new Date().toISOString() }, channelId),
+      alice.send({ statement: "race A1", kind: "progress", topic: "race", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId),
+      bob.send({ statement: "race B1", kind: "progress", topic: "race", seq: null, ts: new Date().toISOString(), provenance: { member: "tester", source: "agent" } }, channelId),
     ]);
     const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
     expect(new Set(seqs).size).toBe(2);
