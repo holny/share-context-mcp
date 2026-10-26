@@ -6,7 +6,7 @@
  * agent session runs, so the socket may come and go).
  */
 import net from "node:net";
-import type { DigestCard } from "./coalesce";
+import type { DigestCard } from "./coalesce.ts";
 
 export interface BackoffOptions {
   base: number;

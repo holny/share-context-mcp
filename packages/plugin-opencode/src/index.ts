@@ -22,9 +22,9 @@
  * Config: SHARE_CONTEXT_IPC_SOCKET (same env as the server) for the socket
  * path; SHARE_CONTEXT_PLUGIN=off disables the plugin entirely.
  */
-import { IpcClient } from "./ipc";
-import { CARD_SEPARATOR, mergeCards, renderDigestCard, type DigestCard } from "./coalesce";
-import { isActionTool, isShareTool, renderReminder, shouldRemind } from "./anti-forget";
+import { IpcClient } from "./ipc.ts";
+import { CARD_SEPARATOR, mergeCards, renderDigestCard, type DigestCard } from "./coalesce.ts";
+import { isActionTool, isShareTool, renderReminder, shouldRemind } from "./anti-forget.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
