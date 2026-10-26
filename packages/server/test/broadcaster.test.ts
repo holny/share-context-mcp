@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
 import type { Mailbox, MailboxListener, PollResult } from "../src/mailbox/types";
-import { Broadcaster } from "../src/broadcaster";
+import { Broadcaster, passesFilters } from "../src/broadcaster";
 import { Store } from "../src/store";
 
 const WINDOW_MS = 30;
@@ -37,6 +37,8 @@ class FakeMailbox implements Pick<Mailbox, "poll" | "listen"> {
   private readonly queues = new Map<string, ClaimMessage[]>();
   private readonly handlers = new Map<string, (seq: number) => void>();
   private readonly skippedByChannel = new Map<string, number>();
+  /** Number of listen() registrations (per channel) — for idempotency asserts. */
+  readonly listenCalls = new Map<string, number>();
   private stopped = false;
 
   constructor(private readonly store: Store) {}
@@ -65,6 +67,7 @@ class FakeMailbox implements Pick<Mailbox, "poll" | "listen"> {
   }
 
   listen(channelId: string, onNotify: (seq: number) => void): MailboxListener {
+    this.listenCalls.set(channelId, (this.listenCalls.get(channelId) ?? 0) + 1);
     this.handlers.set(channelId, onNotify);
     return {
       stop: async () => {
@@ -360,5 +363,52 @@ describe("Broadcaster", () => {
     });
     expect(rejected).not.toBeNull();
     client.close();
+  });
+
+  test("addChannel is idempotent — duplicate registration never double-listens or double-emits", async () => {
+    const socketPath = join(dir, "ipc.sock");
+    const broadcaster = new Broadcaster({ socketPath, windowMs: WINDOW_MS });
+    await broadcaster.start({ store, mailbox });
+    broadcaster.addChannel("ch1"); // already registered by start()
+    broadcaster.addChannel("ch1"); // and again
+    expect(mailbox.listenCalls.get("ch1")).toBe(1);
+
+    const client = await connectClient(socketPath);
+    mailbox.enqueue("ch1", claim("once only", "alice", { seq: 1 }));
+    mailbox.notify("ch1");
+    const evt = (await waitFor(() => client.events[0], "digest card")) as {
+      lines: Array<{ seq: number }>;
+    };
+    expect(evt.lines.map((l) => l.seq)).toEqual([1]);
+    await new Promise((r) => setTimeout(r, WINDOW_MS * 4));
+    expect(client.events).toHaveLength(1); // no duplicate card from a second listener
+    await broadcaster.stop();
+  });
+});
+
+describe("passesFilters branches (subscription filter coverage)", () => {
+  test("topic exact-match: positive and negative", () => {
+    const filters = [{ topic: "auth" }];
+    expect(passesFilters(claim("s", "a", { seq: 1, topic: "auth" }), filters, "me")).toBe(true);
+    expect(passesFilters(claim("s", "a", { seq: 2, topic: "authx" }), filters, "me")).toBe(false);
+    expect(passesFilters(claim("s", "a", { seq: 3, topic: "other" }), filters, "me")).toBe(false);
+  });
+
+  test("scopePrefix: positive and negative", () => {
+    const filters = [{ scopePrefix: "repo-x" }];
+    expect(passesFilters(claim("s", "a", { seq: 1, scope: { repo: "repo-x" } }), filters, "me")).toBe(true);
+    // prefix match on a longer value also passes
+    expect(passesFilters(claim("s", "a", { seq: 2, scope: { repo: "repo-x-infra" } }), filters, "me")).toBe(true);
+    // unrelated scope value drops
+    expect(passesFilters(claim("s", "a", { seq: 3, scope: { repo: "other-repo" } }), filters, "me")).toBe(false);
+    // no scope at all drops
+    expect(passesFilters(claim("s", "a", { seq: 4 }), filters, "me")).toBe(false);
+  });
+
+  test("multiple filters: any matching filter passes", () => {
+    const filters = [{ kinds: ["decision"] }, { topic: "auth" }];
+    expect(passesFilters(claim("s", "a", { seq: 1, kind: "progress", topic: "auth" }), filters, "me")).toBe(true);
+    expect(passesFilters(claim("s", "a", { seq: 2, kind: "decision", topic: "other" }), filters, "me")).toBe(true);
+    expect(passesFilters(claim("s", "a", { seq: 3, kind: "progress", topic: "other" }), filters, "me")).toBe(false);
   });
 });
