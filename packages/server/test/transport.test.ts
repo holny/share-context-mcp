@@ -98,13 +98,13 @@ describe("backend.listen transport (ws-first auto downgrade)", () => {
    * seq so overlapping polls are absorbed. `ch`/`backend` are captured at
    * call time (pass the channel + backend the listener belongs to).
    */
-  function makeHandler(targetCh: string, targetMailbox: RelayBackend, targetStore: Store): Handler {
+  function makeHandler(targetCh: string, targetBackend: RelayBackend, targetStore: Store): Handler {
     const delivered: ClaimMessage[] = [];
     const seen = new Set<number>();
     const notifyLog: NotifyRec[] = [];
     const onNotify = (seq: number): void => {
       notifyLog.push({ seq, at: Date.now() });
-      void targetMailbox
+      void targetBackend
         .poll(targetCh, targetStore.getCursor(targetCh))
         .then((r) => {
           for (const m of r.messages) {

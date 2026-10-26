@@ -1,7 +1,7 @@
 /**
- * Mailbox abstraction (spec §5.5): the transport seam behind the MCP tool layer.
+ * ChannelBackend abstraction (spec §5.5): the storage seam behind the MCP tool layer.
  * The blind relay is the first implementation (RelayBackend); git/cloud-storage
- * mailboxes are v2 candidates that plug in here with zero tool-layer changes.
+ * backends are v2 candidates that plug in here with zero tool-layer changes.
  */
 import type { ClaimMessage } from "@share-context-mcp/protocol";
 import type { TransportState, TransportTuning } from "../transport";
