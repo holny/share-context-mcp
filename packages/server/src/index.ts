@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { INSTRUCTIONS } from "./instructions";
 import { buildMcpServer } from "./mcp";
+import { Broadcaster } from "./broadcaster";
 import { RelayMailbox } from "./mailbox/relay";
 import { Store } from "./store";
 
@@ -20,6 +21,8 @@ export type { Mailbox, MailboxMember, MailboxMeta, PollResult, ClaimInput } from
 export { buildMcpServer, TOOL_NAMES } from "./mcp";
 export { INSTRUCTIONS } from "./instructions";
 export type { McpServerDeps } from "./mcp";
+export { Broadcaster } from "./broadcaster";
+export type { BroadcasterHandle, BroadcasterOptions, DigestEvent, DigestLine } from "./broadcaster";
 
 export interface StdioStartOptions {
   relayUrl?: string;
@@ -53,6 +56,19 @@ export async function runStdioServer(options: StdioStartOptions = {}): Promise<M
   }
   const server = buildMcpServer({ store, mailbox });
   await server.connect(new StdioServerTransport());
+  // Local IPC broadcaster (spec §5.4): always started — with no plugin
+  // connected the events are simply unconsumed and the server keeps updating
+  // its cache regardless. Path override: SHARE_CONTEXT_IPC_SOCKET.
+  try {
+    const broadcaster = new Broadcaster({
+      socketPath: process.env.SHARE_CONTEXT_IPC_SOCKET || undefined,
+    });
+    await broadcaster.start({ store, mailbox });
+  } catch (err) {
+    console.error(
+      `share-context-mcp: ipc broadcaster failed to start (server continues without push): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return server;
 }
 

@@ -138,6 +138,14 @@ export interface ChannelSecretInput {
   cursor?: number;
 }
 
+export interface SubscriptionFilter {
+  kinds?: string[];
+  scopePrefix?: string;
+  topic?: string;
+}
+
+const SUBSCRIPTION_KEY_PREFIX = "subscription:";
+
 export class Store {
   private readonly db: Database;
   private readonly machineKey: Buffer;
@@ -419,6 +427,27 @@ export class Store {
 
   deleteKv(key: string): void {
     this.db.prepare("DELETE FROM kvs WHERE key = ?").run(key);
+  }
+
+  // ---- subscriptions (consumed by the IPC broadcaster, spec §5.4) ----
+
+  /**
+   * Per-channel push filters, as set by the `set_subscription` tool. Null when
+   * no subscription was declared (the broadcaster then passes everything).
+   */
+  getSubscription(channelId: string): SubscriptionFilter[] | null {
+    const raw = this.getKv(SUBSCRIPTION_KEY_PREFIX + channelId);
+    if (raw === null) return null;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed as SubscriptionFilter[]) : null;
+    } catch {
+      return null; // corrupt entry — treat as absent
+    }
+  }
+
+  setSubscription(channelId: string, filters: SubscriptionFilter[]): void {
+    this.setKv(SUBSCRIPTION_KEY_PREFIX + channelId, JSON.stringify(filters));
   }
 
   /** Close the database (WAL checkpoints on close). */

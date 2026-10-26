@@ -391,7 +391,7 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
     },
     safe(async ({ filters, channelId }) => {
       const ch = resolveChannel(store, channelId);
-      store.setKv(`subscription:${ch}`, JSON.stringify(filters));
+      store.setSubscription(ch, filters);
       return JSON.stringify({ ok: true, filters });
     }),
   );
