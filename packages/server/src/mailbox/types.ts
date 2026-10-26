@@ -58,7 +58,7 @@ export interface Mailbox {
   /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
-  poll(channelId: string, since: number): Promise<PollResult>;
+  poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult>;
   /**
    * Live notifications (spec §5.7): WS-first with automatic poll downgrade
    * (adaptive active/idle intervals, periodic WS re-upgrade probe).

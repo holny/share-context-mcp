@@ -86,8 +86,8 @@ describe("renderDigestCard", () => {
     });
     const text = renderDigestCard(c);
     expect(text).toContain("📋 协作通道：2 条新消息（1 条 @你）");
-    expect(text).toContain("- [#12·decision·auth] alice: use JWT rotation");
-    expect(text).toContain("- [#13·howto·db] bob: index the cursor");
+    expect(text).toContain("> #12·decision·auth alice: use JWT rotation");
+    expect(text).toContain("> #13·howto·db bob: index the cursor");
     expect(text).toContain("另有 1 条未能解密。");
     expect(text).toContain("用 fetch_updates 展开详情");
     // No piggyback separator inside the body — the injection site adds it.

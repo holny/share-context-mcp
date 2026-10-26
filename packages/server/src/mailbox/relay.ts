@@ -277,7 +277,7 @@ export class RelayMailbox implements Mailbox {
     return { seq: res.seq as number, deduped: res.deduped === true };
   }
 
-  async poll(channelId: string, since: number): Promise<PollResult> {
+  async poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult> {
     const data = (await this.request(`/channels/${channelId}/messages?since=${since}`, {
       method: "GET",
       headers: this.authHeaders(channelId),
@@ -318,8 +318,10 @@ export class RelayMailbox implements Mailbox {
     // permanently block every newer message behind it.
     this.store.recordCursorFromMessages(channelId, envelopes);
     // A fetch is activity (spec §5.8) — usually triggered BY a listener's
-    // wake (already marked), but direct poll() calls count too.
-    this.markListeners(channelId);
+    // wake (already marked), but direct poll() calls count too. AGENT-SCOPED
+    // (Review F3): the broadcaster's background poll passes markActivity:
+    // false — self-marking would keep poll mode at the active pace forever.
+    if (opts?.markActivity !== false) this.markListeners(channelId);
     return { messages: out, skipped: envelopes.length - out.length };
   }
 

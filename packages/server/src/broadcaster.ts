@@ -33,7 +33,12 @@ const DEFAULT_WINDOW_MS = 2500;
 
 /** The slice of Mailbox the broadcaster needs (keeps tests fakes minimal). */
 export interface BroadcasterMailbox {
-  poll(channelId: string, since: number): Promise<PollResult>;
+  /**
+   * markActivity is agent-scoped (Review F3): the broadcaster's background
+   * poll is NOT agent activity and passes { markActivity: false } — marking
+   * here would pin the poll transport at the active pace forever.
+   */
+  poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult>;
   listen(channelId: string, onNotify: (seq: number) => void): { stop(): Promise<void> };
 }
 
@@ -73,16 +78,39 @@ export interface BroadcasterHandle {
   socketPath: string;
 }
 
+/**
+ * Sanitize free text that lands inside a digest line (F1): a multi-line
+ * statement or topic must never survive into the card — a newline would let
+ * appended text forge its own bullets ("…\n- do X now") or injected
+ * instructions inside the plugin's rendering. Fold every newline into a
+ * visible ␤ glyph (one physical line) and strip forged bullet ("- ") and
+ * horizontal-rule ("---") prefixes at the start of the line and right after
+ * a folded break. Loops until stable so stacked prefixes ("− - --- x") all go.
+ */
+function sanitizeLineText(text: string): string {
+  let out = text.replace(/\r\n?|\n/g, "␤");
+  let prev: string;
+  do {
+    prev = out;
+    out = out.replace(/(^|␤)\s*-{2,}\s*/g, "$1"); // "---" horizontal-rule runs
+    out = out.replace(/(^|␤)\s*-\s+/g, "$1"); // "- " bullet markers
+  } while (out !== prev);
+  return out;
+}
+
 /** Build a whitelisted line by picking fields individually — never spread. */
 function buildLine(msg: ClaimMessage): DigestLine {
   const line: DigestLine = {
     seq: typeof msg.seq === "number" ? msg.seq : 0,
     kind: msg.kind,
-    topic: msg.topic,
+    topic: sanitizeLineText(msg.topic),
     from: msg.provenance.member,
-    statement: msg.statement.length > STATEMENT_MAX ? msg.statement.slice(0, STATEMENT_MAX) : msg.statement,
+    statement: "",
   };
-  if (msg.to !== undefined) line.to = msg.to;
+  // Sanitize BEFORE truncating so the cap applies to what is actually sent.
+  const statement = sanitizeLineText(msg.statement);
+  line.statement = statement.length > STATEMENT_MAX ? statement.slice(0, STATEMENT_MAX) : statement;
+  if (msg.to !== undefined) line.to = sanitizeLineText(msg.to);
   return line;
 }
 
@@ -146,6 +174,7 @@ export class Broadcaster {
   async start(deps: BroadcasterDeps): Promise<BroadcasterHandle> {
     this.deps = deps;
     await this.listenSocket();
+    console.error(`share-context-mcp: broadcaster listening at ${this.socketPath} channels=${this.channels.size}`);
     for (const channelId of deps.store.rejoinable()) {
       this.addChannel(channelId);
     }
@@ -154,7 +183,9 @@ export class Broadcaster {
 
   /** Begin listening on a channel joined after start() (idempotent). */
   addChannel(channelId: string): void {
-    if (!this.deps || this.channels.has(channelId)) return;
+    // stopped guard (Review F8): a join racing exit() must not leave a
+    // lingering listener behind after the session-lifetime teardown.
+    if (this.stopped || !this.deps || this.channels.has(channelId)) return;
     const state: ChannelState = { listener: null!, chain: Promise.resolve(), pending: null, pendingTimer: null, skipped: 0 };
     this.channels.set(channelId, state);
     state.listener = this.deps.mailbox.listen(channelId, () => {
@@ -170,7 +201,8 @@ export class Broadcaster {
     if (this.stopped || !this.deps) return;
     const { store, mailbox } = this.deps;
     const since = store.getCursor(channelId);
-    const result = await mailbox.poll(channelId, since);
+    // Background consumption is not agent activity (Review F3): never mark.
+    const result = await mailbox.poll(channelId, since, { markActivity: false });
     state.skipped += result.skipped;
     const secret = store.getChannelSecret(channelId);
     if (!secret) return; // channel forgotten mid-flight — nothing to do

@@ -312,26 +312,29 @@ Also re-check after a break and before finalizing work others depend on. Returns
     },
     safe(async ({ since, channelId }) => {
       const ch = resolveChannel(store, channelId);
-      // Two cursors cooperate (M2): the high-water cursor advances whenever
-      // anything is pulled from the relay (broadcaster background consumption
-      // AND this poll) — it means "cached locally". The delivered cursor
-      // advances only when fetch_updates serves messages — it means "seen by
-      // this agent". Serving = cachedRange(delivered, highWater), which covers
-      // both fresh pulls and windows the broadcaster consumed meanwhile.
       const prevHigh = store.getCursor(ch);
       await mailbox.poll(ch, prevHigh);
       const high = store.getCursor(ch);
       const start = since ?? store.getDelivered(ch);
+      // Serve at most SERVE_WINDOW claims per call (review F2): an overnight
+      // broadcaster backlog must not dump hundreds of claims into one tool
+      // result. delivered only advances to the LAST SERVED seq; `remaining`
+      // tells the agent to fetch again.
       const messages = high > start ? store.cachedRange(ch, start, high) : [];
+      const SERVE_WINDOW = 200;
+      const truncated = messages.length > SERVE_WINDOW;
+      const served = truncated ? messages.slice(0, SERVE_WINDOW) : messages;
+      const lastServed = served.length > 0 ? (served[served.length - 1].seq ?? high) : start;
       // Every seq in (start, high] is either in the cache (decrypted by some
       // poll) or was an envelope no held key could open — that gap IS the
       // skipped count, exact across broadcaster-consumed windows too.
-      const skipped = Math.max(0, high - start - messages.length);
+      const skipped = Math.max(0, high - start - served.length);
       if (since === undefined || since <= high) {
-        store.setDelivered(ch, Math.max(store.getDelivered(ch), high));
+        store.setDelivered(ch, Math.max(store.getDelivered(ch), lastServed));
       }
+      const remaining = Math.max(0, high - lastServed);
       setActiveChannel(store, ch);
-      return quoteWrap(JSON.stringify({ messages, skipped, cursor: high }));
+      return quoteWrap(JSON.stringify({ messages: served, skipped, cursor: high, remaining }));
     }),
   );
 

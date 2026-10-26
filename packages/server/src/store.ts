@@ -237,8 +237,7 @@ export class Store {
       .run(
         ch.channelId,
         encryptSecret(this.machineKey, ch.password),
-        ch.memberName,
-        ch.epoch,
+        ch.memberName,        ch.epoch,
         ch.cursor ?? 0,
         new Date().toISOString(),
       );
@@ -416,6 +415,10 @@ export class Store {
    */
   getDelivered(channelId: string): number {
     const raw = this.getKv(`delivered:${channelId}`);
+    // Deliberately defaults to 0 (review F4 rejected): the join card only
+    // SUMMARIZES pre-join history (80 chars per topic) — the full messages of
+    // the join window are meant to be delivered by the first fetch_updates.
+    // An M1→M2 upgrade re-serves its cache once, bounded by SERVE_WINDOW.
     const n = raw === null ? 0 : Number(raw);
     return Number.isFinite(n) && n >= 0 ? n : 0;
   }
