@@ -317,8 +317,16 @@ Also re-check after a break and before finalizing work others depend on. Returns
       // open (e.g. old-epoch ciphertext after a rotate); the cursor already
       // advanced past them inside poll (high-water, C-1).
       const { messages, skipped } = await mailbox.poll(ch, start);
+      // The M2 broadcaster may have consumed this window already (its poll
+      // caches messages and advances the cursor ahead of this tool). An empty
+      // relay window with a moved cursor means the content is in local cache.
+      let out = messages;
+      if (out.length === 0) {
+        const cursor = store.getCursor(ch);
+        if (cursor > start) out = store.cachedRange(ch, start, cursor);
+      }
       setActiveChannel(store, ch);
-      return quoteWrap(JSON.stringify({ messages, skipped, cursor: store.getCursor(ch) }));
+      return quoteWrap(JSON.stringify({ messages: out, skipped, cursor: store.getCursor(ch) }));
     }),
   );
 

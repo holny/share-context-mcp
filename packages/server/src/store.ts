@@ -392,6 +392,22 @@ export class Store {
     return rows.map(rowToClaim);
   }
 
+  /**
+   * Cached messages with since < seq <= until, ascending. Serves fetch_updates
+   * when the broadcaster (M2) already consumed a window: its poll cached the
+   * messages and advanced the cursor before the tool ran, so a relay poll
+   * returns empty while the content is locally available.
+   */
+  cachedRange(channelId: string, since: number, until: number): ClaimMessage[] {
+    const rows = this.db
+      .prepare(
+        `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
+         FROM messages WHERE channel_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC`,
+      )
+      .all(channelId, since, until) as MessageRow[];
+    return rows.map(rowToClaim);
+  }
+
   // ---- key-value scratch space (active channel, subscriptions, labels) ----
 
   /**
