@@ -408,6 +408,22 @@ export class Store {
     return rows.map(rowToClaim);
   }
 
+  /**
+   * Delivered cursor: the seq up to which fetch_updates has SERVED messages to
+   * this agent. Separate from the high-water cursor (which the broadcaster
+   * advances by consuming windows ahead of the agent) — fetch_updates serves
+   * cachedRange(delivered, highWater) and then moves delivered forward.
+   */
+  getDelivered(channelId: string): number {
+    const raw = this.getKv(`delivered:${channelId}`);
+    const n = raw === null ? 0 : Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  setDelivered(channelId: string, seq: number): void {
+    this.setKv(`delivered:${channelId}`, String(seq));
+  }
+
   // ---- key-value scratch space (active channel, subscriptions, labels) ----
 
   /**

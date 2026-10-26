@@ -312,21 +312,26 @@ Also re-check after a break and before finalizing work others depend on. Returns
     },
     safe(async ({ since, channelId }) => {
       const ch = resolveChannel(store, channelId);
-      const start = since ?? store.getCursor(ch);
-      // skipped counts envelopes of the fetched window that no held key could
-      // open (e.g. old-epoch ciphertext after a rotate); the cursor already
-      // advanced past them inside poll (high-water, C-1).
-      const { messages, skipped } = await mailbox.poll(ch, start);
-      // The M2 broadcaster may have consumed this window already (its poll
-      // caches messages and advances the cursor ahead of this tool). An empty
-      // relay window with a moved cursor means the content is in local cache.
-      let out = messages;
-      if (out.length === 0) {
-        const cursor = store.getCursor(ch);
-        if (cursor > start) out = store.cachedRange(ch, start, cursor);
+      // Two cursors cooperate (M2): the high-water cursor advances whenever
+      // anything is pulled from the relay (broadcaster background consumption
+      // AND this poll) — it means "cached locally". The delivered cursor
+      // advances only when fetch_updates serves messages — it means "seen by
+      // this agent". Serving = cachedRange(delivered, highWater), which covers
+      // both fresh pulls and windows the broadcaster consumed meanwhile.
+      const prevHigh = store.getCursor(ch);
+      await mailbox.poll(ch, prevHigh);
+      const high = store.getCursor(ch);
+      const start = since ?? store.getDelivered(ch);
+      const messages = high > start ? store.cachedRange(ch, start, high) : [];
+      // Every seq in (start, high] is either in the cache (decrypted by some
+      // poll) or was an envelope no held key could open — that gap IS the
+      // skipped count, exact across broadcaster-consumed windows too.
+      const skipped = Math.max(0, high - start - messages.length);
+      if (since === undefined || since <= high) {
+        store.setDelivered(ch, Math.max(store.getDelivered(ch), high));
       }
       setActiveChannel(store, ch);
-      return quoteWrap(JSON.stringify({ messages: out, skipped, cursor: store.getCursor(ch) }));
+      return quoteWrap(JSON.stringify({ messages, skipped, cursor: high }));
     }),
   );
 
