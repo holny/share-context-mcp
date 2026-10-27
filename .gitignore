@@ -1,7 +1,7 @@
 node_modules
 *.db
 .superpowers/
-.opencode/
+.bocomcode/
 .DS_Store
 session-out.txt
 session-err.txt
