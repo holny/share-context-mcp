@@ -38,7 +38,7 @@ bun install && bun test          # 119 tests, tsc clean
 bun packages/relay/src/index.ts --port 8931 --db relay.db
 ```
 
-Then point each agent at the server (`packages/relay/README.md` has the exact `bocomcode.json` snippet) and let the agents do the rest:
+Then point each agent at the server (`packages/relay/README.md` has the exact config snippet) and let the agents do the rest:
 
 - `create_channel` → share `channel_id` + password with a teammate (out of band)
 - `join_channel` → the new member gets a join card (members, active topics, last statements)
