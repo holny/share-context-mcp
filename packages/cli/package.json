@@ -1,0 +1,13 @@
+{
+  "name": "@share-context-mcp/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "share-context": "./src/index.ts"
+  },
+  "dependencies": {
+    "@share-context-mcp/relay": "workspace:*",
+    "@share-context-mcp/server": "workspace:*",
+    "@share-context-mcp/console": "workspace:*"
+  }
+}
