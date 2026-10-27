@@ -413,19 +413,13 @@ export class Store {
    * advances by consuming windows ahead of the agent) — fetch_updates serves
    * cachedRange(delivered, highWater) and then moves delivered forward.
    */
-  getDelivered(channelId: string): number {
-    const raw = this.getKv(`delivered:${channelId}`);
-    // Deliberately defaults to 0 (review F4 rejected): the join card only
-    // SUMMARIZES pre-join history (80 chars per topic) — the full messages of
-    // the join window are meant to be delivered by the first fetch_updates.
-    // An M1→M2 upgrade re-serves its cache once, bounded by SERVE_WINDOW.
-    const n = raw === null ? 0 : Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : 0;
-  }
+  // delivered cursor moved to process memory (session-scoped, M3 review):
+  // each MCP server process tracks its own delivery position independently,
+  // so multiple sessions on the same machine get isolated views.
 
-  setDelivered(channelId: string, seq: number): void {
-    this.setKv(`delivered:${channelId}`, String(seq));
-  }
+
+  // delivered cursor moved to process memory (session-scoped, M3 review).
+
 
   // ---- key-value scratch space (active channel, subscriptions, labels) ----
 
