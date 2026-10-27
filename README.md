@@ -35,7 +35,7 @@ Validated by a behavior spike: across 10 pairs of real collaborative sessions, a
 
 ```bash
 bun install && bun test          # 119 tests, tsc clean
-bun packages/relay/src/index.ts --port 8931 --db relay.db
+./dist/bin/share-context-relay-darwin-arm64   # scripts/build-binaries.sh to build
 ```
 
 Then point each agent at the server (`packages/relay/README.md` has the exact `opencode.json` snippet) and let the agents do the rest:
