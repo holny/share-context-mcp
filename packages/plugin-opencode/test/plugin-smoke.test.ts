@@ -1,5 +1,5 @@
 /**
- * Plugin smoke test — loads the plugin module the same way the bocomcode_v2
+ * Plugin smoke test — loads the plugin module the same way the opencode v2
  * fork does (dynamic import of the entry, default export must be
  * { id, setup }), then drives setup() in-process against a minimal fake
  * Context: a real Unix-socket IPC server feeds digest/urgent cards and the
