@@ -6,8 +6,15 @@ import { existsSync } from "node:fs";
 const VERSION = "0.1.0";
 
 function arg(name: string): string | undefined {
-  const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 ? process.argv[i + 1] : undefined;
+  const prefix = `--${name}`;
+  for (let i = 0; i < process.argv.length; i++) {
+    if (process.argv[i] === prefix) {
+      const v = process.argv[i + 1];
+      return v !== undefined && !v.startsWith("--") ? v : undefined;
+    }
+    if (process.argv[i].startsWith(`${prefix}=`)) return process.argv[i].slice(prefix.length + 1);
+  }
+  return undefined;
 }
 
 function relayUrl(): string {
@@ -21,6 +28,10 @@ function dbPath(): string {
 async function cmdRelay() {
   const { startRelay } = await import("@share-context-mcp/relay");
   const port = Number(arg("port") ?? 8931);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    console.error(`invalid --port: ${arg("port")}`);
+    process.exit(1);
+  }
   const db = arg("db") ?? join(homedir(), ".share-context-mcp", "relay.db");
   console.error(`share-context relay v${VERSION}`);
   console.error(`  admin console: http://localhost:${port}/admin`);
@@ -77,9 +88,36 @@ async function cmdFetch() {
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
   const channels = store.listChannels();
   for (const ch of channels) {
-    const r = await bridge.poll(ch, 0);
-    console.log(`\n📡 ${ch}:`);
-    for (const m of r.messages) console.log(`  [${m.seq}] ${m.kind} (${m.topic}) ${m.provenance.member}: ${m.statement.slice(0, 100)}`);
+    try {
+      const r = await bridge.poll(ch, 0);
+      console.log(`\n📡 ${ch}:`);
+      for (const m of r.messages) console.log(`  [${m.seq}] ${m.kind} (${m.topic}) ${m.provenance.member}: ${m.statement.slice(0, 100)}`);
+    } catch (e) { console.error(`\n📡 ${ch} — error: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+}
+
+async function cmdRotatePassword() {
+  const { Store, RelayBridge, generateGroupedPassword } = await import("@share-context-mcp/server");
+  const store = new Store(dbPath());
+  const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
+  const channels = store.listChannels();
+  if (channels.length === 0) { console.log("No channels."); return; }
+  for (const ch of channels) {
+    const newPassword = generateGroupedPassword();
+    await bridge.rotate(ch, newPassword);
+    console.log(`\n🔄 ${ch}: new password = ${newPassword}\n  (share this with teammates — old password no longer works)\n`);
+  }
+}
+
+async function cmdLeave() {
+  const { Store, RelayBridge } = await import("@share-context-mcp/server");
+  const store = new Store(dbPath());
+  const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
+  const channels = store.listChannels();
+  if (channels.length === 0) { console.log("No channels."); return; }
+  for (const ch of channels) {
+    await bridge.leave(ch);
+    console.log(`Left ${ch}`);
   }
 }
 
@@ -91,8 +129,8 @@ const command = process.argv[2];
 const commands: Record<string, () => Promise<void>> = {
   relay: cmdRelay, server: cmdServer, "create-channel": cmdCreateChannel,
   join: cmdJoin, status: cmdStatus, fetch: cmdFetch,
-  "rotate-password": async () => {},
-  leave: async () => {},
+  "rotate-password": cmdRotatePassword,
+  leave: cmdLeave,
 };
 
 if (!command || command === "help" || command === "--help") { cmdHelp(); process.exit(0); }
