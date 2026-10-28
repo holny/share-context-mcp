@@ -14,6 +14,10 @@ export const CLAIM_KINDS = [
   "negative-result",
   "question",
   "claim",
+  // Structural history summary posted by a member's server when the relay
+  // evicts old ciphertext. Convention (not enforced here): topic is
+  // "channel-digest" and scope carries { covers: "<fromSeq>-<toSeq>" }.
+  "digest",
 ] as const;
 
 export type ClaimKind = (typeof CLAIM_KINDS)[number];

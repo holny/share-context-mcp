@@ -1,17 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { validateClaim, idempotencyKey, CREDENTIAL_PATTERNS } from "../src/schema";
+import { CLAIM_KINDS, validateClaim, idempotencyKey, CREDENTIAL_PATTERNS } from "../src/schema";
 
-const KINDS = [
-  "progress",
-  "decision",
-  "contract",
-  "spec",
-  "howto",
-  "env-fact",
-  "negative-result",
-  "question",
-  "claim",
-] as const;
 
 function base(kind: string = "progress") {
   return {
@@ -129,12 +118,28 @@ describe("validateClaim — credentials blacklist", () => {
 });
 
 describe("validateClaim — kind enum", () => {
-  test("accepts all 9 valid kinds", () => {
-    for (const kind of KINDS) {
+  test("accepts all valid kinds", () => {
+    for (const kind of CLAIM_KINDS) {
       const r = validateClaim(base(kind));
       expect(r.ok).toBe(true);
       if (r.ok) expect(r.msg.kind).toBe(kind);
     }
+  });
+
+  test("includes digest kind (structural history summaries)", () => {
+    expect(CLAIM_KINDS.includes("digest")).toBe(true);
+    const r = validateClaim(base("digest"));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.msg.kind).toBe("digest");
+  });
+
+  test("accepts digest with covers scope convention", () => {
+    const claim = base("digest");
+    claim.scope = { covers: "1-500" };
+    claim.topic = "channel-digest";
+    const r = validateClaim(claim);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.msg.scope).toEqual({ covers: "1-500" });
   });
 
   test('rejects "foo"', () => {
