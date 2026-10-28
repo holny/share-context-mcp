@@ -780,4 +780,43 @@ describe("blind relay", () => {
       expect(m2.manager_member).toBe("carol");
     }
   });
+
+  test("bans listing + unban: manager/creator gated; consumer ids surfaced; invite-rights toggle", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/alice0001")).body as { token: string };
+    await joinChannel(channelId, "bob", PASSWORD, "s/bob000001");
+    // ban bob directly (as via a settled vote)
+    relay.db.prepare(
+      "INSERT INTO member_bans(channel_id, name, consumer_ids, banned_at, banned_by) VALUES (?, 'bob', ?, ?, 'vote:alice')",
+    ).run(channelId, JSON.stringify(["s/bob000001"]), new Date().toISOString());
+    relay.db.prepare("UPDATE members SET status = 'banned' WHERE channel_id = ? AND name = 'bob'").run(channelId);
+
+    // listing: any member can view (governance transparency)
+    const bans = (await (await fetch(`${base}/channels/${channelId}/bans`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as {
+      bans: Array<{ name: string; consumer_ids: string; banned_by: string }>;
+    };
+    expect(bans.bans).toHaveLength(1);
+    expect(bans.bans[0].name).toBe("bob");
+    expect(bans.bans[0].consumer_ids).toContain("s/bob000001");
+    // non-manager member join (carol) — carol cannot unban
+    const carol = (await joinChannel(channelId, "carol", PASSWORD, "s/carol0001")).body as { token: string };
+    const badUnban = await postJson(`/channels/${channelId}/unban`, { name: "bob" }, carol.token);
+    expect(badUnban.status).toBe(403);
+    // unban by manager (alice) → bob can re-join (consumer id no longer banned)
+    const unban = await postJson(`/channels/${channelId}/unban`, { name: "bob" }, alice.token);
+    expect(unban.status).toBe(200);
+    const rebob = await joinChannel(channelId, "bob", PASSWORD, "s/bob000002");
+    expect(rebob.status).toBe(200);
+
+    // invite-rights toggle: manager strips carol's right, restores it
+    const rights = await postJson(`/channels/${channelId}/invite-rights`, { name: "carol", canInvite: 0 }, alice.token);
+    expect(rights.status).toBe(200);
+    const carolRow = relay.db.prepare("SELECT can_invite FROM members WHERE channel_id = ? AND name = 'carol'").get(channelId) as { can_invite: number };
+    expect(carolRow.can_invite).toBe(0);
+    const restore = await postJson(`/channels/${channelId}/invite-rights`, { name: "carol", canInvite: 1 }, alice.token);
+    expect(restore.status).toBe(200);
+    const restoredRow = relay.db.prepare("SELECT can_invite FROM members WHERE channel_id = ? AND name = 'carol'").get(channelId) as { can_invite: number };
+    expect(restoredRow.can_invite).toBe(1);
+  });
 });

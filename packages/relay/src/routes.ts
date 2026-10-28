@@ -226,6 +226,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   const stmtSetAdmission = db.prepare(
     "UPDATE channels SET admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
   );
+  const stmtSetCredential = db.prepare(
+    "UPDATE channels SET verify_key = ?, admission_credential_revoked = ? WHERE id = ?",
+  );
   const stmtDirectory = db.prepare(`
     SELECT c.id, c.admission_mode, c.contact_info,
            (SELECT COUNT(*) FROM members m WHERE m.channel_id = c.id AND m.status = 'active') AS members
@@ -660,7 +663,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|transfer|leave|votes|votes\/[^/]+\/ballot))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -1018,6 +1021,85 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           });
         }
         return jsonError(405, "method not allowed");
+      }
+
+      case "bans": {
+        if (method !== "GET") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const rows = db.prepare("SELECT name, consumer_ids, ip, banned_at, banned_by FROM member_bans WHERE channel_id = ?").all(channelId);
+        return json({ bans: rows });
+      }
+
+      case "unban": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const name = parsed.body.name;
+        if (typeof name !== "string" || !validMemberName(name)) return jsonError(400, "invalid request: name must be a valid member name");
+        const res = db.prepare("DELETE FROM member_bans WHERE channel_id = ? AND name = ?").run(channelId, name);
+        // Unban ≠ readmission: clear the ban AND revoke tokens — the person
+        // re-admits with valid credentials (current password / fresh code).
+        if (res.changes > 0) {
+          db.prepare("UPDATE members SET status = 'active', token_hash = NULL, token_expires_at = NULL WHERE channel_id = ? AND name = ?").run(channelId, name);
+        }
+        audit(channelId, auth.member.name, res.changes > 0 ? "member.unbanned" : "unban.noop", name, res.changes > 0 ? "ok" : "no ban row");
+        return json({ ok: res.changes > 0 });
+      }
+
+      case "invite-rights": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const name = parsed.body.name;
+        const canInvite = parsed.body.canInvite;
+        if (typeof name !== "string" || !validMemberName(name) || (canInvite !== 0 && canInvite !== 1)) {
+          return jsonError(400, "invalid request: name (member) and canInvite (0|1) required");
+        }
+        const target = stmtMemberByName.get(channelId, name) as MemberRow | undefined;
+        if (!target || target.status !== "active") return jsonError(400, "target must be an active member");
+        db.prepare("UPDATE members SET can_invite = ? WHERE channel_id = ? AND name = ?").run(canInvite, channelId, name);
+        if (canInvite === 0) {
+          // strip their active codes too — no invite right, no invite capability
+          db.prepare("UPDATE invite_codes SET status = 'revoked' WHERE channel_id = ? AND owner = ? AND status = 'active'").run(channelId, name);
+        }
+        audit(channelId, auth.member.name, "invite.rights", name, `can_invite=${canInvite}`);
+        wsHub?.notifyGovernance(channelId, { type: "invite-rights", member: name, canInvite: canInvite === 1 });
+        return json({ ok: true, name, canInvite: canInvite === 1 });
+      }
+
+      case "set-credential": {
+        // Manager/creator swaps the admission credential WITHOUT touching the
+        // message key, epoch, or tokens (§ rotate --mode access).
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const verifyKeyB64 = parsed.body.verifyKeyB64;
+        if (typeof verifyKeyB64 !== "string" || verifyKeyB64.length < 16 || verifyKeyB64.length > 128) {
+          return jsonError(400, "invalid request: verifyKeyB64 required");
+        }
+        stmtSetCredential.run(verifyKeyB64, 0, channelId);
+        audit(channelId, auth.member.name, "credential.rotated", auth.member.name, "access mode");
+        return json({ ok: true });
       }
 
       case "messages": {

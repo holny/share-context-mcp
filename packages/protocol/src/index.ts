@@ -7,6 +7,10 @@ export {
   seal,
   open,
   hmacProof,
+  mintAdmissionCredential,
+  parseAdmissionCredential,
+  mintInviteCode,
+  parseInviteCode,
   type SealedEnvelope,
 } from "./crypto";
 export {

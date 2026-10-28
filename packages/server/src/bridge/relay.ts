@@ -16,6 +16,7 @@ import {
   deriveChannelKey,
   hmacProof,
   open,
+  parseAdmissionCredential,
   seal,
   validateClaim,
   type SealedEnvelope,
@@ -101,7 +102,7 @@ export class RelayBridge implements ChannelBridge {
     return body ?? {};
   }
 
-  private authHeaders(channelId: string): Record<string, string> {
+  authHeaders(channelId: string): Record<string, string> {
     const token = this.loadToken(channelId);
     if (!token) throw new Error(`not joined: ${channelId}`);
     const headers: Record<string, string> = { authorization: `Bearer ${token}` };
@@ -180,6 +181,11 @@ export class RelayBridge implements ChannelBridge {
   private channelKey(channelId: string): Uint8Array {
     const secret = this.store.getChannelSecret(channelId);
     if (!secret) throw new Error(`unknown channel: ${channelId}`);
+    // Self-contained credential (scmc1-): the message key unwraps from it.
+    // Legacy channels derive it from the password via HKDF.
+    if (secret.password.startsWith("scmc1-")) {
+      return parseAdmissionCredential(secret.password);
+    }
     return deriveChannelKey(secret.password, channelId);
   }
 
@@ -244,7 +250,14 @@ export class RelayBridge implements ChannelBridge {
   }
 
   async join(channelId: string, password: string, memberName: string, _opts?: { gitUrl?: string }): Promise<void> {
-    const key = deriveChannelKey(password, channelId);
+    // Self-contained admission credential (scmc1- prefix): the message key
+    // travels inside the credential — unwrap it; the challenge proof is
+    // computed from the SAME channel key either way. Legacy passwords derive
+    // it via HKDF.
+    const { parseAdmissionCredential } = await import("@share-context-mcp/protocol");
+    const key = password.startsWith("scmc1-")
+      ? parseAdmissionCredential(password)
+      : deriveChannelKey(password, channelId);
     // On 401 the relay's error propagates verbatim BEFORE anything is persisted.
     try {
       await this.challengeJoin(channelId, key, memberName);
