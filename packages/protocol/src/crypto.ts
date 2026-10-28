@@ -194,7 +194,11 @@ export function mintInviteCode(
   const cipher = createCipheriv("aes-256-gcm", wrapKey, nonce);
   const expiresAt = Date.now() + ttlMs;
   const payload = Buffer.from(JSON.stringify({ key: Buffer.from(channelKey).toString("base64"), exp: expiresAt }), "utf8");  const ct = Buffer.concat([cipher.update(payload), cipher.final(), cipher.getAuthTag()]);
-  const code = `${CREDENTIAL_PREFIX}-${b32(Buffer.concat([Buffer.from(codeId, "utf8").subarray(0, 16), ws, nonce, ct]))}`;
+  // codeId is fixed-width (16 bytes, NUL-padded) so the round trip is exact
+  // for arbitrary ids ≤ 16 chars.
+  const idBuf = Buffer.alloc(16);
+  idBuf.write(codeId, 0, "utf8");
+  const code = `${CREDENTIAL_PREFIX}-${b32(Buffer.concat([idBuf, ws, nonce, ct]))}`;
   return { code, codeId, expiresAt };
 }
 
