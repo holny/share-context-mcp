@@ -142,7 +142,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   `);
   const stmtClearTokens = db.prepare("UPDATE members SET token_hash = NULL, token_expires_at = NULL WHERE channel_id = ?");
   const stmtBumpEpoch = db.prepare("UPDATE channels SET epoch = epoch + 1 WHERE id = ?");
-  const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, nonce, ciphertext, idem_key, created_at) VALUES (?, ?, ?, ?, ?, ?)");
+  const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, sender, nonce, ciphertext, idem_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
   const stmtMessageByIdem = db.prepare("SELECT seq FROM messages WHERE channel_id = ? AND idem_key = ?");
   const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
   // Returns the LIVE epoch alongside the allocated seq so push notifications
@@ -159,6 +159,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
   const stmtUseInviteCode = db.prepare("UPDATE invite_codes SET used_by = ?, status = 'used' WHERE channel_id = ? AND code_id = ? AND status = 'active'");
   const stmtInviteCode = db.prepare("SELECT owner, used_by, status, expires_at FROM invite_codes WHERE channel_id = ? AND code_id = ?");
+  const stmtSetRoles = db.prepare("UPDATE channels SET creator_member = ?, manager_member = ? WHERE id = ?");
   const stmtAudit = db.prepare("INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, ?, ?, ?)");
   const stmtInsertInviteCode = db.prepare(
     "INSERT INTO invite_codes(channel_id, code_id, owner, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 'active')",
@@ -173,6 +174,45 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     WHERE c.admission_mode = 'public' OR c.contact_info IS NOT NULL
     ORDER BY c.created_at ASC
   `);
+  const stmtLeave = db.prepare(
+    "UPDATE members SET status = 'left', token_hash = NULL, token_expires_at = NULL WHERE channel_id = ? AND name = ?",
+  );
+  const stmtSetManager = db.prepare("UPDATE channels SET manager_member = ? WHERE id = ?");
+  const stmtActiveCount = db.prepare(
+    "SELECT COUNT(*) AS n FROM members WHERE channel_id = ? AND status = 'active'",
+  );
+  // Default successor rule (§2): most messages in the trailing 7 days among
+  // active members excluding the leaving creator; tie → earliest joined.
+  const stmtSuccessor = db.prepare(`
+    SELECT m.name
+    FROM members m
+    LEFT JOIN (
+      SELECT sender, COUNT(*) AS n FROM messages
+      WHERE channel_id = ? AND created_at > ? AND sender IS NOT NULL
+      GROUP BY sender
+    ) c ON c.sender = m.name
+    WHERE m.channel_id = ? AND m.status = 'active' AND m.name != ?
+    ORDER BY COALESCE(c.n, 0) DESC, m.joined_at ASC
+    LIMIT 1
+  `);
+  const stmtDissolve = {
+    run(channelId: string): void {
+      for (const t of ["members", "messages", "votes", "ballots", "member_bans", "invite_codes", "member_consumer_ids", "audit_log"]) {
+        db.prepare(`DELETE FROM ${t} WHERE channel_id = ?`).run(channelId);
+      }
+      db.prepare("DELETE FROM channels WHERE id = ?").run(channelId);
+    },
+  };
+
+  function dissolve(channelId: string): void {
+    stmtDissolve.run(channelId);
+  }
+
+  function defaultSuccessor(channelId: string, leavingCreator: string): string | null {
+    const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    const row = stmtSuccessor.get(channelId, since, channelId, leavingCreator) as { name: string } | undefined;
+    return row?.name ?? null;
+  }
 
   /** Governance audit trail (§4b): every governance operation lands here. */
   function audit(channelId: string, actor: string, action: string, target?: string, result?: string): void {
@@ -279,7 +319,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   const storeMessage = db.transaction(
-    (channelId: string, nonce: string, ciphertext: string, idemKey: string): { seq: number; epoch: number; deduped: boolean } => {
+    (channelId: string, sender: string, nonce: string, ciphertext: string, idemKey: string): { seq: number; epoch: number; deduped: boolean } => {
       const existing = stmtMessageByIdem.get(channelId, idemKey) as { seq: number } | undefined;
       if (existing) {
         return { seq: existing.seq, epoch: 0, deduped: true };
@@ -292,7 +332,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         // unreachable: channel existence verified in authenticate()
         throw new Error("channel vanished mid-transaction");
       }
-      stmtInsertMessage.run(channelId, allocated.seq, nonce, ciphertext, idemKey, new Date().toISOString());
+      stmtInsertMessage.run(channelId, allocated.seq, sender, nonce, ciphertext, idemKey, new Date().toISOString());
       return { seq: allocated.seq, epoch: allocated.epoch, deduped: false };
     },
   );
@@ -346,10 +386,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         admissionMode === "public" || admissionMode === "invite" ? admissionMode : "password";
       const invitePolicy = parsed.body.invitePolicy === "managers-only" ? "managers-only" : "everyone";
       const contactInfo = typeof parsed.body.contactInfo === "string" ? (parsed.body.contactInfo as string) : null;
-      const stmtSetRoles = db.prepare(
+      const stmtSetRolesAndAdmission = db.prepare(
         "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
       );
-      stmtSetRoles.run((memberName as string).trim(), (memberName as string).trim(), mode, invitePolicy, contactInfo, channelId);
+      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, invitePolicy, contactInfo, channelId);
       audit(channelId, (memberName as string).trim(), "channel.created", channelId, `mode=${mode}`);
       return json({ channelId, epoch: 1, nextSeq: 1 });
     }
@@ -375,7 +415,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|transfer|leave))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -570,6 +610,80 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         return json({ ok: true, mode });
       }
 
+      case "transfer": {
+        // Creator hands the manager role to another active member.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const to = parsed.body.to;
+        if (typeof to !== "string" || !validMemberName(to)) {
+          return jsonError(400, "invalid request: to must be a valid member name");
+        }
+        const target = stmtMemberByName.get(channelId, to) as MemberRow | undefined;
+        if (!target || target.status !== "active") return jsonError(400, "transfer target must be an active member");
+        stmtSetRoles.run(auth.channel.creator_member, to, channelId);
+        audit(channelId, auth.member.name, "role.transferred", to, "manager");
+        wsHub?.notifyGovernance(channelId, { type: "role-changed", manager: to });
+        return json({ ok: true, manager: to });
+      }
+
+      case "leave": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const parsed = await readJson(req);
+        const name = auth.member.name;
+        const isCreator = name === auth.channel.creator_member;
+        const isManager = name === auth.channel.manager_member;
+        let transferTo: string | null = null;
+        if (parsed.ok && typeof parsed.body.transferTo === "string" && validMemberName(parsed.body.transferTo)) {
+          transferTo = (parsed.body.transferTo as string).trim();
+        }
+        // Mark left + revoke tokens.
+        stmtLeave.run(channelId, name);
+        // Succession.
+        if (isCreator) {
+          const successor =
+            transferTo !== null && transferTo !== name
+              ? transferTo
+              : defaultSuccessor(channelId, name);
+          if (successor) {
+            const oldManager = auth.channel.manager_member;
+            // creator leaves → successor takes creator; manager passes too if
+            // the leaving creator was also the manager
+            stmtSetRoles.run(successor, oldManager === name ? successor : oldManager, channelId);
+            audit(channelId, name, "role.transferred", successor, "creator");
+            wsHub?.notifyGovernance(channelId, { type: "role-changed", creator: successor, manager: oldManager === name ? successor : (oldManager ?? "") });
+          } else {
+            // nobody to hand over to → dissolution below
+          }
+        } else if (isManager) {
+          // manager (not creator) leaves → reverts to creator
+          const creator = auth.channel.creator_member ?? "";
+          stmtSetManager.run(creator, channelId);
+          audit(channelId, name, "role.reverted", creator, "manager");
+          wsHub?.notifyGovernance(channelId, { type: "role-changed", manager: creator });
+        }
+        // Dissolution: no active members remain.
+        const activeLeft = stmtActiveCount.get(channelId) as { n: number };
+        if ((activeLeft?.n ?? 0) === 0) {
+          dissolve(channelId);
+          audit(channelId, name, "channel.dissolved", channelId, "last member left");
+          // Dissolved: evict every live connection for the dead channel.
+          wsHub?.invalidateChannel(channelId, 0);
+        } else {
+          wsHub?.notifyGovernance(channelId, { type: "member-left", member: name });
+        }
+        return json({ ok: true, dissolved: (activeLeft?.n ?? 0) === 0 });
+      }
+
       case "messages": {
         if (method === "POST") {
           const auth = authenticate(channelId, req);
@@ -591,7 +705,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           if (Buffer.from(ciphertext, "base64").length > MAX_CIPHERTEXT_BYTES) {
             return jsonError(413, "message too large: ciphertext must be at most 8192 bytes");
           }
-          const stored = storeMessage(channelId, shape.values.nonce, ciphertext, shape.values.idemKey);
+          const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey);
           if (!stored.deduped) {
             // Push-wake only (spec §5.7): notifications carry seq+epoch, never
             // content. Dedup re-sends nothing (the original insert already
@@ -672,6 +786,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const auth = authenticate(channelId, req);
         if (auth === "banned") return jsonError(403, "banned");
         if (!auth) return jsonError(401, "unauthorized");
+        // Governance (§2): rotation is a MANAGER/CREATOR operation.
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          audit(channelId, auth.member.name, "rotate.denied", auth.member.name, "not manager/creator");
+          return jsonError(403, "manager or creator only");
+        }
         // v1: no key chain (spec §5.5). The caller (proven old-password holder
         // via Bearer token) supplies the NEW password's verification key —
         // still blind: a verification key cannot decrypt messages. Bump epoch,

@@ -67,6 +67,7 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE channels ADD COLUMN vote_cooldown_until INTEGER"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN can_invite INTEGER NOT NULL DEFAULT 1"); } catch {}
+    try { db.exec("ALTER TABLE messages ADD COLUMN sender TEXT"); } catch {}
     db.exec(`
       CREATE TABLE IF NOT EXISTS member_bans(
         channel_id TEXT NOT NULL REFERENCES channels(id),
@@ -156,6 +157,7 @@ export function openDb(dbPath: string): Database {
     CREATE TABLE IF NOT EXISTS messages(
       channel_id TEXT NOT NULL REFERENCES channels(id),
       seq INTEGER NOT NULL,
+      sender TEXT,
       nonce TEXT NOT NULL,
       ciphertext TEXT NOT NULL,
       idem_key TEXT NOT NULL,

@@ -637,4 +637,67 @@ describe("blind relay", () => {
       await r2.stop();
     }
   });
+
+  test("roles: rotate is manager-only; leave/transfer/dissolve per succession table", async () => {
+    // manager (alice) + regular members bob, carol
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+    const aliceTok = ((await joinChannel(channelId, "alice", PASSWORD, "s/alice0001")).body as { token: string }).token;
+    const bobTok = ((await joinChannel(channelId, "bob", PASSWORD, "s/bob000001")).body as { token: string }).token;
+    const carolTok = ((await joinChannel(channelId, "carol", PASSWORD, "s/carol0001")).body as { token: string }).token;
+    const meta = async (t: string) =>
+      (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${t}` } })).json()) as {
+        creatorMember: string;
+        managerMember: string;
+      };
+
+    // (a) rotate by non-manager → 403
+    const vk = verifyKeyB64Of("new-pw-1", channelId);
+    const badRotate = await postJson(`/channels/${channelId}/rotate`, { verifyKeyB64: vk }, bobTok);
+    expect(badRotate.status).toBe(403);
+
+    // (c) creator leaves WITHOUT transferTo → default rule: most messages in
+    // trailing 7d excluding creator (bob: 2, carol: 1) → bob becomes creator
+    await sendClaim(aliceTok, channelId, "a1", { topic: "t" });
+    await sendClaim(bobTok, channelId, "b1", { topic: "t" });
+    await sendClaim(bobTok, channelId, "b2", { topic: "t" });
+    await sendClaim(carolTok, channelId, "c1", { topic: "t" });
+    const leaveCreator = await postJson(`/channels/${channelId}/leave`, {}, aliceTok);
+    expect(leaveCreator.status).toBe(200);
+    expect((await meta(bobTok)).creatorMember).toBe("bob");
+    expect((await meta(bobTok)).managerMember).toBe("bob");
+
+    // manager (bob, now also creator) leaves WITH transferTo → carol takes both
+    const leaveManager = await postJson(`/channels/${channelId}/leave`, { transferTo: "carol" }, bobTok);
+    expect(leaveManager.status).toBe(200);
+    const m3 = await meta(carolTok);
+    expect(m3.creatorMember).toBe("carol");
+    expect(m3.managerMember).toBe("carol");
+
+    // last member (carol) leaves → dissolve: credential join → 404
+    const lastLeave = await postJson(`/channels/${channelId}/leave`, {}, carolTok);
+    expect(lastLeave.status).toBe(200);
+    const ch = await postJson(`/channels/${channelId}/challenge`, { memberName: "carol" });
+    expect(ch.status).toBe(404);
+  });
+
+  test("manager (not creator) leaves → manager reverts to creator", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+    const aliceTok = ((await joinChannel(channelId, "alice", PASSWORD, "s/alice1001")).body as { token: string }).token;
+    const bobTok = ((await joinChannel(channelId, "bob", PASSWORD, "s/bob100001")).body as { token: string }).token;
+    const meta = async (t: string) =>
+      (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${t}` } })).json()) as {
+        creatorMember: string;
+        managerMember: string;
+      };
+    // explicit manager transfer (creator op)
+    const xfer = await postJson(`/channels/${channelId}/transfer`, { to: "bob" }, aliceTok);
+    expect(xfer.status).toBe(200);
+    expect((await meta(bobTok)).managerMember).toBe("bob");
+    // bob (manager, not creator) leaves → manager reverts to alice
+    const leaveRes = await postJson(`/channels/${channelId}/leave`, {}, bobTok);
+    expect(leaveRes.status).toBe(200);
+    expect((await meta(aliceTok)).managerMember).toBe("alice");
+  });
 });
