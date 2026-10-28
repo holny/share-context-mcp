@@ -263,6 +263,148 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     },
   };
 
+  // ---- vote module (§4) ----
+  const VOTE_DURATION_MS = 48 * 3_600_000;
+  const VOTE_GLOBAL_COOLDOWN_MS = 4 * 3_600_000;
+  const VOTE_INITIATOR_PASS_COOLDOWN_MS = 48 * 3_600_000;
+  const VOTE_INITIATOR_FAIL_COOLDOWN_MS = 7 * 86_400_000;
+
+  const stmtInsertVote = db.prepare(
+    "INSERT INTO votes(channel_id, id, type, initiator, target, params_json, started_at, ends_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')",
+  );
+  const stmtOpenVote = db.prepare("SELECT id, type, initiator, target, started_at, ends_at FROM votes WHERE channel_id = ? AND status = 'open'");
+  const stmtVoteById = db.prepare("SELECT * FROM votes WHERE channel_id = ? AND id = ?");
+  const stmtOpenVotes = db.prepare("SELECT id, type, target, ends_at FROM votes WHERE channel_id = ? AND status = 'open'");
+  const stmtVoteHistory = db.prepare("SELECT id, type, initiator, target, status, started_at, ends_at FROM votes WHERE channel_id = ? ORDER BY started_at DESC");
+  const stmtBallots = db.prepare("SELECT voter_name, choice FROM ballots WHERE channel_id = ? AND vote_id = ?");
+  const stmtInsertBallot = db.prepare(
+    "INSERT INTO ballots(channel_id, vote_id, voter_name, choice) VALUES (?, ?, ?, ?)",
+  );
+  const stmtSettleVote = db.prepare("UPDATE votes SET status = ? WHERE channel_id = ? AND id = ? AND status = 'open'");
+  const stmtActiveMembers = db.prepare("SELECT name FROM members WHERE channel_id = ? AND status = 'active'");
+  const stmtSetCooldown = db.prepare("UPDATE channels SET vote_cooldown_until = ? WHERE id = ?");
+  const stmtCooldown = db.prepare("SELECT vote_cooldown_until FROM channels WHERE id = ?");
+  const stmtInitiatorLastPass = db.prepare(
+    "SELECT MAX(ends_at) AS t FROM votes WHERE channel_id = ? AND initiator = ? AND status = 'passed'",
+  );
+  const stmtInitiatorLastFail = db.prepare(
+    "SELECT MAX(ends_at) AS t FROM votes WHERE channel_id = ? AND initiator = ? AND status = 'failed'",
+  );
+  const stmtSettleFreeze = db.prepare("UPDATE invite_codes SET status = 'revoked' WHERE channel_id = ? AND status = 'frozen'");
+
+  /** Active member names — the vote denominator universe. */
+  function activeMemberNames(channelId: string): string[] {
+    return (stmtActiveMembers.all(channelId) as Array<{ name: string }>).map((r) => r.name);
+  }
+
+  /** Threshold evaluation (§4): does the current tally pass? */
+  function tallyPasses(channelId: string, target: string, cast: number, yes: number): boolean {
+    const ch = stmtChannel.get(channelId) as ChannelRow;
+    const leadership = target === ch.manager_member || target === ch.creator_member;
+    if (leadership) {
+      const turnoutOk = cast >= Math.ceil(ch2active(channelId) / 2);
+      return turnoutOk && yes >= Math.ceil((2 * cast) / 3);
+    }
+    return yes > cast / 2;
+  }
+
+  function ch2active(channelId: string): number {
+    return (stmtActiveCount.get(channelId) as { n: number }).n;
+  }
+
+  /**
+   * Settle an open vote exactly once (guarded by the status transition).
+   * `passed` applies the kick action; any settlement sets cooldowns.
+   * Idempotent: a second call finds no open vote and does nothing.
+   */
+  function settleVote(channelId: string, voteId: string, passed: boolean): void {
+    const updated = stmtSettleVote.run(passed ? "passed" : "failed", channelId, voteId);
+    if (updated.changes === 0) return; // already settled — idempotent
+    const vote = stmtVoteById.get(channelId, voteId) as
+      | { type: string; initiator: string; target: string; params_json: string | null }
+      | undefined;
+    const now = Date.now();
+    stmtSetCooldown.run(now + VOTE_GLOBAL_COOLDOWN_MS, channelId);
+    if (!vote) return;
+    if (passed && vote.type === "kick") {
+      const params = vote.params_json ? (JSON.parse(vote.params_json) as { banIp?: boolean; revokeInvitees?: boolean }) : {};
+      const ip = (
+        db.prepare("SELECT ip FROM member_bans WHERE channel_id = ? AND name = ?").get(channelId, vote.target) as
+          | { ip: string | null }
+          | undefined
+      )?.ip ?? undefined;
+      applyKick(db, channelId, vote.target, vote.initiator, { ip, banIp: params.banIp === true });
+      if (params.revokeInvitees === true) {
+        db.prepare(
+          "UPDATE members SET can_invite = 0 WHERE channel_id = ? AND name IN (SELECT used_by FROM invite_codes WHERE channel_id = ? AND owner = ?) AND name != ? AND name != ?",
+        ).run(channelId, channelId, vote.target, vote.target, vote.initiator);
+      }
+    }
+    if (!passed && vote.type === "kick") {
+      // failure lifts the lineage freeze exactly
+      db.prepare("UPDATE invite_codes SET status = 'active' WHERE channel_id = ? AND status = 'frozen'").run(channelId);
+    }
+    wsHub?.notifyGovernance(channelId, {
+      type: "vote-settled",
+      voteId,
+      target: vote.target,
+      outcome: passed ? "passed" : "failed",
+    });
+  }
+
+  function checkSettle(channelId: string, voteId: string): void {
+    const vote = stmtVoteById.get(channelId, voteId) as
+      | { status: string; target: string; initiator: string; ends_at: number }
+      | undefined;
+    if (!vote || vote.status !== "open") return;
+    const ballots = stmtBallots.all(channelId, voteId) as Array<{ voter_name: string; choice: string }>;
+    const yes = ballots.filter((b) => b.choice === "yes").length;
+    const cast = ballots.length;
+    const ch = stmtChannel.get(channelId) as ChannelRow;
+    const leadership = vote.target === ch.manager_member || vote.target === ch.creator_member;
+    const active = activeMemberNames(channelId);
+    const eligible = active.length - 1; // the target cannot vote
+    const remaining = eligible - cast;
+    // EARLY PASS — even a unanimous remaining "no" cannot flip the outcome.
+    if (leadership) {
+      const turnoutWillBeMet = cast >= Math.ceil(active.length / 2) || cast + remaining >= Math.ceil(active.length / 2);
+      const yesWillBeMet = yes >= Math.ceil((2 * (cast + remaining)) / 3);
+      if (turnoutWillBeMet && yesWillBeMet) {
+        settleVote(channelId, voteId, true);
+        return;
+      }
+    } else if (yes > (cast + remaining) / 2) {
+      settleVote(channelId, voteId, true);
+      return;
+    }
+    // EARLY FAIL — even a unanimous remaining "yes" cannot flip the outcome.
+    const bestCaseYes = yes + remaining;
+    if (leadership) {
+      const eventualCast = cast + remaining;
+      if (bestCaseYes < Math.ceil((2 * eventualCast) / 3)) {
+        settleVote(channelId, voteId, false);
+      }
+      // Remaining ballots always count toward cast, so turnout only grows —
+      // no separate early-fail on turnout is possible.
+      return;
+    }
+    if (bestCaseYes <= cast / 2) {
+      settleVote(channelId, voteId, false);
+    }
+  }
+
+  function settleExpiredVotes(): void {
+    const now = Date.now();
+    const expired = db
+      .prepare("SELECT channel_id, id, target FROM votes WHERE status = 'open' AND ends_at <= ?")
+      .all(now) as Array<{ channel_id: string; id: string; target: string }>;
+    for (const v of expired) {
+      const ballots = stmtBallots.all(v.channel_id, v.id) as Array<{ choice: string }>;
+      const yes = ballots.filter((b) => b.choice === "yes").length;
+      settleVote(v.channel_id, v.id, tallyPasses(v.channel_id, v.target, ballots.length, yes));
+    }
+  }
+
   function dissolve(channelId: string): void {
     stmtDissolve.run(channelId);
   }
@@ -319,6 +461,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     for (const ch of stmtChannelsForSweep.all() as Array<{ id: string; next_seq: number }>) {
       evictIfNeeded(ch.id, ch.next_seq);
     }
+    settleExpiredVotes();
   }
 
   /** Returns channel+member for a valid Bearer token, or null (caller answers 401). */
@@ -333,13 +476,28 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
    */
   function authenticate(channelId: string, req: Request): AuthResult {
     const token = bearerToken(req);
-    if (!token) return null;
+    if (!token) {
+      if (process.env.SCM_DEBUG) console.error("auth-debug: no token", new URL(req.url).pathname);
+      return null;
+    }
     const channel = stmtChannel.get(channelId) as ChannelRow | undefined;
-    if (!channel) return null;
+    if (!channel) {
+      if (process.env.SCM_DEBUG) console.error("auth-debug: no channel", channelId);
+      return null;
+    }
     const member = stmtMemberByToken.get(channelId, sha256Hex(token)) as MemberRow | undefined;
-    if (!member) return null;
+    if (!member) {
+      if (process.env.SCM_DEBUG) {
+        const all = db.prepare("SELECT channel_id, name, substr(token_hash,1,10) AS h, status FROM members").all();
+        console.error("auth-debug: no member by token", channelId, sha256Hex(token).slice(0, 10), JSON.stringify(all));
+      }
+      return null;
+    }
     const now = Date.now();
-    if (!isLiveToken(member, channel, now)) return null;
+    if (!isLiveToken(member, channel, now)) {
+      if (process.env.SCM_DEBUG) console.error("auth-debug: token not live", member.token_expires_at, member.epoch, channel.epoch);
+      return null;
+    }
     const memberBanned = member.status === "banned";
     // Consumer binding: a presented consumer id is auto-registered (a valid
     // member token IS the membership proof — multi-session processes must
@@ -473,8 +631,36 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       return json({ channels });
     }
 
+    // ---- /channels/:id/votes/:vid/ballot — cast a ballot ----
+    const ballotMatch = path.match(/^\/channels\/([^/]+)\/votes\/([^/]+)\/ballot$/);
+    if (ballotMatch && method === "POST") {
+      const [, channelId, voteId] = ballotMatch;
+      const auth = authenticate(channelId, req);
+      if (auth === "banned") return jsonError(403, "banned");
+      if (!auth) return jsonError(401, "unauthorized");
+      const voter = auth.member.name;
+      const parsed = await readJson(req);
+      if (!parsed.ok) return parsed.resp;
+      const choice = parsed.body.choice;
+      if (choice !== "yes" && choice !== "no") return jsonError(400, "invalid request: choice must be yes|no");
+      const vote = stmtVoteById.get(channelId, voteId) as
+        | { status: string; initiator: string; target: string }
+        | undefined;
+      if (!vote) return jsonError(404, "vote not found");
+      if (vote.status !== "open") return jsonError(409, "vote settled");
+      if (vote.target === voter) return jsonError(403, "target cannot vote");
+      // checkSettle may settle early; ballot insert first, then settle check
+      try {
+        stmtInsertBallot.run(channelId, voteId, voter, choice);
+      } catch {
+        return jsonError(409, "already voted");
+      }
+      checkSettle(channelId, voteId);
+      return json({ ok: true });
+    }
+
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|transfer|leave))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|transfer|leave|votes|votes\/[^/]+\/ballot))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -746,6 +932,92 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           wsHub?.notifyGovernance(channelId, { type: "member-left", member: name });
         }
         return json({ ok: true, dissolved: (activeLeft?.n ?? 0) === 0 });
+      }
+
+      case "votes": {
+        if (method === "POST") {
+          // OPEN a vote (CLI-facing; the relay accepts any active member —
+          // the CLI-only rule is a surface rule, enforced by tool presence).
+          const auth = authenticate(channelId, req);
+          if (auth === "banned") return jsonError(403, "banned");
+          if (!auth) return jsonError(401, "unauthorized");
+          const initiator = auth.member.name;
+          if (auth.member.can_invite !== 1 && auth.member.name !== auth.channel.manager_member) {
+            return jsonError(403, "banned");
+          }
+          const parsed = await readJson(req);
+          if (!parsed.ok) return parsed.resp;
+          const type = parsed.body.type;
+          if (type !== "kick") return jsonError(400, "invalid request: type must be kick (v1)");
+          const target = parsed.body.target;
+          if (typeof target !== "string" || !validMemberName(target)) {
+            return jsonError(400, "invalid request: target must be a valid member name");
+          }
+          if (target === initiator) return jsonError(400, "invalid request: target must differ from initiator");
+          const targetRow = stmtMemberByName.get(channelId, target) as MemberRow | undefined;
+          if (!targetRow || targetRow.status !== "active") {
+            return jsonError(400, "invalid request: target must be an active member");
+          }
+          // single open vote per channel
+          const open = stmtOpenVote.get(channelId) as { id: string } | undefined;
+          if (open) return jsonError(409, "a vote is already open");
+          // cooldowns: global + initiator
+          const cooldown = (stmtCooldown.get(channelId) as { vote_cooldown_until: number | null } | undefined)
+            ?.vote_cooldown_until ?? 0;
+          if (cooldown > Date.now()) return jsonError(429, "vote cooldown active");
+          const lastPass = (stmtInitiatorLastPass.get(channelId, initiator) as { t: number | null }).t ?? 0;
+          if (Date.now() - lastPass < VOTE_INITIATOR_PASS_COOLDOWN_MS) {
+            return jsonError(429, "initiator cooldown (passed vote)");
+          }
+          const lastFail = (stmtInitiatorLastFail.get(channelId, initiator) as { t: number | null }).t ?? 0;
+          if (Date.now() - lastFail < VOTE_INITIATOR_FAIL_COOLDOWN_MS) {
+            return jsonError(429, "initiator cooldown (failed vote)");
+          }
+          const active = activeMemberNames(channelId);
+          if (active.length < 3) return jsonError(400, "at least 3 active members required");
+          if (!active.includes(target)) return jsonError(400, "target must be an active member");
+          const voteId = randomBytes(8).toString("hex");
+          const params: Record<string, unknown> = {};
+          if (parsed.body.banIp === true) params.banIp = true;
+          if (parsed.body.revokeInvitees === true) params.revokeInvitees = true;
+          const now = Date.now();
+          stmtInsertVote.run(
+            channelId,
+            voteId,
+            "kick",
+            initiator,
+            target,
+            JSON.stringify(params),
+            new Date().toISOString(),
+            now + VOTE_DURATION_MS,
+          );
+          // Lineage freeze: target's code + codes of everyone the target
+          // invited (invite tier semantics; no-op in password mode).
+          db.prepare(
+            "UPDATE invite_codes SET status = 'frozen' WHERE channel_id = ? AND (owner = ? OR used_by = ?) AND status = 'active'",
+          ).run(channelId, target, target);
+          audit(channelId, initiator, "vote.opened", target, `vote ${voteId} type kick`);
+          wsHub?.notifyGovernance(channelId, { type: "vote-open", voteId, target, endsAt: now + VOTE_DURATION_MS });
+          return json({ ok: true, voteId, endsAt: now + VOTE_DURATION_MS });
+        }
+        if (method === "GET") {
+          const auth = authenticate(channelId, req);
+          if (auth === "banned") return jsonError(403, "banned");
+          if (!auth) return jsonError(401, "unauthorized");
+          const open = stmtOpenVotes.all(channelId) as Array<{ id: string; type: string; target: string; ends_at: number }>;
+          const history = stmtVoteHistory.all(channelId) as Array<{
+            id: string; type: string; initiator: string; target: string; status: string; started_at: string; ends_at: number;
+          }>;
+          const withTallies = history.map((v) => {
+            const ballots = stmtBallots.all(channelId, v.id) as Array<{ choice: string }>;
+            return { ...v, yes: ballots.filter((b) => b.choice === "yes").length, no: ballots.filter((b) => b.choice === "no").length };
+          });
+          return json({
+            open: open.map((v) => ({ id: v.id, type: v.type, target: v.target, endsAt: v.ends_at })),
+            history: withTallies,
+          });
+        }
+        return jsonError(405, "method not allowed");
       }
 
       case "messages": {
