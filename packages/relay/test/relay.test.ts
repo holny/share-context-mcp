@@ -329,4 +329,34 @@ describe("blind relay", () => {
     expect(route.status).toBe(404);
     expect((await route.json()) as Record<string, unknown>).toEqual({ error: "not found" });
   });
+
+  test("activity receipts: auth required, timestamp stored, exposed via meta", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    expect(created.status).toBe(200);
+    const joined = await joinChannel(channelId, "alice", PASSWORD);
+    expect(joined.status).toBe(200);
+    const token = (joined.body as { token: string }).token;
+
+    // no token → 401
+    const noAuth = await postJson(`/channels/${channelId}/activity`, { lastActiveAt: new Date().toISOString() });
+    expect(noAuth.status).toBe(401);
+
+    // invalid timestamp → 400 (blind relay hygiene: validate metadata shape)
+    const bad = await postJson(`/channels/${channelId}/activity`, { lastActiveAt: "not-a-date" }, token);
+    expect(bad.status).toBe(400);
+
+    // authenticated → 200, stored, exposed via meta
+    const ts = new Date().toISOString();
+    const act = await postJson(`/channels/${channelId}/activity`, { lastActiveAt: ts }, token);
+    expect(act.status).toBe(200);
+    const meta = await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${token}` } });
+    const body = (await meta.json()) as { members: Array<{ memberName: string; lastActiveAt: string | null }> };
+    const me = body.members.find((m) => m.memberName === "alice");
+    expect(me?.lastActiveAt).toBe(ts);
+  });
 });

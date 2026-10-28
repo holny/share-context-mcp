@@ -97,7 +97,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND token_hash = ?");
-  const stmtMembers = db.prepare("SELECT name, joined_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
+  const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
+  const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
   const stmtUpsertMember = db.prepare(`
     INSERT INTO members(channel_id, name, token_hash, token_expires_at, epoch, joined_at)
@@ -210,7 +211,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -322,16 +323,30 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
         return jsonError(405, "method not allowed");
       }
 
+      case "activity": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (!auth) return jsonError(401, "unauthorized");
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const lastActiveAt = parsed.body.lastActiveAt;
+        if (typeof lastActiveAt !== "string" || Number.isNaN(Date.parse(lastActiveAt))) {
+          return jsonError(400, "invalid request: lastActiveAt must be an ISO 8601 timestamp");
+        }
+        stmtSetLastActive.run(lastActiveAt, channelId, auth.member.name);
+        return json({ ok: true });
+      }
+
       case "meta": {
         if (method !== "GET") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
         if (!auth) return jsonError(401, "unauthorized");
-        const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string }>;
+        const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string; last_active_at: string | null }>;
         return json({
           channelId: auth.channel.id,
           epoch: auth.channel.epoch,
           nextSeq: auth.channel.next_seq,
-          members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at })),
+          members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at, lastActiveAt: m.last_active_at })),
         });
       }
 

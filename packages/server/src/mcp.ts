@@ -70,6 +70,12 @@ function truncate(text: string, max: number): string {
  * channel > last joined. Friendly error when nothing is joined.
  */
 function resolveChannel(store: Store, channelId?: string): string {
+  const ch = resolveChannelInner(store, channelId);
+  activityHook?.(ch);
+  return ch;
+}
+
+function resolveChannelInner(store: Store, channelId?: string): string {
   if (channelId !== undefined && channelId !== "") {
     if (!store.getChannelSecret(channelId)) {
       throw new Error(`not joined to channel ${channelId} — use join_channel first`);
@@ -105,6 +111,23 @@ function filterClaims(
     }
     return true;
   });
+}
+
+/**
+ * Presence hook, set by buildMcpServer: every tool call that resolves a
+ * channel is an activity signal (the MCP protocol has no session-exit events,
+ * so "active" = recently active). The bridge rate-limits the actual POST.
+ */
+let activityHook: ((channelId: string) => void) | null = null;
+
+/** Presence bucket: active within the last 5 minutes. */
+const ACTIVE_WINDOW_MS = 5 * 60 * 1000;
+
+function activityBucket(lastActiveAt: string | null | undefined): string | undefined {
+  if (!lastActiveAt) return undefined;
+  const age = Date.now() - Date.parse(lastActiveAt);
+  if (Number.isNaN(age)) return undefined;
+  return age <= ACTIVE_WINDOW_MS ? "recently-active" : "idle";
 }
 
 /**
@@ -147,8 +170,7 @@ const channelIdParam = {
 };
 
 export function buildMcpServer(deps: McpServerDeps): McpServer {
-  const { store, bridge, onChannelJoined, onChannelLeft } = deps;
-  // Consumer-scoped delivered cursor: one MCP server process serves many
+  const { store, bridge, onChannelJoined, onChannelLeft } = deps;  // Consumer-scoped delivered cursor: one MCP server process serves many
   // agent sessions (opencode shares one stdio process across sessions, each
   // tool call carrying `_meta["ai.opencode/sessionID"]`). Each consumer —
   // session when identifiable, process otherwise — tracks its own delivery
@@ -157,6 +179,11 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   // consumers = different consumers; process restart replays from the relay
   // (full history is retained), so nothing is lost.
   const delivered = new Map<string, Map<string, number>>();
+  // Presence: every channel-resolving tool call reports member activity to the
+  // bridge (RelayBridge rate-limits to one POST per 30s; other bridges no-op).
+  activityHook = (ch) => {
+    void bridge.reportActivity(ch, new Date().toISOString()).catch(() => {});
+  };
   const deliveredFor = (consumerId: string) => {
     let m = delivered.get(consumerId);
     if (!m) {
@@ -489,7 +516,13 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
     safe(async ({ channelId }) => {
       const ch = resolveChannel(store, channelId);
       const meta = await bridge.meta(ch);
-      return quoteWrap(JSON.stringify({ members: meta.members }));
+      const members = meta.members.map((m) => {
+        const activity = activityBucket(m.lastActiveAt);
+        return activity === undefined
+          ? { memberName: m.memberName, joinedAt: m.joinedAt }
+          : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
+      });
+      return quoteWrap(JSON.stringify({ members }));
     }),
   );
 

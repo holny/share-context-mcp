@@ -28,6 +28,8 @@ import type { ClaimInput, ChannelBridge, BridgeListener, ChannelMember, ChannelM
 
 const ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const PASSWORD_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+/** Client-side rate limit for presence receipts (presence is 5-minute buckets downstream). */
+const ACTIVITY_POST_INTERVAL_MS = 30_000;
 const CHANNEL_ID_LEN = 12;
 const PASSWORD_CHARS = 20; // 5 groups of 4 → "xxxx-xxxx-xxxx-xxxx-xxxx"
 
@@ -72,6 +74,9 @@ export class RelayBridge implements ChannelBridge {
   private defaultChannelId: string | null = null;
   /** Live listeners per channel, marked active by send/poll (spec §5.8). */
   private readonly listeners = new Map<string, Set<ChannelTransport>>();
+
+  /** Last activity POST time per channel — 30s client-side rate limit (presence receipts). */
+  private readonly lastActivityPost = new Map<string, number>();
 
   constructor(opts: { baseUrl: string; store: Store }) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
@@ -381,6 +386,23 @@ export class RelayBridge implements ChannelBridge {
       members: (data.members as ChannelMember[]) ?? [],
       nextSeq: data.nextSeq as number,
     };
+  }
+
+  /**
+   * Presence receipts: POST the member's last-activity timestamp to the relay,
+   * rate-limited to one POST per 30s per channel (presence is bucketed at a
+   * 5-minute granularity downstream — sub-30s precision buys nothing).
+   */
+  async reportActivity(channelId: string, lastActiveAt: string): Promise<void> {
+    const now = Date.now();
+    const last = this.lastActivityPost.get(channelId);
+    if (last !== undefined && now - last < ACTIVITY_POST_INTERVAL_MS) return;
+    this.lastActivityPost.set(channelId, now);
+    await this.request(`/channels/${channelId}/activity`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({ lastActiveAt }),
+    });
   }
 
   async rotate(channelId: string, newPassword: string): Promise<void> {

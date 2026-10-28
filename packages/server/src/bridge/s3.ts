@@ -237,6 +237,9 @@ export class S3Bridge implements ChannelBridge {
     return { members: members?.data ?? [], nextSeq: head?.data.nextSeq ?? 1 };
   }
 
+  /** No-op: S3 has no presence endpoint (spec: activity inference is relay-backed in v1). */
+  async reportActivity(_channelId: string, _lastActiveAt: string): Promise<void> {}
+
   listen(channelId: string, onNotify: (seq: number) => void, _tuning?: TransportTuning): { stop: () => Promise<void>; markActivity(): void; closeForTest(): void; readonly state: TransportState } {
     const interval = this.opts.pollIntervalMs ?? 10_000;
     const timer = setInterval(() => onNotify(0), interval);

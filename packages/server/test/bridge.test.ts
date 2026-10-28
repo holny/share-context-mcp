@@ -247,4 +247,14 @@ describe("RelayBridge against a real relay", () => {
     expect(storeB.listChannels()).toEqual([]);
     expect(storeB.getChannelSecret(channelId)).toBeNull();
   });
+
+  test("reportActivity posts at most once per rate-limit window", async () => {
+    const { channelId } = await mbA.createChannel({ memberName: "a" });
+    await mbA.reportActivity(channelId, "2026-10-28T00:00:00Z");
+    // second immediate call is rate-limited away — relay keeps the FIRST ts
+    await mbA.reportActivity(channelId, "2026-10-28T09:00:00Z");
+    const meta = await mbA.meta(channelId);
+    const me = meta.members.find((m) => m.memberName === "a");
+    expect(me?.lastActiveAt).toBe("2026-10-28T00:00:00Z");
+  });
 });

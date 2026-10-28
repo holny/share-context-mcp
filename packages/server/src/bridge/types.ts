@@ -43,6 +43,8 @@ export interface BridgeListener {
 export interface ChannelMember {
   memberName: string;
   joinedAt: string;
+  /** ISO timestamp of the member's last reported activity; null when never reported. Relay-backed bridges only. */
+  lastActiveAt?: string | null;
 }
 
 export interface ChannelMeta {
@@ -71,6 +73,14 @@ export interface ChannelBridge {
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
   poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult>;
+  /**
+   * Report member activity to the bridge backend (presence inference — the
+   * MCP protocol has no session-exit events, so "active" = recently active).
+   * Implementations may rate-limit (RelayBridge: one POST per 30s per
+   * channel) or no-op (bridges without a presence endpoint). Fire-and-forget
+   * semantics for callers: errors surface as rejected promises.
+   */
+  reportActivity(channelId: string, lastActiveAt: string): Promise<void>;
   /**
    * Live notifications (spec §5.7): WS-first with automatic poll downgrade
    * (adaptive active/idle intervals, periodic WS re-upgrade probe).

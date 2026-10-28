@@ -43,6 +43,7 @@ export function openDb(dbPath: string): Database {
     // M3 migration: add tracking columns if not present
     try { db.exec("ALTER TABLE members ADD COLUMN last_poll_seq INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN last_viewed_seq INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { db.exec("ALTER TABLE members ADD COLUMN last_active_at TEXT"); } catch {}
   db.exec(`
     CREATE TABLE IF NOT EXISTS channels(
       id TEXT PRIMARY KEY,
@@ -61,6 +62,7 @@ export function openDb(dbPath: string): Database {
       joined_at TEXT NOT NULL,
       last_poll_seq INTEGER NOT NULL DEFAULT 0,
       last_viewed_seq INTEGER NOT NULL DEFAULT 0,
+      last_active_at TEXT,
       PRIMARY KEY(channel_id, name)
     );
 

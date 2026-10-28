@@ -250,6 +250,9 @@ export class GitBridge implements ChannelBridge {
     return { members, nextSeq: high + 1 };
   }
 
+  /** No-op: git has no presence endpoint (spec: activity inference is relay-backed in v1). */
+  async reportActivity(_channelId: string, _lastActiveAt: string): Promise<void> {}
+
   listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): BridgeListener {
     const interval = this.opts.pollIntervalMs ?? 15_000;
     const timer = setInterval(() => onNotify(0), interval);

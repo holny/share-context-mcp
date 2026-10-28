@@ -305,6 +305,50 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(names).toEqual(["a", "b"]);
   });
 
+  test("list_members marks activity buckets from relay receipts", async () => {
+    const a = await makeAgent("a");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    // join a second member via raw HTTP so we hold its token, then report
+    // activity: one stale (10 min ago), one fresh (now)
+    const joinB = async (memberName: string): Promise<string> => {
+      const ch = await fetch(`${baseUrl}/channels/${channelId}/challenge`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ memberName }),
+      });
+      const { nonceB64 } = (await ch.json()) as { nonceB64: string };
+      const { deriveChannelKey, hmacProof } = await import("@share-context-mcp/protocol");
+      const { createHmac } = await import("node:crypto");
+      const verifyKey = createHmac("sha256", Buffer.from(deriveChannelKey(password, channelId))).update("verify", "utf8").digest("base64");
+      const proof = hmacProof(new Uint8Array(Buffer.from(verifyKey, "base64")), nonceB64);
+      const j = await fetch(`${baseUrl}/channels/${channelId}/join`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ memberName, proof }),
+      });
+      return ((await j.json()) as { token: string }).token;
+    };
+    const postActivity = (token: string, lastActiveAt: string) =>
+      fetch(`${baseUrl}/channels/${channelId}/activity`, {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ lastActiveAt }),
+      });
+    const staleToken = await joinB("stale-member1");
+    await postActivity(staleToken, new Date(Date.now() - 10 * 60 * 1000).toISOString());
+    const freshToken = await joinB("fresh-member");
+    await postActivity(freshToken, new Date().toISOString());
+
+    const res = await a.client.callTool({ name: "list_members", arguments: {} });
+    const body = JSON.parse(unwrapQuote(textOf(res))) as {
+      members: Array<{ memberName: string; activity?: string }>;
+    };
+    const byName = new Map(body.members.map((m) => [m.memberName, m]));
+    expect(byName.get("stale-member1")?.activity).toBe("idle");
+    expect(byName.get("fresh-member")?.activity).toBe("recently-active");
+    // a's own list_members call IS activity (resolved the channel) → fresh bucket
+    expect(byName.get("a")?.activity).toBe("recently-active");
+  });
+
   test("set_subscription persists filters per channel", async () => {
     const a = await makeAgent("a");
     const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
