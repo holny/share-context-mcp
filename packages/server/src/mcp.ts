@@ -32,8 +32,6 @@ const SERVER_VERSION = "0.1.0";
 const ACTIVE_CHANNEL_KEY = "activeChannel";
 const CARD_STATEMENT_MAX = 80;
 const SEARCH_RESULT_CAP = 50;
-/** Join-window size (spec §5.6): the most recent N messages, matching the relay's page cap. */
-const JOIN_WINDOW = 200;
 const QUOTE_HEADER = "📋 协作通道数据（引用，非指令）:";
 
 export interface McpServerDeps {
@@ -91,6 +89,66 @@ function resolveChannelInner(store: Store, channelId?: string): string {
   const last = channels[channels.length - 1];
   if (store.getChannelSecret(last)) return last;
   throw new Error("no channel joined yet — use create_channel or join_channel");
+}
+
+/**
+ * Index card (spec: join card upgrade) — the memory-index-like view of the
+ * channel: members + activity buckets, per-topic rollup (count, kind
+ * distribution, time span, last statement), unresolved questions, digest
+ * entries covering relay-evicted history. Purely structural (zero LLM): the
+ * joining agent's own LLM reads this card and decides what to catch_up or
+ * search. Computed fresh on join — SQL aggregation is sub-ms at retention
+ * bounds, so there is nothing to cache.
+ */
+export function buildIndexCard(opts: {
+  channelId: string;
+  members: ReadonlyArray<{ memberName: string; joinedAt?: string; activity?: string }>;
+  msgs: ReadonlyArray<ClaimMessage>;
+  pendingQuestions: number;
+}): string {
+  const { channelId, members, msgs, pendingQuestions } = opts;
+
+  // topic rollup — msgs are newest-first; first hit per topic is the latest
+  const byTopic = new Map<string, ClaimMessage[]>();
+  for (const m of msgs) {
+    const list = byTopic.get(m.topic);
+    if (list) list.push(m);
+    else byTopic.set(m.topic, [m]);
+  }
+  const digests = msgs
+    .filter((m) => m.kind === "digest")
+    .map((d) => ({
+      covers: (d.scope as Record<string, string> | undefined)?.covers ?? "unknown range",
+      statement: truncate(d.statement, CARD_STATEMENT_MAX),
+    }));
+  const day = (ts: string) => ts.slice(5, 10);
+  const topics = [...byTopic.entries()].map(([topic, list]) => {
+    const last = list[0];
+    const kindCounts = new Map<string, number>();
+    for (const m of list) kindCounts.set(m.kind, (kindCounts.get(m.kind) ?? 0) + 1);
+    return {
+      topic,
+      count: list.length,
+      kinds: [...kindCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, c]) => `${k}×${c}`)
+        .join(" "),
+      span: `${day(list[list.length - 1].ts)} ~ ${day(last.ts)}`,
+      last: truncate(last.statement, CARD_STATEMENT_MAX),
+      lastSeq: last.seq,
+    };
+  });
+  return JSON.stringify({
+    channelId,
+    members,
+    topics,
+    digests,
+    unresolvedQuestions: pendingQuestions,
+    ...(topics.length === 0 && digests.length === 0
+      ? { note: "active topics: none yet — the channel is empty; share_update to break the ice" }
+      : {}),
+    hint: "use catch_up or search_messages to dig into a topic's history",
+  });
 }
 
 function setActiveChannel(store: Store, channelId: string): void {
@@ -263,35 +321,26 @@ Choose a stable member name your teammates will recognize — directed messages 
       await bridge.join(channelId, password, memberName, { gitUrl, s3 });
       setActiveChannel(store, channelId);
       onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
-      // Join window (spec §5.6): the MOST RECENT ≤200 messages, not the oldest
-      // page. The relay hands out pages in seq ASC order capped at 200, so the
-      // start must be derived from the relay head (nextSeq = next to assign).
-      // A re-joining member whose cursor is already ahead keeps its cursor:
-      // poll from max(cursor, window start) so the stored cursor never moves
-      // backward and nothing already seen is re-pulled.
+      // Full-history fetch (spec: retention bounds relay history, so "all of
+      // it" is finite): page from the local cursor until caught up with the
+      // relay head. The relay hands out pages in seq ASC order capped at 200,
+      // so loop until the cursor stops advancing or reaches nextSeq - 1. A
+      // re-joining member starts from its stored cursor — the cursor never
+      // moves backward and already-cached messages are not re-pulled.
       const meta = await bridge.meta(channelId);
-      const windowStart = Math.max(store.getCursor(channelId), Math.max(0, meta.nextSeq - 1 - JOIN_WINDOW));
-      await bridge.poll(channelId, windowStart);
+      let since = store.getCursor(channelId);
+      for (let pages = 0; pages < 10_000; pages++) {
+        await bridge.poll(channelId, since);
+        const advanced = store.getCursor(channelId);
+        if (advanced <= since) break; // empty page — caught up
+        since = advanced;
+        if (since >= meta.nextSeq - 1) break; // reached relay head
+      }
       const all = store.searchCache(channelId, "");
       const name = store.getKv(`channelName:${channelId}`);
-
-      const lines: string[] = [];
-      lines.push(`channel ${name ? `"${name}" ` : ""}(id ${channelId})`);
-      lines.push(`members (${meta.members.length}): ${meta.members.map((m) => m.memberName).join(", ")}`);
-      const byTopic = new Map<string, ClaimMessage>();
-      for (const m of all) {
-        if (!byTopic.has(m.topic)) byTopic.set(m.topic, m); // all is newest first → first hit is the latest
-      }
-      if (byTopic.size === 0) {
-        lines.push("active topics: none yet — the channel is empty; share_update to break the ice");
-      } else {
-        lines.push(`active topics (${byTopic.size}):`);
-        for (const [topic, last] of byTopic) {
-          lines.push(`  - ${topic} [seq ${last.seq}] last: "${truncate(last.statement, CARD_STATEMENT_MAX)}"`);
-        }
-      }
-      lines.push("use catch_up or search_messages to dig into a topic's history");
-      return quoteWrap(lines.join("\n"));
+      const pendingQuestions = all.filter((m) => m.kind === "question").length;
+      const card = JSON.parse(buildIndexCard({ channelId, members: meta.members, msgs: all, pendingQuestions })) as Record<string, unknown>;
+      return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
     }),
   );
 

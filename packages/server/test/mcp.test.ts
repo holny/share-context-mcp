@@ -16,7 +16,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
 import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
-import { buildMcpServer, TOOL_NAMES } from "../src/mcp";
+import { buildMcpServer, buildIndexCard, TOOL_NAMES } from "../src/mcp";
 import { RelayBridge } from "../src/bridge/relay";
 import { Store } from "../src/store";
 
@@ -178,7 +178,10 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(card).not.toContain(long.slice(0, 81));
     expect(card).toContain("build");
     expect(card).toContain("export-api");
-    expect(card).toMatch(/\[seq \d+\]/);
+    // JSON card: rollup carries lastSeq per topic (supersedes the old "[seq N]" line format)
+    const body = JSON.parse(unwrapQuote(card)) as { topics: Array<{ topic: string; lastSeq: number }> };
+    expect(body.topics.find((t) => t.topic === "build")?.lastSeq).toBe(1);
+    expect(body.topics.find((t) => t.topic === "export-api")?.lastSeq).toBe(2);
   });
 
   test("share_update with a 501-char statement → error mentions 500", async () => {
@@ -288,8 +291,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(none.messages).toHaveLength(0);
   });
 
-  test("list_members returns the wrapped member list", async () => {
-    const a = await makeAgent("a");
+  test("list_members returns the wrapped member list", async () => {    const a = await makeAgent("a");
     const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const b = await makeAgent("b");
@@ -597,5 +599,103 @@ describe("MCP stdio entry", () => {  let relay: RelayHandle;
     const body = JSON.parse(unwrapQuote(textOf(await c2.callTool({ name: "fetch_updates", arguments: {} }))));
     expect(body.messages.some((m: { statement: string }) => m.statement === "survives a restart")).toBe(true);
     await c2.close();
+  }, 60_000);
+});
+
+describe("index card + full-history join fetch (Task 5)", () => {
+  let relay5: RelayHandle;
+  let baseUrl: string;
+  const dirs5: string[] = [];
+
+  beforeAll(async () => {
+    relay5 = await startRelay({ port: 0 });
+    baseUrl = `http://127.0.0.1:${relay5.port}`;
+  });
+  afterAll(async () => {
+    await relay5?.stop();
+    for (const d of dirs5) rmSync(d, { recursive: true, force: true });
+  });
+  const tmp = () => {
+    const d = mkdtempSync(join(tmpdir(), "scm-seed-"));
+    dirs5.push(d);
+    return d;
+  };
+
+  /** Local equivalent of the first describe's makeAgent — independent store + client. */
+  const mkAgent = async (label: string) => {
+    const store = new Store(join(tmp(), `${label}.db`));
+    const bridge = new RelayBridge({ baseUrl, store });
+    const server = buildMcpServer({ store, bridge });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `t5-${label}`, version: "0.0.0" });
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    return { client, store };
+  };
+
+  const mk = (seq: number, statement: string, kind: string, topic: string, ts: string) => ({
+    seq, ts, statement, kind, topic,
+    provenance: { member: "a", source: "agent" },
+  });
+
+  test("buildIndexCard renders topic rollup with counts, kinds, span, last statement", () => {
+    const card = buildIndexCard({
+      channelId: "ch-test000001",
+      members: [{ memberName: "a", joinedAt: "2026-10-20T00:00:00Z" }],
+      msgs: [
+        mk(3, "latest auth note", "howto", "auth", "2026-10-27T00:00:00Z"),
+        mk(2, "decide sliding window", "decision", "auth", "2026-10-26T00:00:00Z"),
+        mk(1, "api frozen", "contract", "export-api", "2026-10-20T00:00:00Z"),
+      ] as unknown as ClaimMessage[],
+      pendingQuestions: 2,
+    });
+    expect(card).toContain("auth");
+    expect(card).toContain("export-api");
+    expect(card).toContain("decision×1");
+    expect(card).toContain("2");
+    expect(card).toContain("latest auth note");
+    expect(card).toContain("unresolvedQuestions\":2");
+  });
+
+  test("buildIndexCard: empty channel renders the none-yet copy", () => {
+    const card = buildIndexCard({
+      channelId: "ch-test000002",
+      members: [],
+      msgs: [],
+      pendingQuestions: 0,
+    });
+    expect(card).toContain("none yet");
+  });
+
+  test("join fetches FULL history (beyond the old 200 window) into the local cache", async () => {
+    // seed 250 messages through a dedicated bridge (one channel)
+    const seedStore = new Store(join(tmp(), "seed.db"));
+    const seeder = new RelayBridge({ baseUrl, store: seedStore });
+    const { channelId, password } = await seeder.createChannel({ memberName: "seed" });
+    for (let i = 1; i <= 250; i++) {
+      await seeder.send({ statement: `seed message ${i}`, kind: "progress", topic: i <= 200 ? "early" : "late", seq: null, ts: new Date().toISOString(), provenance: { member: "seed", source: "agent" } }, channelId);
+    }
+    // a fresh MCP agent joins → must cache ALL 250 (relay page cap is 200)
+    const a = await mkAgent("fulljoiner");
+    const card = textOf(await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "fulljoiner" } }));
+    expect(a.store.searchCache(channelId, "").length).toBe(250);
+    const body = JSON.parse(unwrapQuote(card));
+    const topics = body.topics as Array<{ topic: string; count: number }>;
+    expect(topics.find((t) => t.topic === "early")?.count).toBe(200);
+    expect(topics.find((t) => t.topic === "late")?.count).toBe(50);
+  }, 60_000);
+
+  test("re-join does not move the cursor backward or duplicate cached rows", async () => {
+    const seedStore = new Store(join(tmp(), "seed.db"));
+    const seeder = new RelayBridge({ baseUrl, store: seedStore });
+    const { channelId, password } = await seeder.createChannel({ memberName: "seed2" });
+    await seeder.send({ statement: "only message", kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "seed2", source: "agent" } }, channelId);
+    const a = await mkAgent("rejoiner");
+    await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "rejoiner" } });
+    const cursorAfterFirst = a.store.getCursor(channelId);
+    // re-join with fresh messages posted between joins
+    await seeder.send({ statement: "second message", kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "seed2", source: "agent" } }, channelId);
+    await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "rejoiner" } });
+    expect(a.store.getCursor(channelId)).toBeGreaterThanOrEqual(cursorAfterFirst);
+    expect(a.store.searchCache(channelId, "").length).toBe(2); // no duplicates
   }, 60_000);
 });
