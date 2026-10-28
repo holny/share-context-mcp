@@ -116,9 +116,10 @@ async function cmdLeave() {
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
   const channels = store.listChannels();
   if (channels.length === 0) { console.log("No channels."); return; }
+  const transferTo = arg("transfer-to");
   for (const ch of channels) {
-    await bridge.leave(ch);
-    console.log(`Left ${ch}`);
+    await bridge.leave(ch, transferTo ? { transferTo } : undefined);
+    console.log(`Left ${ch}${transferTo ? ` (roles transferred to ${transferTo} per succession rules)` : ""}`);
   }
 }
 
@@ -149,7 +150,7 @@ Commands:
                                full: + message key (all members need the new credential)
   invite <id> [--ttl hours]    Mint an invite code (invite tier, per invite rights)
   token refresh <id>           Rotate this member's channel token
-  vote start --channel <id> --type kick --target <name> [--reason R] [--ban-ip] [--revoke-invitees]
+  vote start --channel <id> --type kick --target <name> [--reason R] [--revoke-invitees]
   vote list <id>               Open + settled votes with tallies
   audit <id>                   Governance audit log
   directory [query]            Search opt-in channels on the relay
@@ -312,8 +313,8 @@ async function cmdInvite() {
   const { store, bridge } = await govBridge();
   const secret = store.getChannelSecret(id);
   if (!secret) { console.error(`Error: not joined: ${id}`); process.exit(1); }
-  const { mintInviteCode, deriveChannelKey } = await import("@share-context-mcp/protocol");
-  const channelKey = deriveChannelKey(secret.password ?? "", id);
+  const { mintInviteCode } = await import("@share-context-mcp/protocol");
+  const channelKey = bridge.channelKey(id);
   const codeId = randomBytes(8).toString("hex");
   const { code } = mintInviteCode(channelKey, codeId, ttlHours * 3_600_000);
   const reg = await relayPostJson(id, "/invite-codes", { codeId, expiresAt: Date.now() + ttlHours * 3_600_000 });
@@ -342,7 +343,6 @@ async function cmdVoteStart() {
   const body: Record<string, unknown> = { type, target };
   const reason = arg("reason");
   if (reason) body.reason = reason;
-  if (arg("ban-ip")) body.banIp = true;
   if (arg("revoke-invitees")) body.revokeInvitees = true;
   const out = await relayPostJson(channelId, "/votes", body);
   console.log(`✅ vote ${out.voteId} opened (target: ${target}) — closes in 48h or at early resolution`);

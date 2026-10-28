@@ -99,7 +99,7 @@ export interface ChannelBridge {
   /** Open a new epoch with a new password; invalidates all tokens (caller must re-join). */
   rotate(channelId: string, newPassword: string): Promise<void>;
   /** Leave: forget the channel locally (relay-side member record stays in v1). */
-  leave(channelId: string): Promise<void>;
+  leave(channelId: string, opts?: { transferTo?: string }): Promise<void>;
   /** Open + settled votes (governance; relay-backed bridges only). */
   votes(channelId: string): Promise<{
     open: Array<{ id: string; type: string; target: string; endsAt: number }>;

@@ -834,4 +834,47 @@ describe("blind relay", () => {
     expect(stats.perDay).toHaveLength(7);
     expect(stats.perDay[6].count).toBe(3);
   });
+
+  test("F-1: ban list enforced at admission — kicked member cannot re-enter (new name, fresh code, same consumer)", async () => {
+    // invite tier: creator alice + dave (joins via code), dave kicked via applyKick
+    const invId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId: invId, memberName: "alice", admissionMode: "invite", verifyKeyB64: verifyKeyB64Of(PASSWORD, invId) });
+    const aliceTok = ((await joinChannel(invId, "alice", PASSWORD, "s/alice2001")).body as { token: string }).token;
+    const codeId = "code-f1dave1";
+    const { mintInviteCode, parseInviteCode, deriveChannelKey } = await import("@share-context-mcp/protocol");
+    const { code } = mintInviteCode(deriveChannelKey(PASSWORD, invId), codeId, 86_400_000);
+    expect((await postJson(`/channels/${invId}/invite-codes`, { codeId, expiresAt: Date.now() + 86_400_000 }, aliceTok)).status).toBe(200);
+    const daveConsumer = "s/davef1001";
+    const parsed = parseInviteCode(code);
+    expect(parsed.codeId).toBe(codeId);
+    const daveJoin = await postJson(`/channels/${invId}/join`, { memberName: "dave", consumerId: daveConsumer, inviteCodeId: parsed.codeId });
+    expect(daveJoin.status).toBe(200);
+    // kick dave (vote settlement path)
+    applyKick(relay.db, invId, "dave", "alice");
+    // alice mints a FRESH code; dave reuses his banned consumer id under a new name
+    const codeId2 = "code-f1fresh";
+    const { code: freshCode } = mintInviteCode(deriveChannelKey(PASSWORD, invId), codeId2, 86_400_000);
+    await postJson(`/channels/${invId}/invite-codes`, { codeId: codeId2, expiresAt: Date.now() + 86_400_000 }, aliceTok);
+    const parsed2 = parseInviteCode(freshCode);
+    const rejoin = await postJson(`/channels/${invId}/join`, {
+      memberName: "dave2", consumerId: daveConsumer, inviteCodeId: parsed2.codeId,
+    });
+    expect(rejoin.status).toBe(403);
+    expect(((await rejoin.json()) as { error: string }).error).toBe("banned");
+    // same name also blocked
+    const rejoin2 = await postJson(`/channels/${invId}/join`, {
+      memberName: "dave", consumerId: "s/brandnew1", inviteCodeId: parsed2.codeId,
+    });
+    expect(rejoin2.status).toBe(403);
+
+    // public tier: kicked member cannot re-enter with the same consumer id
+    const pubId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId: pubId, memberName: "alice", admissionMode: "public", verifyKeyB64: verifyKeyB64Of(PASSWORD, pubId) });
+    await joinChannel(pubId, "alice", PASSWORD, "s/alice3001");
+    const mallory = "s/mallory01";
+    await postJson(`/channels/${pubId}/join`, { memberName: "mallory", consumerId: mallory });
+    applyKick(relay.db, pubId, "mallory", "alice");
+    const rejoin3 = await postJson(`/channels/${pubId}/join`, { memberName: "mallory2", consumerId: mallory });
+    expect(rejoin3.status).toBe(403);
+  });
 });

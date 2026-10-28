@@ -24,6 +24,7 @@ export const TOOL_NAMES = [
   "list_members",
   "create_channel",
   "join_channel",
+  "leave_channel",
   "cast_vote",
   "list_channels",
 ] as const;
@@ -791,7 +792,7 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
     }),
   );
 
-  // ---- cast_vote ----
+  // ---- cast_vote (governance — relay-backed bridges only) ----
   if (bridge.governance) {
     server.registerTool(
       "cast_vote",
@@ -810,31 +811,57 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
         return quoteWrap(JSON.stringify({ ok: true, voteId, choice, channelId: ch }));
       }),
     );
-
-    // ---- list_channels ----
-    server.registerTool(
-      "list_channels",
-      {
-        description:
-          "List the channels THIS session has joined, with per-channel meta (id, name, membership name, admission mode, your role). Use it after a context reset to rediscover your channels.",
-        inputSchema: {},
-      },
-      safe(async (_args, extra) => {
-        const consumerId = consumerIdFromExtra(extra);
-        const channels = store.listConsumerChannels(consumerId).map(({ channelId: cid, joinedAt }) => {
-          const secret = store.getChannelSecret(cid);
-          return {
-            channelId: cid,
-            name: store.getKv(`channelName:${cid}`) ?? undefined,
-            memberName: secret?.memberName,
-            joinedAt,
-            active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
-          };
-        });
-        return quoteWrap(JSON.stringify({ consumerId, channels }));
-      }),
-    );
   }
+
+  // ---- list_channels (local per-session ledger — every backend) ----
+  server.registerTool(
+    "list_channels",
+    {
+      description:
+        "List the channels THIS session has joined, with per-channel meta (id, name, membership name, active flag). Use it after a context reset to rediscover your channels.",
+      inputSchema: {},
+    },
+    safe(async (_args, extra) => {
+      const consumerId = consumerIdFromExtra(extra);
+      const channels = store.listConsumerChannels(consumerId).map(({ channelId: cid, joinedAt }) => {
+        const secret = store.getChannelSecret(cid);
+        return {
+          channelId: cid,
+          name: store.getKv(`channelName:${cid}`) ?? undefined,
+          memberName: secret?.memberName,
+          joinedAt,
+          active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
+        };
+      });
+      return quoteWrap(JSON.stringify({ consumerId, channels }));
+    }),
+  );
+
+  // ---- leave_channel (§2: succession + dissolution live at the relay) ----
+  server.registerTool(
+    "leave_channel",
+    {
+      description:
+        "Leave a channel. Relay-side succession and dissolution rules apply: a leaving creator transfers roles (transferTo, or the default most-active rule); the last active member leaving dissolves the channel. You can re-join later with valid credentials.",
+      inputSchema: {
+        transferTo: z
+          .string()
+          .optional()
+          .describe("Creator only: hand roles to this active member when leaving. Omit for the default rule."),
+        ...channelIdParam,
+      },
+    },
+    safe(async ({ transferTo, channelId }, extra) => {
+      const ch = resolveChannel(store, channelId);
+      await bridge.leave(ch, transferTo ? { transferTo } : undefined);
+      onChannelLeft?.(ch); // detach from the broadcaster — plugin stops receiving
+      store.removeConsumerChannel(consumerIdFromExtra(extra), ch);
+      store.deleteKv(`subscription:${ch}`);
+      store.deleteKv(`channelName:${ch}`);
+      if (store.getKv(ACTIVE_CHANNEL_KEY) === ch) store.deleteKv(ACTIVE_CHANNEL_KEY);
+      return quoteWrap(JSON.stringify({ ok: true, channelId: ch, left: true }));
+    }),
+  );
 
   return server;
 }

@@ -17,6 +17,7 @@ import {
   hmacProof,
   open,
   parseAdmissionCredential,
+  parseInviteCode,
   seal,
   validateClaim,
   type SealedEnvelope,
@@ -136,6 +137,18 @@ export class RelayBridge implements ChannelBridge {
     return null;
   }
 
+  /** Rotate the member token (CLI token refresh): new token replaces old atomically. */
+  async refreshToken(channelId: string): Promise<void> {
+    const data = await this.request(`/channels/${channelId}/token-refresh`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders(channelId) },
+      body: JSON.stringify({}),
+    });
+    if (typeof data.token !== "string") throw new Error("relay did not issue a refreshed token");
+    this.tokens.set(channelId, data.token);
+    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: data.token, memberName: this.loadStoredSession(channelId)?.memberName ?? "" }));
+  }
+
   /**
    * The persisted session: token AND the memberName it was issued for.
    * The name rides with the token so adoption can never cross identities
@@ -178,13 +191,20 @@ export class RelayBridge implements ChannelBridge {
     return ch;
   }
 
-  private channelKey(channelId: string): Uint8Array {
+  /**
+   * The channel's message key: unwrapped from a self-contained credential
+   * (scmc1- admission credential, or an invite code) or derived from the
+   * password via HKDF (legacy).
+   */
+  channelKey(channelId: string): Uint8Array {
     const secret = this.store.getChannelSecret(channelId);
     if (!secret) throw new Error(`unknown channel: ${channelId}`);
-    // Self-contained credential (scmc1-): the message key unwraps from it.
-    // Legacy channels derive it from the password via HKDF.
     if (secret.password.startsWith("scmc1-")) {
-      return parseAdmissionCredential(secret.password);
+      try {
+        return parseAdmissionCredential(secret.password);
+      } catch {
+        return parseInviteCode(secret.password).channelKey;
+      }
     }
     return deriveChannelKey(secret.password, channelId);
   }
@@ -499,9 +519,35 @@ export class RelayBridge implements ChannelBridge {
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
   }
 
-  async leave(channelId: string): Promise<void> {
+  async leave(channelId: string, opts?: { transferTo?: string }): Promise<void> {
+    // Governance leave (§2): succession + dissolution live at the relay.
+    // Local cleanup only after the relay accepted the departure.
+    await this.request(`/channels/${channelId}/leave`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders(channelId) },
+      body: JSON.stringify(opts?.transferTo ? { transferTo: opts.transferTo } : {}),
+    });
     this.store.removeChannel(channelId);
     this.forgetToken(channelId);
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
+  }
+
+  /**
+   * Invite-tier join: the code is self-contained (code id + wrapped channel
+   * key). Parses it, presents the code id to the relay, stores the code as
+   * the channel secret (channelKey() unwraps it later).
+   */
+  async joinWithInvite(channelId: string, code: string, memberName: string): Promise<void> {
+    const { parseInviteCode } = await import("@share-context-mcp/protocol");
+    const parsed = parseInviteCode(code);
+    await this.request(`/channels/${channelId}/join`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ memberName, consumerId: this.consumerId, inviteCodeId: parsed.codeId }),
+    });
+    this.tokens.set(channelId, (this.loadStoredSession(channelId)?.token ?? ""));
+    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: this.loadStoredSession(channelId)?.token ?? "", memberName }));
+    this.store.upsertChannel({ channelId, password: code, memberName, epoch: 1 });
+    this.defaultChannelId = channelId;
   }
 }

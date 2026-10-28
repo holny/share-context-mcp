@@ -279,7 +279,7 @@ export class GitBridge implements ChannelBridge {
     ], `rotate to epoch ${s.epoch}`);
   }
 
-  async leave(channelId: string): Promise<void> {
+  async leave(channelId: string, _opts?: { transferTo?: string }): Promise<void> {
     this.secrets.delete(channelId);
     const t = this.timers.get(channelId);
     if (t) clearInterval(t);

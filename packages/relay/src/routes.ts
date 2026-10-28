@@ -695,7 +695,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -734,9 +734,24 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         // password = credential proof. Creator (reserved, not yet joined)
         // always admits with the credential. A governance kick invalidates
         // the credential — only a manager/creator credential rotation
-        // re-enables admission.
+        // re-enables admission. The BAN LIST is enforced here too: a banned
+        // name, or a banned consumer id under ANY name, is rejected at the
+        // gate — kicks must survive new-name re-entry attempts.
         const mode = channel.admission_mode ?? "password";
         const isCreator = channel.creator_member === memberName;
+        let pendingInviteCodeId: string | null = null;
+        const banRowGate = stmtBanRow.get(channelId, memberName) as { consumer_ids: string | null } | undefined;
+        if (banRowGate) return jsonError(403, "banned");
+        if (consumerId) {
+          const allBans = db.prepare("SELECT consumer_ids FROM member_bans WHERE channel_id = ? AND consumer_ids IS NOT NULL").all(channelId) as Array<{ consumer_ids: string }>;
+          const bannedConsumer = allBans.some((r) => {
+            try {
+              const arr: string[] = JSON.parse(r.consumer_ids);
+              return Array.isArray(arr) && arr.includes(consumerId);
+            } catch { return false; }
+          });
+          if (bannedConsumer) return jsonError(403, "banned");
+        }
         if (mode === "password" && channel.admission_credential_revoked === 1 && !isCreator) {
           return jsonError(403, "admission credential revoked");
         }
@@ -751,8 +766,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           if (!code || code.status !== "active") return jsonError(403, "invite code invalid");
           if (code.expires_at !== null && code.expires_at <= now) return jsonError(403, "invite code expired");
           if (code.used_by !== null) return jsonError(403, "invite code already used");
-          stmtUseInviteCode.run(memberName, channelId, codeId);
-          audit(channelId, memberName, "invite.used", memberName, `code ${codeId} (invited by ${code.owner})`);
+          // Consumption is DEFERRED until admission succeeds (F-4): a failed
+          // join must not burn a single-use code.
+          pendingInviteCodeId = codeId;
         }
         const proof = parsed.body.proof;
         const needsProof = mode === "password" || (isCreator && mode !== "public");
@@ -792,6 +808,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           member?.joined_at ?? new Date().toISOString(),
         );
         stmtRegisterConsumer.run(channelId, memberName, consumerId, new Date().toISOString());
+        if (pendingInviteCodeId !== null) {
+          // Admission succeeded — consume the code (F-4).
+          stmtUseInviteCode.run(memberName, channelId, pendingInviteCodeId);
+        }
         challenges.delete(key); // one-time use
         audit(channelId, memberName, "member.joined", memberName, "ok");
         return json({ token, epoch: channel.epoch, memberName });
@@ -929,7 +949,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const isManager = name === auth.channel.manager_member;
         let transferTo: string | null = null;
         if (parsed.ok && typeof parsed.body.transferTo === "string" && validMemberName(parsed.body.transferTo)) {
-          transferTo = (parsed.body.transferTo as string).trim();
+          const t = (parsed.body.transferTo as string).trim();
+          const tRow = stmtMemberByName.get(channelId, t) as MemberRow | undefined;
+          if (!tRow || tRow.status !== "active") return jsonError(400, "transferTo must be an active member");
+          if (t === name) return jsonError(400, "transferTo must differ from the leaving member");
+          transferTo = t;
         }
         // Mark left + revoke tokens.
         stmtLeave.run(channelId, name);
@@ -977,9 +1001,6 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           if (auth === "banned") return jsonError(403, "banned");
           if (!auth) return jsonError(401, "unauthorized");
           const initiator = auth.member.name;
-          if (auth.member.can_invite !== 1 && auth.member.name !== auth.channel.manager_member) {
-            return jsonError(403, "banned");
-          }
           const parsed = await readJson(req);
           if (!parsed.ok) return parsed.resp;
           const type = parsed.body.type;
@@ -1159,6 +1180,29 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           lastActiveAt: member.last_active_at,
           perDay,
         });
+      }
+
+      case "dissolve": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        dissolve(channelId);
+        audit(channelId, auth.member.name, "channel.dissolved", channelId, "explicit");
+        wsHub?.invalidateChannel(channelId, 0);
+        return json({ ok: true });
+      }
+
+      case "audit": {
+        if (method !== "GET") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const rows = db.prepare("SELECT ts, actor, action, target, result FROM audit_log WHERE channel_id = ? ORDER BY ts DESC LIMIT 200").all(channelId);
+        return json({ entries: rows });
       }
 
       case "messages": {
