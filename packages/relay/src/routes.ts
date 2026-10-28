@@ -126,7 +126,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     timer.unref();
   }
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq FROM channels WHERE id = ?");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
@@ -149,6 +149,12 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   // are allocated atomically with the message (a concurrent rotate cannot
   // split seq from its epoch).
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
+  const stmtAudit = db.prepare("INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, ?, ?, ?)");
+
+  /** Governance audit trail (§4b): every governance operation lands here. */
+  function audit(channelId: string, actor: string, action: string, target?: string, result?: string): void {
+    stmtAudit.run(channelId, new Date().toISOString(), actor, action, target ?? null, result ?? null);
+  }
   const stmtMinSeqAbove = db.prepare("SELECT MIN(seq) AS s FROM messages WHERE channel_id = ? AND created_at > ?");
   const stmtEvictPrefix = db.prepare("DELETE FROM messages WHERE channel_id = ? AND seq < ?");
   const stmtSetMinSeq = db.prepare("UPDATE channels SET min_seq = MAX(min_seq, ?) WHERE id = ?");
@@ -282,6 +288,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       // reserve the creator's member name (no token yet → not "live",
       // so the creator can still join under it)
       stmtUpsertMember.run(channelId, (memberName as string).trim(), null, null, 1, new Date().toISOString());
+      // Governance: the creating member is creator AND manager (§2).
+      const stmtSetRoles = db.prepare("UPDATE channels SET creator_member = ?, manager_member = ? WHERE id = ?");
+      stmtSetRoles.run((memberName as string).trim(), (memberName as string).trim(), channelId);
+      audit(channelId, (memberName as string).trim(), "channel.created", channelId, "ok");
       return json({ channelId, epoch: 1, nextSeq: 1 });
     }
 
@@ -348,6 +358,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           member?.joined_at ?? new Date().toISOString(),
         );
         challenges.delete(key); // one-time use
+        audit(channelId, memberName, "member.joined", memberName, "ok");
         return json({ token, epoch: channel.epoch, memberName });
       }
 
@@ -435,6 +446,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           epoch: auth.channel.epoch,
           nextSeq: auth.channel.next_seq,
           minSeq: auth.channel.min_seq ?? 1,
+          creatorMember: auth.channel.creator_member,
+          managerMember: auth.channel.manager_member,
+          admissionMode: auth.channel.admission_mode ?? "password",
+          invitePolicy: auth.channel.invite_policy ?? "everyone",
           members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at, lastActiveAt: m.last_active_at })),
         });
       }

@@ -330,8 +330,7 @@ describe("blind relay", () => {
     expect((await route.json()) as Record<string, unknown>).toEqual({ error: "not found" });
   });
 
-  test("activity receipts: auth required, timestamp stored, exposed via meta", async () => {
-    const channelId = randomBytes(8).toString("hex");
+  test("activity receipts: auth required, timestamp stored, exposed via meta", async () => {    const channelId = randomBytes(8).toString("hex");
     const created = await postJson("/channels", {
       channelId,
       memberName: "alice",
@@ -465,5 +464,38 @@ describe("blind relay", () => {
     } finally {
       await r4.stop();
     }
+  });
+
+  test("governance schema: creator/manager recorded at create+join, exposed via meta; audit rows written", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    expect(created.status).toBe(200);
+    // reserved creator is already creator/manager before joining
+    const meta0 = await fetch(`${base}/channels/${channelId}/meta`, { method: "GET" }).then((r) => r.status);
+    // meta requires auth — join first
+    const joined = await joinChannel(channelId, "alice", PASSWORD);
+    expect(joined.status).toBe(200);
+    const token = (joined.body as { token: string }).token;
+    const meta = await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${token}` } });
+    const body = (await meta.json()) as {
+      creatorMember: string;
+      managerMember: string;
+      admissionMode: string;
+      invitePolicy: string;
+    };
+    expect(body.creatorMember).toBe("alice");
+    expect(body.managerMember).toBe("alice");
+    expect(body.admissionMode).toBe("password");
+    expect(body.invitePolicy).toBe("everyone");
+    // audit rows: channel.created + member.joined
+    const rows = relay.db
+      .prepare("SELECT action, actor, result FROM audit_log WHERE channel_id = ? ORDER BY ts")
+      .all(channelId) as Array<{ action: string; actor: string; result: string }>;
+    expect(rows.map((r) => r.action)).toContain("channel.created");
+    expect(rows.map((r) => r.action)).toContain("member.joined");
   });
 });

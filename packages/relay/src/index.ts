@@ -7,7 +7,8 @@
  * Push frames are seq-only ({type, seq, epoch}); poll GET ?since= remains
  * the correctness fallback (spec §5.7).
  */
-import { openDb } from "./db";
+import { openDb, type ChannelRow } from "./db";
+import type { Database } from "bun:sqlite";
 import { authenticateUpgradeToken, createRelayHandler, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_MESSAGES, jsonError } from "./routes";
 import { createWsHub, type WsConnData } from "./ws";
 
@@ -43,6 +44,8 @@ export interface RelayHandle {
   port: number;
   /** Stop the server (closing all WS connections) and close the database. */
   stop(): Promise<void>;
+  /** Direct database handle — governance tables are inspected via SQL in tests/CLI. */
+  db: Database;
 }
 
 function numEnv(name: string): number | undefined {
@@ -118,6 +121,7 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
 
   return {
     port: server.port ?? 0,
+    db,
     async stop() {
       if (pingTimer) clearInterval(pingTimer);
       hub.closeAll();
