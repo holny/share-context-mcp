@@ -431,4 +431,39 @@ describe("blind relay", () => {
       await r3.stop();
     }
   });
+
+  test("TTL sweep evicts on IDLE channels (no inserts) — count bound alone can't do it", async () => {
+    const r4 = await startRelay({ port: 0, maxAgeDays: 0, sweepIntervalMs: 30 });
+    try {
+      const base4 = `http://127.0.0.1:${r4.port}`;
+      const post = (p: string, b: unknown, t?: string) =>
+        fetch(`${base4}${p}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(t ? { authorization: `Bearer ${t}` } : {}) },
+          body: JSON.stringify(b),
+        });
+      const channelId = randomBytes(8).toString("hex");
+      await post("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+      const ch = await post(`/channels/${channelId}/challenge`, { memberName: "alice" });
+      const { nonceB64 } = (await ch.json()) as { nonceB64: string };
+      const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
+      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof });
+      const token = ((await joined.json()) as { token: string }).token;
+      for (let i = 1; i <= 2; i++) {
+        const key = deriveChannelKey(PASSWORD, channelId);
+        const validated = validateClaim({ ts: new Date().toISOString(), statement: `m${i}`, kind: "progress", topic: "t", provenance: { member: "alice", source: "agent" } });
+        if (!validated.ok) throw new Error(validated.reason);
+        const env = seal(validated.msg, key);
+        await post(`/channels/${channelId}/messages`, { nonce: env.nonce, ciphertext: env.ciphertext, idemKey: validated.msg.idempotencyKey }, token);
+      }
+      // no further writes: only the periodic sweep can enforce the TTL bound
+      await Bun.sleep(250);
+      const list = await fetch(`${base4}/channels/${channelId}/messages?since=0`, { headers: { authorization: `Bearer ${token}` } });
+      const body = (await list.json()) as { messages: unknown[]; nextSeq: number; minSeq: number };
+      expect(body.messages).toEqual([]);
+      expect(body.minSeq).toBe(body.nextSeq);
+    } finally {
+      await r4.stop();
+    }
+  });
 });

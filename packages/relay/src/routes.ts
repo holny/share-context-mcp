@@ -89,10 +89,42 @@ function bearerToken(req: Request): string | null {
 
 // ---- route factory ----
 
-export function createRelayHandler(db: Database, wsHub?: WsHub, retention: { maxMessages: number; maxAgeDays: number } = { maxMessages: 10_000, maxAgeDays: 30 }): (req: Request) => Promise<Response> {
+/** Shared retention defaults — bin.ts, index.ts and the route factory must not drift. */
+export const DEFAULT_MAX_MESSAGES = 10_000;
+export const DEFAULT_MAX_AGE_DAYS = 30;
+
+export interface RelayRetention {
+  maxMessages: number;
+  maxAgeDays: number;
+}
+
+function validateRetention(r: RelayRetention): RelayRetention {
+  if (!Number.isInteger(r.maxMessages) || r.maxMessages < 1) {
+    throw new Error(`invalid retention: maxMessages must be an integer >= 1 (got ${r.maxMessages})`);
+  }
+  if (!Number.isFinite(r.maxAgeDays) || r.maxAgeDays < 0) {
+    throw new Error(`invalid retention: maxAgeDays must be a finite number >= 0 (got ${r.maxAgeDays})`);
+  }
+  return r;
+}
+
+export function createRelayHandler(db: Database, wsHub?: WsHub, retention: RelayRetention = { maxMessages: DEFAULT_MAX_MESSAGES, maxAgeDays: DEFAULT_MAX_AGE_DAYS }, sweepIntervalMs?: number): (req: Request) => Promise<Response> {
+  validateRetention(retention);
   // pending challenges, in-memory only: (channelId, memberName) → nonce
   const challenges = new Map<string, PendingChallenge>();
   const challengeKey = (channelId: string, memberName: string) => `${channelId}\n${memberName}`;
+  if (sweepIntervalMs !== undefined && sweepIntervalMs > 0) {
+    // unref'd: the sweep must not keep the process alive on its own; stop()
+    // closes the db, after which a late tick would throw — guarded below.
+    const timer = setInterval(() => {
+      try {
+        sweepTtl();
+      } catch {
+        /* db closed — sweep is best-effort */
+      }
+    }, sweepIntervalMs);
+    timer.unref();
+  }
 
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND name = ?");
@@ -119,7 +151,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: { max
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
   const stmtMinSeqAbove = db.prepare("SELECT MIN(seq) AS s FROM messages WHERE channel_id = ? AND created_at > ?");
   const stmtEvictPrefix = db.prepare("DELETE FROM messages WHERE channel_id = ? AND seq < ?");
-  const stmtSetMinSeq = db.prepare("UPDATE channels SET min_seq = ? WHERE id = ?");
+  const stmtSetMinSeq = db.prepare("UPDATE channels SET min_seq = MAX(min_seq, ?) WHERE id = ?");
 
   /**
    * Retention (spec): evict the OLDEST messages as a contiguous seq prefix
@@ -127,17 +159,38 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: { max
    * (created_at older than maxAgeDays). Eviction must never punch holes: a
    * consumer cursor below min_seq would make "no data loss" undecidable.
    */
-  function evictIfNeeded(channelId: string, channel: { next_seq: number; min_seq?: number }): void {
-    const nextSeq = channel.next_seq;
+  function evictIfNeeded(channelId: string, nextSeqHint: number): void {
+    // Re-read at eviction time: under concurrent sends the caller's snapshot
+    // (auth.channel) is stale, and an unconditional min_seq write from an
+    // older cutoff would REGRESS it.
+    const row = stmtChannel.get(channelId) as { next_seq: number; min_seq: number } | undefined;
+    if (!row) return;
+    const nextSeq = Math.max(row.next_seq, nextSeqHint);
+    const current = row.min_seq ?? 1;
     const countCutoff = nextSeq - retention.maxMessages;
     const cutoffTime = new Date(Date.now() - retention.maxAgeDays * 86_400_000).toISOString();
     const oldestKept = (stmtMinSeqAbove.get(channelId, cutoffTime) as { s: number | null }).s;
     const timeCutoff = oldestKept ?? nextSeq; // nothing young enough → evict all
     const cutoff = Math.min(Math.max(1, Math.max(countCutoff, timeCutoff)), nextSeq);
-    const current = channel.min_seq ?? 1;
     if (cutoff <= current) return;
-    stmtEvictPrefix.run(channelId, cutoff);
-    stmtSetMinSeq.run(cutoff, channelId);
+    // One transaction: a crash between DELETE and the min_seq update would
+    // hide the eviction from consumers (rows gone, no gap recorded).
+    const tx = db.transaction(() => {
+      stmtEvictPrefix.run(channelId, cutoff);
+      stmtSetMinSeq.run(cutoff, channelId);
+    });
+    tx();
+  }
+
+  // TTL sweeps iterate all channels; the per-channel cutoff<=min_seq guard
+  // keeps quiet channels cheap.
+  const stmtChannelsForSweep = db.prepare("SELECT id, next_seq FROM channels");
+
+  /** Periodic TTL sweep: insert-driven eviction alone lets idle channels keep ciphertext past maxAgeDays forever. */
+  function sweepTtl(): void {
+    for (const ch of stmtChannelsForSweep.all() as Array<{ id: string; next_seq: number }>) {
+      evictIfNeeded(ch.id, ch.next_seq);
+    }
   }
 
   /** Returns channel+member for a valid Bearer token, or null (caller answers 401). */
@@ -325,7 +378,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: { max
             // notified); poll GET ?since= remains the correctness fallback.
             wsHub?.notifyMessage(channelId, stored.seq, stored.epoch);
             // Retention runs after each accepted message (spec: count + TTL).
-            evictIfNeeded(channelId, { next_seq: stored.seq + 1, min_seq: auth.channel.min_seq });
+            evictIfNeeded(channelId, stored.seq + 1);
           }
           return json({ seq: stored.seq, deduped: stored.deduped });
         }
@@ -361,7 +414,14 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: { max
         if (typeof lastActiveAt !== "string" || Number.isNaN(Date.parse(lastActiveAt))) {
           return jsonError(400, "invalid request: lastActiveAt must be an ISO 8601 timestamp");
         }
-        stmtSetLastActive.run(lastActiveAt, channelId, auth.member.name);
+        // Normalize and clamp: a member posting a far-future timestamp would
+        // otherwise stay permanently "active" and corrupt presence buckets.
+        const t = new Date(lastActiveAt);
+        stmtSetLastActive.run(
+          (t.getTime() > Date.now() ? new Date() : t).toISOString(),
+          channelId,
+          auth.member.name,
+        );
         return json({ ok: true });
       }
 

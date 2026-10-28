@@ -31,7 +31,14 @@ const HIGH_VALUE_KINDS: ReadonlySet<ClaimMessage["kind"]> = new Set([
 
 const VERBATIM_CAP = 100;
 
-type Line = { seq: number | null; text: string };
+/** Code-point safe truncation (a naive slice can split a surrogate pair). */
+function truncate(text: string, max: number): string {
+  return Array.from(text)
+    .slice(0, max)
+    .join("");
+}
+
+type Line = { seq: number | null; text: string; collapsed?: boolean };
 
 function digestLines(msgs: ReadonlyArray<ClaimMessage>): Line[] {
   const sorted = [...msgs].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
@@ -40,23 +47,23 @@ function digestLines(msgs: ReadonlyArray<ClaimMessage>): Line[] {
   if (high.length === 0) return lines;
   const collapsedCount = Math.max(0, high.length - VERBATIM_CAP);
   for (const m of high.slice(0, collapsedCount)) {
-    lines.push({ seq: m.seq, text: `seq ${m.seq} (collapsed): ${m.statement.slice(0, 60)}…` });
+    lines.push({ seq: m.seq, text: `seq ${m.seq} (collapsed): ${truncate(m.statement, 60)}…`, collapsed: true });
   }
   for (const m of high.slice(collapsedCount)) {
     lines.push({ seq: m.seq, text: `seq ${m.seq} [${m.kind}] ${m.statement}` });
   }
-  // counts for the remaining kinds, per topic
+  // counts for the remaining kinds (digests excluded — a digest must not
+  // count earlier digests as channel content), one entry per line so the
+  // chunker can split a long tail across blocks.
   const counts = new Map<string, number>();
   for (const m of sorted) {
-    if (HIGH_VALUE_KINDS.has(m.kind)) continue;
+    if (HIGH_VALUE_KINDS.has(m.kind) || m.kind === "digest") continue;
     const key = `${m.topic}/${m.kind}`;
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   if (counts.size > 0) {
-    lines.push({
-      seq: null,
-      text: `other kinds: ${[...counts.entries()].map(([k, n]) => `${k}×${n}`).join(", ")}`,
-    });
+    lines.push({ seq: null, text: "other kinds:" });
+    for (const [k, n] of counts) lines.push({ seq: null, text: `  ${k}×${n}` });
   }
   return lines;
 }
@@ -90,9 +97,11 @@ export function buildDigestMessages(
   }
   if (current.length > 0) blocks.push(current);
 
+  let runningLast: number | undefined; // last real seq seen in earlier blocks
   return blocks.map((block, i) => {
     const seqs = block.map((l) => l.seq).filter((s): s is number => s !== null);
-    const prevLast = blocks.slice(0, i).flatMap((b) => b.map((l) => l.seq).filter((s): s is number => s !== null)).pop();
+    if (seqs.length > 0) runningLast = seqs[seqs.length - 1];
+    const prevLast = runningLast;
     // chunks without their own seqs (e.g. a trailing counts-only line) extend
     // the previous chunk's span rather than claiming the whole range
     const from = i === 0 ? range.from : (seqs[0] ?? prevLast ?? range.from);
@@ -102,9 +111,7 @@ export function buildDigestMessages(
     // the statement is what index cards and injections surface; anything that
     // overflows statementMax stays in the detail (fetchable via catch_up).
     const header = `channel digest seq ${from}-${to} (${block.length} entries)`;
-    const verbatimLines = block
-      .filter((l) => l.seq !== null && !l.text.includes("(collapsed)"))
-      .map((l) => l.text);
+    const verbatimLines = block.filter((l) => !l.collapsed && l.seq !== null).map((l) => l.text);
     let body = "";
     for (const line of verbatimLines) {
       const candidate = body === "" ? line : `${body}\n${line}`;
@@ -116,8 +123,8 @@ export function buildDigestMessages(
   });
 }
 
-/** Single-chunk convenience wrapper: null when nothing high-value exists. */
-export function buildDigestText(msgs: ReadonlyArray<ClaimMessage>, range: DigestRange): string | null {
+/** Single-chunk convenience: digest detail text, or null when nothing high-value exists. */
+function buildDigestText(msgs: ReadonlyArray<ClaimMessage>, range: DigestRange): string | null {
   const built = buildDigestMessages(msgs, range);
   return built.length > 0 ? built[0].detail : null;
 }

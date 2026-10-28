@@ -105,18 +105,22 @@ describe("consumer identity via _meta sessionID", () => {
     root2 = mkdtempSync(join(tmpdir(), "scm-consumer-"));
     store = new Store(join(root2, "state.db"));
     const bridge = new RelayBridge({ baseUrl: `http://127.0.0.1:${relay.port}`, store });
+    (globalThis as Record<string, unknown>).__bridgeSingleton = bridge;
     const server = buildMcpServer({ store, bridge });
     const [ct, st] = InMemoryTransport.createLinkedPair();
     client = new Client({ name: "consumer-test", version: "0.0.0" });
     await Promise.all([client.connect(ct), server.connect(st)]);
-    const created = (await call("create_channel", { memberName: "alice" })) as { channelId: string };
-    channelId2 = created.channelId;
+    // create_channel answers with plain text (not quote-wrapped JSON)
+    const createdRaw = ((await call("create_channel", { memberName: "alice" })) as { raw: string }).raw;
+    channelId2 = /channel_id=([a-z0-9]+)/.exec(createdRaw)![1];
   });
 
   afterAll(async () => { await stopRelay(); rmSync(root2, { recursive: true, force: true }); });
 
   test("consumerIdFromExtra: sessionID path and pid fallback", () => {
-    expect(consumerIdFromExtra({ _meta: { "ai.opencode/sessionID": "ses_abcdefgh123" } })).toBe("s/ses_abcd");
+    // full sessionID preserved — slicing to 8 chars leaves ~4 variable chars
+    // after the ses_ prefix (collision → two sessions share a cursor)
+    expect(consumerIdFromExtra({ _meta: { "ai.opencode/sessionID": "ses_abcdefgh123" } })).toBe("s/ses_abcdefgh123");
     expect(consumerIdFromExtra(undefined)).toMatch(/^p\//);
     expect(consumerIdFromExtra({})).toMatch(/^p\//);
   });
@@ -140,5 +144,28 @@ describe("consumer identity via _meta sessionID", () => {
     const r = (await call("fetch_updates", {})) as { messages: unknown[]; cursor: number };
     expect(Array.isArray(r.messages)).toBe(true);
     expect(r.cursor).toBeGreaterThan(0);
+  });
+
+  test("digest posting failure does not turn fetch_updates into a tool error", async () => {
+    await call("share_update", { statement: "decided: digest failure probe", kind: "decision", topic: "t" }, "ses_abcdefgh123");
+    await call("fetch_updates", {}, "ses_abcdefgh123"); // cache the message
+    // force the gap so maybePostDigest attempts a post (pending = the cached message)
+    process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "1";
+    store.setKv(`gap:${channelId2}`, "5"); // pending (0,4] includes the probe decision
+    const bridgeSingleton = (globalThis as Record<string, unknown>).__bridgeSingleton as RelayBridge;
+    const self = bridgeSingleton as unknown as { send: (msg: unknown, ch?: string) => Promise<{ seq: number; deduped: boolean }> };
+    const original = self.send.bind(bridgeSingleton);
+    self.send = async () => {
+      throw new Error("relay down");
+    };
+    try {
+      const r = (await call("fetch_updates", {}, "ses_abcdefgh123")) as { messages?: unknown[]; raw?: string; isError?: boolean };
+      expect(r.isError).toBeUndefined();
+      expect(Array.isArray(r.messages)).toBe(true);
+    } finally {
+      self.send = original;
+      delete process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+      store.setKv(`gap:${channelId2}`, "0");
+    }
   });
 });

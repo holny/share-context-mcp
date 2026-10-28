@@ -13,20 +13,26 @@ function flag(name: string): string | undefined {
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
+function numFlagOrEnv(flagName: string, envName: string, fallback: number): number {
+  const raw = flag(flagName) ?? process.env[envName];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  return Number(raw);
+}
+
 const port = Number(flag("--port") ?? 8931);
 const dbPath = flag("--db") ?? join(homedir(), ".share-context-mcp", "relay.db");
-const maxMessages = Number(flag("--max-messages") ?? process.env.SHARE_CONTEXT_RELAY_MAX_MESSAGES ?? 10_000);
-const maxAgeDays = Number(flag("--max-age-days") ?? process.env.SHARE_CONTEXT_RELAY_MAX_AGE_DAYS ?? 30);
+const maxMessages = numFlagOrEnv("--max-messages", "SHARE_CONTEXT_RELAY_MAX_MESSAGES", 10_000);
+const maxAgeDays = numFlagOrEnv("--max-age-days", "SHARE_CONTEXT_RELAY_MAX_AGE_DAYS", 30);
 if (!Number.isInteger(port) || port < 0 || port > 65535) {
   console.error(`invalid --port: ${flag("--port")}`);
   process.exit(1);
 }
 if (!Number.isInteger(maxMessages) || maxMessages < 1) {
-  console.error(`invalid --max-messages: ${flag("--max-messages")}`);
+  console.error(`invalid --max-messages: ${maxMessages} (must be an integer >= 1)`);
   process.exit(1);
 }
 if (!Number.isFinite(maxAgeDays) || maxAgeDays < 0) {
-  console.error(`invalid --max-age-days: ${flag("--max-age-days")}`);
+  console.error(`invalid --max-age-days: ${maxAgeDays} (must be a number >= 0)`);
   process.exit(1);
 }
 

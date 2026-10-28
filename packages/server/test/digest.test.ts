@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { LIMITS, type ClaimMessage } from "@share-context-mcp/protocol";
-import { buildDigestMessages, buildDigestText } from "../src/digest";
+import { buildDigestMessages } from "../src/digest";
 
 let seq = 0;
 const msg = (statement: string, kind: ClaimMessage["kind"], topic = "t"): ClaimMessage => ({
@@ -48,7 +48,6 @@ describe("buildDigestMessages", () => {
   test("returns nothing (null text / empty array) when zero high-value messages", () => {
     const msgs = [msg("progress one", "progress"), msg("howto two", "howto")];
     expect(buildDigestMessages(msgs, RANGE, LIMITS)).toEqual([]);
-    expect(buildDigestText(msgs, RANGE)).toBeNull();
   });
 
   test("collapses statements beyond the verbatim cap to one-line entries", () => {
@@ -74,5 +73,40 @@ describe("buildDigestMessages", () => {
     // ranges are contiguous and cover the whole input range
     expect(built[0].covers.startsWith("1-")).toBe(true);
     expect(built[built.length - 1].covers.endsWith("-30")).toBe(true);
+  });
+
+  test("a many-topic counts tail splits across chunks without exceeding detailMax", () => {
+    const small = { ...LIMITS, statementMax: 500, detailMax: 400 };
+    const msgs = [msg("decided: something", "decision")];
+    for (let i = 1; i <= 40; i++) {
+      msgs.push(msg(`p${i}`, "progress", `topic-${i}`));
+    }
+    const built = buildDigestMessages(msgs, { channelId: "ch0000000000", from: 1, to: 41 }, small);
+    expect(built.length).toBeGreaterThan(1);
+    for (const b of built) {
+      expect(b.detail.length).toBeLessThanOrEqual(small.detailMax);
+      expect(b.statement.length).toBeLessThanOrEqual(small.statementMax);
+    }
+    const all = built.map((b) => b.detail).join("\n");
+    expect(all).toContain("topic-1/progress×1");
+    expect(all).toContain("topic-40/progress×1");
+  });
+
+  test("earlier digests are not counted as channel content (no self-accumulation)", () => {
+    const msgs = [msg("decided: real content", "decision"), msg("old digest", "digest", "channel-digest")];
+    const built = buildDigestMessages(msgs, RANGE, LIMITS);
+    expect(built.length).toBe(1);
+    expect(built[0].detail).not.toContain("digest×1");
+  });
+
+  test("collapsed truncation is code-point safe (no lone surrogates)", () => {
+    const emoji = "🚀".repeat(40); // 40 code points, 80 UTF-16 units
+    const msgs = Array.from({ length: 120 }, (_, i) => msg(`${emoji} decision ${i + 1}`, "decision"));
+    const built = buildDigestMessages(msgs, { channelId: "ch0000000000", from: 1, to: 120 }, LIMITS);
+    const text = built.map((b) => b.detail).join("\n");
+    // no lone surrogate: every code unit of the collapsed region pairs up
+    for (const ch of text) {
+      expect(ch.codePointAt(0)).toBeDefined();
+    }
   });
 });

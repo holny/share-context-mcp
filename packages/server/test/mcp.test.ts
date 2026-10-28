@@ -653,7 +653,7 @@ describe("index card + full-history join fetch (Task 5)", () => {
     expect(card).toContain("decision×1");
     expect(card).toContain("2");
     expect(card).toContain("latest auth note");
-    expect(card).toContain("unresolvedQuestions\":2");
+    expect(card).toContain("questionsTotal\":2");
   });
 
   test("buildIndexCard: empty channel renders the none-yet copy", () => {
@@ -752,13 +752,13 @@ describe("structural digest posting (Task 7)", () => {
     // fetch is what caches it locally.
     await a.client.callTool({ name: "fetch_updates", arguments: {} });
     await a.client.callTool({ name: "fetch_updates", arguments: {} });
-    const digests = a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest");
+    const digests = a.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest");
     expect(digests.length).toBe(1);
     expect(digests[0].statement).toContain("decided: WAL mode for cache");
     expect((digests[0].scope as Record<string, string>).covers).toBe("1-3");
     // refetch → no duplicate (digested watermark + covers dedupe)
     await a.client.callTool({ name: "fetch_updates", arguments: {} });
-    expect(a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest").length).toBe(1);
+    expect(a.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest").length).toBe(1);
   }, 60_000);
 
   test("evicted range with zero high-value messages → no digest posted", async () => {
@@ -769,7 +769,7 @@ describe("structural digest posting (Task 7)", () => {
       await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
     }
     await a.client.callTool({ name: "fetch_updates", arguments: {} });
-    expect(a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest").length).toBe(0);
+    expect(a.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest").length).toBe(0);
   }, 60_000);
 
   test("second member does not re-post a digest covering the same range (covers dedupe)", async () => {
@@ -798,7 +798,7 @@ describe("structural digest posting (Task 7)", () => {
     // one more fetch pulls back anything B itself posted, so the count is honest
     await b.client.callTool({ name: "fetch_updates", arguments: {} });
     await b.client.callTool({ name: "fetch_updates", arguments: {} });
-    const bDigests = b.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest");
+    const bDigests = b.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest");
     expect(bDigests.length).toBe(1);
     expect(bDigests[0].statement).toContain("decided: dedupe probe");
   }, 60_000);
@@ -824,7 +824,7 @@ describe("structural digest posting (Task 7)", () => {
     }
     await late.client.callTool({ name: "fetch_updates", arguments: {} });
     await late.client.callTool({ name: "fetch_updates", arguments: {} });
-    const digests = late.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest");
+    const digests = late.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest");
     expect(digests.length).toBe(1);
     // covers 3-5 (what the author saw), NOT 1-5 (what the range implies)
     expect((digests[0].scope as Record<string, string>).covers).toBe("3-5");

@@ -8,7 +8,7 @@
  * the correctness fallback (spec §5.7).
  */
 import { openDb } from "./db";
-import { authenticateUpgradeToken, createRelayHandler, jsonError } from "./routes";
+import { authenticateUpgradeToken, createRelayHandler, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_MESSAGES, jsonError } from "./routes";
 import { createWsHub, type WsConnData } from "./ws";
 
 const DEFAULT_PING_INTERVAL_MS = 25_000;
@@ -31,6 +31,11 @@ export interface RelayOptions {
    */
   maxMessages?: number;
   maxAgeDays?: number;
+  /**
+   * TTL sweep interval in ms (default 60_000): insert-driven eviction alone
+   * would let idle channels keep ciphertext past maxAgeDays forever.
+   */
+  sweepIntervalMs?: number;
 }
 
 export interface RelayHandle {
@@ -42,7 +47,7 @@ export interface RelayHandle {
 
 function numEnv(name: string): number | undefined {
   const raw = process.env[name];
-  if (raw === undefined || raw === "") return undefined;
+  if (raw === undefined || raw.trim() === "") return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
@@ -50,10 +55,15 @@ function numEnv(name: string): number | undefined {
 export async function startRelay(options: RelayOptions = {}): Promise<RelayHandle> {
   const db = openDb(options.dbPath ?? ":memory:");
   const hub = createWsHub();
-  const handle = createRelayHandler(db, hub, {
-    maxMessages: options.maxMessages ?? numEnv("SHARE_CONTEXT_RELAY_MAX_MESSAGES") ?? 10_000,
-    maxAgeDays: options.maxAgeDays ?? numEnv("SHARE_CONTEXT_RELAY_MAX_AGE_DAYS") ?? 30,
-  });
+  const handle = createRelayHandler(
+    db,
+    hub,
+    {
+      maxMessages: options.maxMessages ?? numEnv("SHARE_CONTEXT_RELAY_MAX_MESSAGES") ?? DEFAULT_MAX_MESSAGES,
+      maxAgeDays: options.maxAgeDays ?? numEnv("SHARE_CONTEXT_RELAY_MAX_AGE_DAYS") ?? DEFAULT_MAX_AGE_DAYS,
+    },
+    options.sweepIntervalMs ?? 60_000,
+  );
   const stmtChannelInfo = db.prepare("SELECT epoch, next_seq FROM channels WHERE id = ?");
 
   const server = Bun.serve<WsConnData>({

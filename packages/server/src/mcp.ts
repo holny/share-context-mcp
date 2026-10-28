@@ -61,7 +61,10 @@ function quoteWrap(body: string): string {
 }
 
 function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}…`;
+  if (text.length <= max) return text;
+  // code-point safe: a naive slice can split a surrogate pair (emoji) and
+  // emit a lone surrogate into tool output / digest messages
+  return Array.from(text).slice(0, max).join("") + "…";
 }
 
 /**
@@ -70,7 +73,7 @@ function truncate(text: string, max: number): string {
  */
 function resolveChannel(store: Store, channelId?: string): string {
   const ch = resolveChannelInner(store, channelId);
-  activityHook?.(ch);
+  activityHooks.get(store)?.(ch);
   return ch;
 }
 
@@ -103,7 +106,7 @@ function resolveChannelInner(store: Store, channelId?: string): string {
  */
 export function buildIndexCard(opts: {
   channelId: string;
-  members: ReadonlyArray<{ memberName: string; joinedAt?: string; activity?: string }>;
+  members: ReadonlyArray<{ memberName: string; joinedAt?: string; lastActiveAt?: string | null }>;
   msgs: ReadonlyArray<ClaimMessage>;
   pendingQuestions: number;
   /** Lowest seq the relay still retains; older text is evicted (digest-only). */
@@ -125,28 +128,41 @@ export function buildIndexCard(opts: {
       statement: truncate(d.statement, CARD_STATEMENT_MAX),
     }));
   const day = (ts: string) => ts.slice(5, 10);
-  const topics = [...byTopic.entries()].map(([topic, list]) => {
-    const last = list[0];
-    const kindCounts = new Map<string, number>();
-    for (const m of list) kindCounts.set(m.kind, (kindCounts.get(m.kind) ?? 0) + 1);
-    return {
-      topic,
-      count: list.length,
-      kinds: [...kindCounts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .map(([k, c]) => `${k}×${c}`)
-        .join(" "),
-      span: `${day(list[list.length - 1].ts)} ~ ${day(last.ts)}`,
-      last: truncate(last.statement, CARD_STATEMENT_MAX),
-      lastSeq: last.seq,
-    };
-  });
+  // Card is injected wholesale into the joining session — an unbounded topic
+  // list would grow with channel age. Keep the most recently active topics;
+  // catch_up/search cover the long tail.
+  const CARD_TOPIC_CAP = 30;
+  const topics = [...byTopic.entries()]
+    .map(([topic, list]) => {
+      const last = list[0];
+      const kindCounts = new Map<string, number>();
+      for (const m of list) kindCounts.set(m.kind, (kindCounts.get(m.kind) ?? 0) + 1);
+      return {
+        topic,
+        count: list.length,
+        kinds: [...kindCounts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([k, c]) => `${k}×${c}`)
+          .join(" "),
+        span: `${day(list[list.length - 1].ts)} ~ ${day(last.ts)}`,
+        last: truncate(last.statement, CARD_STATEMENT_MAX),
+        lastSeq: last.seq,
+      };
+    })
+    .sort((a, b) => (b.lastSeq ?? 0) - (a.lastSeq ?? 0))
+    .slice(0, CARD_TOPIC_CAP);
   return JSON.stringify({
     channelId,
-    members,
+    // same projection as list_members — activity bucket instead of raw ISO
+    members: members.map((m) => {
+      const activity = activityBucket(m.lastActiveAt);
+      return activity === undefined
+        ? { memberName: m.memberName, joinedAt: m.joinedAt }
+        : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
+    }),
     topics,
     digests,
-    unresolvedQuestions: pendingQuestions,
+    questionsTotal: pendingQuestions,
     ...(historyGap !== undefined && historyGap > 1
       ? { historyGap: `before seq ${historyGap} — older text was evicted by relay retention, recoverable only via digests` }
       : {}),
@@ -213,7 +229,10 @@ async function maybePostDigest(
   // digest covering this range — it arrived as an ordinary message and is in
   // the local cache. Skip rather than flood the channel with N copies.
   const existing = store
-    .searchCache(ch, DIGEST_TOPIC)
+    // "digest" matches the digest header ("channel digest seq …"); the kind
+    // filter below removes false positives. (FTS search covers statement and
+    // detail only, so the hyphenated topic name is not itself searchable.)
+    .searchCache(ch, "digest")
     .filter((m) => m.kind === "digest");
   const covered = existing.some((m) => {
     const c = (m.scope as Record<string, string> | undefined)?.covers;
@@ -262,13 +281,16 @@ function filterClaims(
 }
 
 /**
- * Presence hook, set by buildMcpServer: every tool call that resolves a
- * channel is an activity signal (the MCP protocol has no session-exit events,
- * so "active" = recently active). The bridge rate-limits the actual POST.
+ * Presence hooks keyed by Store: one process may host several MCP servers
+ * (tests, embedding) — a module-level single hook would route every server's
+ * tool calls through whichever registered last. resolveChannel receives the
+ * store, so the lookup is per-instance by construction.
  */
-let activityHook: ((channelId: string) => void) | null = null;
+const activityHooks = new WeakMap<object, (channelId: string) => void>();
 
-/** Presence bucket: active within the last 5 minutes. */
+/**
+ * Presence bucket: active within the last 5 minutes.
+ */
 const ACTIVE_WINDOW_MS = 5 * 60 * 1000;
 
 function activityBucket(lastActiveAt: string | null | undefined): string | undefined {
@@ -291,7 +313,10 @@ export function consumerIdFromExtra(extra: unknown): string {
   const meta = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta;
   const sessionID = meta?.["ai.opencode/sessionID"];
   if (typeof sessionID === "string" && sessionID.length > 0) {
-    return `s/${sessionID.slice(0, 8)}`;
+    // FULL id: slicing (e.g. 8 chars) leaves only a few variable characters
+    // after the ses_ prefix — two colliding sessions would silently share a
+    // delivered cursor. In-memory keys; the extra length costs nothing.
+    return `s/${sessionID}`;
   }
   return `p/${process.pid}`;
 }
@@ -318,7 +343,8 @@ const channelIdParam = {
 };
 
 export function buildMcpServer(deps: McpServerDeps): McpServer {
-  const { store, bridge, onChannelJoined, onChannelLeft } = deps;  // Consumer-scoped delivered cursor: one MCP server process serves many
+  const { store, bridge, onChannelJoined, onChannelLeft } = deps;
+  // Consumer-scoped delivered cursor: one MCP server process serves many
   // agent sessions (opencode shares one stdio process across sessions, each
   // tool call carrying `_meta["ai.opencode/sessionID"]`). Each consumer —
   // session when identifiable, process otherwise — tracks its own delivery
@@ -329,9 +355,14 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   const delivered = new Map<string, Map<string, number>>();
   // Presence: every channel-resolving tool call reports member activity to the
   // bridge (RelayBridge rate-limits to one POST per 30s; other bridges no-op).
-  activityHook = (ch) => {
-    void bridge.reportActivity(ch, new Date().toISOString()).catch(() => {});
-  };
+  // Presence: every channel-resolving tool call reports member activity to
+  // the bridge (RelayBridge rate-limits to one POST per 30s; other bridges
+  // no-op). Failure is logged, never propagated — presence is best-effort.
+  activityHooks.set(store, (ch) => {
+    bridge.reportActivity(ch, new Date().toISOString()).catch((e: unknown) => {
+      console.error("share-context-mcp: activity report failed:", e instanceof Error ? e.message : String(e));
+    });
+  });
   const deliveredFor = (consumerId: string) => {
     let m = delivered.get(consumerId);
     if (!m) {
@@ -434,7 +465,12 @@ Choose a stable member name your teammates will recognize — directed messages 
       const card = JSON.parse(
         buildIndexCard({ channelId, members: meta.members, msgs: all, pendingQuestions, historyGap }),
       ) as Record<string, unknown>;
-      await maybePostDigest(bridge, store, channelId);
+      await maybePostDigest(bridge, store, channelId).catch((e: unknown) => {
+        // Digests are best-effort housekeeping — a failed post must not turn
+        // a successful poll into a tool error. The digested watermark is only
+        // advanced after a successful send, so the next fetch retries.
+        console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
+      });
       return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
     }),
   );
@@ -544,7 +580,10 @@ Also re-check after a break and before finalizing work others depend on. Returns
       const prevHigh = store.getCursor(ch);
       await bridge.poll(ch, prevHigh);
       const high = store.getCursor(ch);
-      await maybePostDigest(bridge, store, ch);
+      // Digest failure must not break the fetch (see join_channel note).
+      await maybePostDigest(bridge, store, ch).catch((e: unknown) => {
+        console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
+      });
       const start = since ?? consumerDelivered.get(ch) ?? 0;
       // Serve at most SERVE_WINDOW claims per call (review F2): an overnight
       // broadcaster backlog must not dump hundreds of claims into one tool

@@ -366,7 +366,7 @@ describe("e2e: retention + digest + consumer identity (Task 8)", () => {
       await call("fetch_updates", {}, "ses_aaaa1111"); // gap advances; digest posted
       await call("fetch_updates", {}, "ses_aaaa1111"); // digest lands in B's cache
       const store = b.client; // digest assertion via B's own search through a third session
-      const f3 = JSON.parse(unwrapQuote(textOf(await call("search_messages", { query: "channel-digest", kind: "digest" }, "ses_aaaa1111")))) as {
+      const f3 = JSON.parse(unwrapQuote(textOf(await call("search_messages", { query: "digest", kind: "digest" }, "ses_aaaa1111")))) as {
         messages: Array<{ statement: string; scope?: Record<string, string> }>;
         count: number;
       };

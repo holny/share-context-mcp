@@ -177,13 +177,25 @@ describe("Store", () => {
     const ch = "chabcdefgh12";
     store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
     store.cacheMessages(ch, [
-      // seq 1: dense match (short statement, both terms) — must outrank seq 2
-      mkMsg(1, "token refresh flow now uses a sliding window"),
-      // seq 2 (newer): same two terms but buried in a long statement → lower BM25
-      mkMsg(2, "a long rambling status note about many unrelated things, mentioning token and also refresh somewhere in the middle of it all"),
+      // seq 1: sparse match — must NOT outrank seq 2 even though its rowid is lower
+      mkMsg(1, "a long rambling status note about many unrelated things, mentioning token and also refresh somewhere in the middle of it all"),
+      // seq 2 (newer, HIGHER rowid): dense match (short statement, both terms) — BM25 must rank it first
+      mkMsg(2, "token refresh flow now uses a sliding window"),
     ]);
     const hits = store.searchCache(ch, "token&refresh");
-    expect(hits.map((m) => m.seq)).toEqual([1, 2]);
+    expect(hits.map((m) => m.seq)).toEqual([2, 1]);
+    store.close();
+  });
+
+  test("searchCache FTS path does not match topic/kind columns (parity with LIKE)", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [
+      mkMsg(1, "plain content", { kind: "decision" as ClaimKind, topic: "decision" }),
+    ]);
+    // "decision" is a kind and a topic — neither is searchable content
+    expect(store.searchCache(ch, "decision")).toEqual([]);
     store.close();
   });
 

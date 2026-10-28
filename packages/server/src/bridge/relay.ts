@@ -416,12 +416,15 @@ export class RelayBridge implements ChannelBridge {
     const now = Date.now();
     const last = this.lastActivityPost.get(channelId);
     if (last !== undefined && now - last < ACTIVITY_POST_INTERVAL_MS) return;
-    this.lastActivityPost.set(channelId, now);
     await this.request(`/channels/${channelId}/activity`, {
       method: "POST",
       headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
       body: JSON.stringify({ lastActiveAt }),
     });
+    // Consume the slot only on success: a failed POST must not suppress the
+    // next 30s of presence reports (the member was active; the relay just
+    // did not hear about it).
+    this.lastActivityPost.set(channelId, now);
   }
 
   async rotate(channelId: string, newPassword: string): Promise<void> {

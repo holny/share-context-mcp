@@ -257,11 +257,11 @@ describe("RelayBridge against a real relay", () => {
     await mbA.reportActivity(channelId, "2026-10-28T09:00:00Z");
     const meta = await mbA.meta(channelId);
     const me = meta.members.find((m) => m.memberName === "a");
-    expect(me?.lastActiveAt).toBe("2026-10-28T00:00:00Z");
+    // relay normalizes timestamps (Date → ISO with ms precision)
+    expect(me?.lastActiveAt).toBe(new Date("2026-10-28T00:00:00Z").toISOString());
   });
 
-  test("poll propagates minSeq: cursor raised, gap kv recorded (Review: eviction gap)", async () => {
-    const r2 = await startRelay({ port: 0, maxMessages: 1 });
+  test("poll propagates minSeq: cursor raised, gap kv recorded (Review: eviction gap)", async () => {    const r2 = await startRelay({ port: 0, maxMessages: 1 });
     try {
       const store2 = new Store(join(mkdtempSync(join(tmpdir(), "scm-gap-")), "s.db"));
       const b2 = new RelayBridge({ baseUrl: `http://127.0.0.1:${r2.port}`, store: store2 });
@@ -290,5 +290,24 @@ describe("RelayBridge against a real relay", () => {
     } finally {
       fake.stop();
     }
+  });
+
+  test("reportActivity rate-limit slot is only consumed on SUCCESS", async () => {
+    const { channelId } = await mbA.createChannel({ memberName: "a" });
+    let fail = true;
+    const self = mbA as unknown as { request: (p: string, i?: RequestInit) => Promise<Record<string, unknown>> };
+    const original = self.request.bind(mbA);
+    self.request = async (p: string, i?: RequestInit) => {
+      if (fail) throw new Error("relay down");
+      return original(p, i);
+    };
+    // failed attempt → slot NOT consumed
+    await expect(mbA.reportActivity(channelId, "2026-10-28T00:00:00Z")).rejects.toThrow("relay down");
+    fail = false;
+    // immediate retry within 30s must still reach the relay
+    await mbA.reportActivity(channelId, "2026-10-28T01:00:00Z");
+    const meta = await mbA.meta(channelId);
+    const me = meta.members.find((m) => m.memberName === "a");
+    expect(me?.lastActiveAt).toBe(new Date("2026-10-28T01:00:00Z").toISOString());
   });
 });

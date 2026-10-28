@@ -297,9 +297,17 @@ export class Store {
 
   /** Forget a channel locally (relay-side membership record is untouched in v1). */
   removeChannel(channelId: string): void {
-    this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(channelId);
-    this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(channelId);
-    this.db.prepare("DELETE FROM messages WHERE channel_id = ?").run(channelId);
+    const tx = this.db.transaction((ch: string) => {
+      this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(ch);
+      this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(ch);
+      // FTS mirror cleanup: orphan rows are otherwise only reclaimed lazily
+      // when a later insert happens to reuse their rowid.
+      this.db
+        .prepare("DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages WHERE channel_id = ?)")
+        .run(ch);
+      this.db.prepare("DELETE FROM messages WHERE channel_id = ?").run(ch);
+    });
+    tx(channelId);
   }
 
   // ---- cursor (spec §5.7) ----
@@ -347,6 +355,12 @@ export class Store {
          provenance_json = excluded.provenance_json`,
     );
     const insertAll = this.db.transaction((rows: ReadonlyArray<Omit<ClaimMessage, "idempotencyKey">>) => {
+      // Hoisted once per batch — bun:sqlite compiles on prepare.
+      const ftsRowid = this.db.prepare(`SELECT rowid FROM messages WHERE channel_id = ? AND seq = ?`);
+      const ftsDelete = this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`);
+      const ftsInsert = this.db.prepare(
+        `INSERT INTO messages_fts(rowid, statement, detail, topic, kind, scope) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
       for (const m of rows) {
         stmt.run(
           channelId,
@@ -362,13 +376,9 @@ export class Store {
         );
         // Mirror into the FTS5 index (trigram): replace any previous text for
         // this (channel_id, seq) so search sees upserted content, not stale.
-        const row = this.db
-          .prepare(`SELECT rowid FROM messages WHERE channel_id = ? AND seq = ?`)
-          .get(channelId, m.seq) as { rowid: number };
-        this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(row.rowid);
-        this.db
-          .prepare(`INSERT INTO messages_fts(rowid, statement, detail, topic, kind, scope) VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(row.rowid, m.statement, m.detail ?? "", m.topic, m.kind, m.scope ? JSON.stringify(m.scope) : "");
+        const row = ftsRowid.get(channelId, m.seq) as { rowid: number };
+        ftsDelete.run(row.rowid);
+        ftsInsert.run(row.rowid, m.statement, m.detail ?? "", m.topic, m.kind, m.scope ? JSON.stringify(m.scope) : "");
       }
     });
     insertAll(msgs);
@@ -393,13 +403,20 @@ export class Store {
     const params: string[] = [];
     let hasFts = false;
     let hasLike = false;
+    const ftsGroups: string[] = [];
     for (const g of groups) {
       const parts: string[] = [];
+      const ftsParts: string[] = [];
       for (const term of g) {
+        const quoted = `"${term.replace(/"/g, '""')}"`;
         if (term.length >= 3) {
           hasFts = true;
-          parts.push(`rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)`);
-          params.push(`"${term.replace(/"/g, '""')}"`);
+          // Column-restricted MATCH: parity with the LIKE path, which scans
+          // statement+detail only. topic/kind/scope have dedicated exact
+          // filters (catch_up) and must not leak into content search.
+          ftsParts.push(quoted);
+          parts.push(`m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)`);
+          params.push(`{statement detail}: ${quoted}`);
         } else {
           hasLike = true;
           parts.push(`lower(coalesce(statement, '') || ' ' || coalesce(detail, '')) LIKE ?`);
@@ -407,20 +424,37 @@ export class Store {
         }
       }
       conds.push(`(${parts.join(" AND ")})`);
+      // FTS5 allows exactly one MATCH constraint per table per query, so the
+      // OR-of-groups structure lives INSIDE a single MATCH expression, with
+      // the column filter repeated per group.
+      ftsGroups.push(`{statement detail}: (${ftsParts.join(" AND ")})`);
     }
     const where = conds.length > 0 ? ` AND (${conds.join(" OR ")})` : "";
     // Pure-FTS queries rank by relevance; anything touching LIKE keeps the
     // stable newest-first order (BM25 scores are not comparable to LIKE hits).
-    const order =
-      hasFts && !hasLike
-        ? ` ORDER BY (SELECT rank FROM messages_fts WHERE messages_fts.rowid = messages.rowid)`
-        : ` ORDER BY seq DESC`;
-    const rows = this.db
-      .prepare(
-        `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
-         FROM messages WHERE channel_id = ?${where}${order}`,
-      )
-      .all(channelId, ...params) as MessageRow[];
+    // Two FTS5 quirks pinned by probes: rank is only populated when the MATCH
+    // targets the scanned FTS table in the same query (a rowid IN (subquery)
+    // filter leaves it NULL), and in a JOIN the MATCH/ORDER BY must reference
+    // the real table name — an alias raises "no such column".
+    let rows: MessageRow[];
+    if (hasFts && !hasLike) {
+      rows = this.db
+        .prepare(
+          `SELECT m.seq, m.ts, m.statement, m.detail, m.kind, m.scope_json, m.topic, m."to" AS to_member, m.provenance_json
+           FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
+           WHERE m.channel_id = ? AND messages_fts MATCH ?
+           ORDER BY messages_fts.rank`,
+        )
+        .all(channelId, ftsGroups.join(" OR ")) as MessageRow[];
+    } else {
+      rows = this.db
+        .prepare(
+          `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
+           FROM messages WHERE channel_id = ?${where}
+           ORDER BY seq DESC`,
+        )
+        .all(channelId, ...params) as MessageRow[];
+    }
     return rows.map(rowToClaim);
   }
 
