@@ -223,7 +223,7 @@ describe("Store", () => {
     // (foo AND bar) OR (baz) → m1, m4, m2, m3. Pure-FTS query → BM25 rank order
     // (relevance first); assert membership, order is pinned by the BM25 test.
     const hits = store.searchCache(ch, "foo&bar,baz");
-    expect([...hits.map((m) => m.seq)].sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+    expect([...hits.map((m) => m.seq)].sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([1, 2, 3, 4]);
 
     // (foo AND baz) → no message has both → empty
     expect(store.searchCache(ch, "foo&baz")).toEqual([]);
@@ -232,7 +232,7 @@ describe("Store", () => {
     expect(store.searchCache(ch, "qux,missingword").map((m) => m.seq)).toEqual([2]);
 
     // AND within a group: foo&bar → m1, m4 (both contain both terms)
-    expect([...store.searchCache(ch, "foo&bar").map((m) => m.seq)].sort((a, b) => a - b)).toEqual([1, 4]);
+    expect([...store.searchCache(ch, "foo&bar").map((m) => m.seq)].sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([1, 4]);
     store.close();
   });
 

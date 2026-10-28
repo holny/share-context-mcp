@@ -134,8 +134,7 @@ describe("validateClaim — kind enum", () => {
   });
 
   test("accepts digest with covers scope convention", () => {
-    const claim = base("digest");
-    claim.scope = { covers: "1-500" };
+    const claim = { ...base("digest"), scope: { covers: "1-500" } };
     claim.topic = "channel-digest";
     const r = validateClaim(claim);
     expect(r.ok).toBe(true);

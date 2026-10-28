@@ -65,3 +65,80 @@ test("same S3Bridge instance, two channels — no cross-channel interference", a
   // messages don't carry channelId — isolation is by separate seq spaces
   expect(r.messages.length).toBe(1); // only channel 2's message
 });
+
+// ---- consumer identity (Task 3): one MCP server process, many sessions ----
+// Uses RelayBridge (the only bridge that persists channels into the Store —
+// same pattern as mcp.test.ts; S3/Git MCP persistence is a separate gap).
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { startRelay } from "@share-context-mcp/relay";
+import { buildMcpServer, consumerIdFromExtra } from "../src/mcp";
+import { RelayBridge } from "../src/bridge/relay";
+
+describe("consumer identity via _meta sessionID", () => {
+  let root2: string;
+  let stopRelay: () => Promise<void>;
+  let client: Client;
+  let store: Store;
+  let channelId2: string;
+
+  const call = async (name: string, args: Record<string, unknown>, sessionID?: string) => {
+    const res = await client.callTool({
+      name,
+      arguments: args,
+      ...(sessionID === undefined ? {} : { _meta: { "ai.opencode/sessionID": sessionID } }),
+    });
+    const text = (res as { content?: Array<{ text?: string }> }).content?.map((c) => c.text ?? "").join("\n") ?? "";
+    const lines = text.split("\n");
+    const payload = lines[0]?.startsWith("📋") ? lines.slice(1).map((l) => l.slice(2)).join("\n") : text;
+    try {
+      return JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      return { raw: payload, isError: (res as { isError?: boolean }).isError === true };
+    }
+  };
+
+  beforeAll(async () => {
+    const relay = await startRelay({ port: 0 });
+    stopRelay = relay.stop;
+    root2 = mkdtempSync(join(tmpdir(), "scm-consumer-"));
+    store = new Store(join(root2, "state.db"));
+    const bridge = new RelayBridge({ baseUrl: `http://127.0.0.1:${relay.port}`, store });
+    const server = buildMcpServer({ store, bridge });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    client = new Client({ name: "consumer-test", version: "0.0.0" });
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    const created = (await call("create_channel", { memberName: "alice" })) as { channelId: string };
+    channelId2 = created.channelId;
+  });
+
+  afterAll(async () => { await stopRelay(); rmSync(root2, { recursive: true, force: true }); });
+
+  test("consumerIdFromExtra: sessionID path and pid fallback", () => {
+    expect(consumerIdFromExtra({ _meta: { "ai.opencode/sessionID": "ses_abcdefgh123" } })).toBe("s/ses_abcd");
+    expect(consumerIdFromExtra(undefined)).toMatch(/^p\//);
+    expect(consumerIdFromExtra({})).toMatch(/^p\//);
+  });
+
+  test("two sessions sharing one process each consume the same messages independently", async () => {
+    for (let i = 1; i <= 3; i++) {
+      await call("share_update", { statement: `shared fact ${i}`, kind: "progress", topic: "t" }, "ses_abcdefgh123");
+    }
+    // consumer 1 fetches → sees all 3
+    const c1 = (await call("fetch_updates", {}, "ses_abcdefgh123")) as { messages: unknown[] };
+    expect(c1.messages.length).toBe(3);
+    // consumer 2 (different sessionID, same process) ALSO sees all 3
+    const c2 = (await call("fetch_updates", {}, "ses_zzzzzzzz999")) as { messages: unknown[] };
+    expect(c2.messages.length).toBe(3);
+    // consumer 1 again → nothing new
+    const c1b = (await call("fetch_updates", {}, "ses_abcdefgh123")) as { messages: unknown[] };
+    expect(c1b.messages.length).toBe(0);
+  });
+
+  test("client without _meta falls back to a pid-scoped consumer and still works", async () => {
+    const r = (await call("fetch_updates", {})) as { messages: unknown[]; cursor: number };
+    expect(Array.isArray(r.messages)).toBe(true);
+    expect(r.cursor).toBeGreaterThan(0);
+  });
+});

@@ -107,11 +107,29 @@ function filterClaims(
   });
 }
 
+/**
+ * Consumer identity for one MCP server process serving many agent sessions.
+ * opencode-family clients (upstream opencode, bocomcode_v2 — verified at
+ * packages/core/src/mcp/client.ts) send `_meta: {"ai.opencode/sessionID": id}`
+ * on every tools/call; the SDK passes request `_meta` through to the handler
+ * via `extra._meta`. Sessions sharing one process get distinct consumer ids;
+ * clients that send no `_meta` (pi, curl, other SDKs) fall back to a
+ * process-scoped id. Shape: `s/<first 8 of sessionID>` or `p/<pid>`.
+ */
+export function consumerIdFromExtra(extra: unknown): string {
+  const meta = (extra as { _meta?: Record<string, unknown> } | undefined)?._meta;
+  const sessionID = meta?.["ai.opencode/sessionID"];
+  if (typeof sessionID === "string" && sessionID.length > 0) {
+    return `s/${sessionID.slice(0, 8)}`;
+  }
+  return `p/${process.pid}`;
+}
+
 /** Wrap a handler so failures reach the agent as readable tool errors. */
-function safe(handler: (args: any) => Promise<string>) {
-  return async (args: any) => {
+function safe(handler: (args: any, extra: unknown) => Promise<string>) {
+  return async (args: any, extra: unknown) => {
     try {
-      return { content: [{ type: "text" as const, text: await handler(args ?? {}) }] };
+      return { content: [{ type: "text" as const, text: await handler(args ?? {}, extra) }] };
     } catch (err) {
       return {
         content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
@@ -130,12 +148,23 @@ const channelIdParam = {
 
 export function buildMcpServer(deps: McpServerDeps): McpServer {
   const { store, bridge, onChannelJoined, onChannelLeft } = deps;
-  // Session-scoped delivered cursor: each MCP server process tracks its own
-  // delivery position in process memory, NOT in the shared SQLite. Even the
-  // same agent opening two sessions on the same channel gets independent
-  // views — one session consuming a message does not prevent the other
-  // session from seeing it. Different sessions = different consumers.
-  const delivered = new Map<string, number>();
+  // Consumer-scoped delivered cursor: one MCP server process serves many
+  // agent sessions (opencode shares one stdio process across sessions, each
+  // tool call carrying `_meta["ai.opencode/sessionID"]`). Each consumer —
+  // session when identifiable, process otherwise — tracks its own delivery
+  // position in process memory, NOT in the shared SQLite: one session
+  // consuming a message never prevents another from seeing it. Different
+  // consumers = different consumers; process restart replays from the relay
+  // (full history is retained), so nothing is lost.
+  const delivered = new Map<string, Map<string, number>>();
+  const deliveredFor = (consumerId: string) => {
+    let m = delivered.get(consumerId);
+    if (!m) {
+      m = new Map();
+      delivered.set(consumerId, m);
+    }
+    return m;
+  };
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
 
   // ---- create_channel ----
@@ -338,12 +367,13 @@ Also re-check after a break and before finalizing work others depend on. Returns
         ...channelIdParam,
       },
     },
-    safe(async ({ since, channelId }) => {
+    safe(async ({ since, channelId }, extra) => {
       const ch = resolveChannel(store, channelId);
+      const consumerDelivered = deliveredFor(consumerIdFromExtra(extra));
       const prevHigh = store.getCursor(ch);
       await bridge.poll(ch, prevHigh);
       const high = store.getCursor(ch);
-      const start = since ?? delivered.get(ch) ?? 0;
+      const start = since ?? consumerDelivered.get(ch) ?? 0;
       // Serve at most SERVE_WINDOW claims per call (review F2): an overnight
       // broadcaster backlog must not dump hundreds of claims into one tool
       // result. delivered only advances to the LAST SERVED seq; `remaining`
@@ -358,7 +388,7 @@ Also re-check after a break and before finalizing work others depend on. Returns
       // skipped count, exact across broadcaster-consumed windows too.
       const skipped = Math.max(0, high - start - served.length);
       if (since === undefined || since <= high) {
-        delivered.set(ch, Math.max(delivered.get(ch) ?? 0, lastServed));
+        consumerDelivered.set(ch, Math.max(consumerDelivered.get(ch) ?? 0, lastServed));
       }
       const remaining = Math.max(0, high - lastServed);
       setActiveChannel(store, ch);
