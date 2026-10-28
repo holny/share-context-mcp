@@ -771,4 +771,62 @@ describe("structural digest posting (Task 7)", () => {
     await a.client.callTool({ name: "fetch_updates", arguments: {} });
     expect(a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest").length).toBe(0);
   }, 60_000);
+
+  test("second member does not re-post a digest covering the same range (covers dedupe)", async () => {
+    const a = await mkAgent("dd-a");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "dd-a" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    // both members cache the range that will be evicted
+    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: dedupe probe", kind: "decision", topic: "t" } });
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    const b = await mkAgent("dd-b");
+    await b.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "dd-b" } });
+    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    // seqs 2-3 sent and fetched by BOTH (before eviction)
+    for (let i = 1; i <= 2; i++) {
+      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+    }
+    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    // eviction pushes minSeq to 4; both hold seqs 1-3 cached
+    for (let i = 3; i <= 5; i++) {
+      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+    }
+    // A crosses the watermark first → posts the digest
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    // B's next fetch sees A's digest (poll caches it) → must NOT re-post;
+    // one more fetch pulls back anything B itself posted, so the count is honest
+    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    const bDigests = b.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest");
+    expect(bDigests.length).toBe(1);
+    expect(bDigests[0].statement).toContain("decided: dedupe probe");
+  }, 60_000);
+
+  test("digest covers only the span its author actually cached (no overstatement)", async () => {
+    const a = await mkAgent("cv-a");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "cv-a" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    // a sends 5 with the decision at seq 3, fetches → relay evicts 1-2, retains 3-5
+    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 1", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 2", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: covers probe", kind: "decision", topic: "t" } });
+    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 4", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 5", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    // late joiner caches ONLY 3-5 (1-2 already evicted relay-side)
+    const late = await mkAgent("cv-late");
+    await late.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "cv-late" } });
+    // eviction advances to minSeq 6 → late's pending evicted-but-cached = 3-5
+    for (let i = 6; i <= 8; i++) {
+      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+    }
+    await late.client.callTool({ name: "fetch_updates", arguments: {} });
+    await late.client.callTool({ name: "fetch_updates", arguments: {} });
+    const digests = late.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest");
+    expect(digests.length).toBe(1);
+    // covers 3-5 (what the author saw), NOT 1-5 (what the range implies)
+    expect((digests[0].scope as Record<string, string>).covers).toBe("3-5");
+  }, 60_000);
 });

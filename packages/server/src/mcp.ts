@@ -200,7 +200,31 @@ async function maybePostDigest(
       ? (Date.parse(pending[pending.length - 1].ts) - Date.parse(pending[0].ts)) / 86_400_000
       : 0;
   if (pending.length < minMsgs && spanDays < maxAgeDays) return;
-  const built = buildDigestMessages(pending, { channelId: ch, from: digestedTo + 1, to: pendingTo });
+  // A member can only summarize what it actually cached (a late joiner never
+  // saw the range head) — covers must never claim more than that, or the
+  // digest asserts facts ("nothing before seq N") it cannot know.
+  if (pending.length === 0) {
+    store.setKv(`digested:${ch}`, String(pendingTo)); // nothing cached → nothing to say; move on
+    return;
+  }
+  const pendingFrom = pending[0].seq ?? digestedTo + 1;
+  const pendingHigh = pending[pending.length - 1].seq ?? pendingTo;
+  // Cross-member dedupe (spec): another member may have already posted a
+  // digest covering this range — it arrived as an ordinary message and is in
+  // the local cache. Skip rather than flood the channel with N copies.
+  const existing = store
+    .searchCache(ch, DIGEST_TOPIC)
+    .filter((m) => m.kind === "digest");
+  const covered = existing.some((m) => {
+    const c = (m.scope as Record<string, string> | undefined)?.covers;
+    const [a, b] = (c ?? "").split("-").map(Number);
+    return Number.isFinite(a) && Number.isFinite(b) && a <= pendingFrom && b >= pendingHigh;
+  });
+  if (covered) {
+    store.setKv(`digested:${ch}`, String(pendingTo));
+    return;
+  }
+  const built = buildDigestMessages(pending, { channelId: ch, from: pendingFrom, to: pendingHigh });
   const secret = store.getChannelSecret(ch);
   if (!secret) return;
   for (const b of built) {

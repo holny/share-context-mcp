@@ -92,7 +92,10 @@ export function buildDigestMessages(
 
   return blocks.map((block, i) => {
     const seqs = block.map((l) => l.seq).filter((s): s is number => s !== null);
-    const from = i === 0 ? range.from : (seqs[0] ?? range.from);
+    const prevLast = blocks.slice(0, i).flatMap((b) => b.map((l) => l.seq).filter((s): s is number => s !== null)).pop();
+    // chunks without their own seqs (e.g. a trailing counts-only line) extend
+    // the previous chunk's span rather than claiming the whole range
+    const from = i === 0 ? range.from : (seqs[0] ?? prevLast ?? range.from);
     const to = i === blocks.length - 1 ? range.to : (seqs[seqs.length - 1] ?? range.to);
     const detail = block.map((l) => l.text).join("\n");
     // statement: header + ALL of the chunk's verbatim lines while they fit —
