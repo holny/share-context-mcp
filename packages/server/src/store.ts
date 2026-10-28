@@ -190,6 +190,10 @@ export class Store {
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        statement, detail, topic, kind, scope,
+        tokenize = 'trigram'
+      );
     `);
   }
 
@@ -356,6 +360,15 @@ export class Store {
           m.to ?? null,
           JSON.stringify(m.provenance),
         );
+        // Mirror into the FTS5 index (trigram): replace any previous text for
+        // this (channel_id, seq) so search sees upserted content, not stale.
+        const row = this.db
+          .prepare(`SELECT rowid FROM messages WHERE channel_id = ? AND seq = ?`)
+          .get(channelId, m.seq) as { rowid: number };
+        this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(row.rowid);
+        this.db
+          .prepare(`INSERT INTO messages_fts(rowid, statement, detail, topic, kind, scope) VALUES (?, ?, ?, ?, ?, ?)`)
+          .run(row.rowid, m.statement, m.detail ?? "", m.topic, m.kind, m.scope ? JSON.stringify(m.scope) : "");
       }
     });
     insertAll(msgs);
@@ -363,9 +376,12 @@ export class Store {
 
   /**
    * Keyword search over the decrypted cache: `a&b,c&d` = (a AND b) OR (c AND d);
-   * case-insensitive substring match over statement+detail. Empty/blank query
-   * returns the whole cache. Returns reconstructed ClaimMessages, newest first.
-   * Note: `%`/`_` inside terms act as LIKE wildcards (accepted in v1).
+   * case-insensitive. Hybrid engine: terms of ≥3 chars go through the FTS5
+   * trigram index (BM25 relevance ranking, CJK substring matching); shorter
+   * terms fall back to LIKE over statement+detail (trigram needs 3 chars).
+   * A query made purely of ≥3-char terms orders by BM25 rank; any LIKE
+   * involvement falls back to newest-first. Empty/blank query returns the
+   * whole cache. Returns reconstructed ClaimMessages.
    */
   searchCache(channelId: string, query: string): ClaimMessage[] {
     const groups = query
@@ -373,19 +389,36 @@ export class Store {
       .map((g) => g.split("&").map((t) => t.trim()).filter((t) => t.length > 0))
       .filter((g) => g.length > 0);
 
-    let where = "";
+    const conds: string[] = [];
     const params: string[] = [];
-    if (groups.length > 0) {
-      const match = `lower(coalesce(statement, '') || ' ' || coalesce(detail, '')) LIKE ?`;
-      where = ` AND (${groups.map((g) => `(${g.map(() => match).join(" AND ")})`).join(" OR ")})`;
-      for (const g of groups) {
-        for (const term of g) params.push(`%${term.toLowerCase()}%`);
+    let hasFts = false;
+    let hasLike = false;
+    for (const g of groups) {
+      const parts: string[] = [];
+      for (const term of g) {
+        if (term.length >= 3) {
+          hasFts = true;
+          parts.push(`rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)`);
+          params.push(`"${term.replace(/"/g, '""')}"`);
+        } else {
+          hasLike = true;
+          parts.push(`lower(coalesce(statement, '') || ' ' || coalesce(detail, '')) LIKE ?`);
+          params.push(`%${term.toLowerCase()}%`);
+        }
       }
+      conds.push(`(${parts.join(" AND ")})`);
     }
+    const where = conds.length > 0 ? ` AND (${conds.join(" OR ")})` : "";
+    // Pure-FTS queries rank by relevance; anything touching LIKE keeps the
+    // stable newest-first order (BM25 scores are not comparable to LIKE hits).
+    const order =
+      hasFts && !hasLike
+        ? ` ORDER BY (SELECT rank FROM messages_fts WHERE messages_fts.rowid = messages.rowid)`
+        : ` ORDER BY seq DESC`;
     const rows = this.db
       .prepare(
         `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
-         FROM messages WHERE channel_id = ?${where} ORDER BY seq DESC`,
+         FROM messages WHERE channel_id = ?${where}${order}`,
       )
       .all(channelId, ...params) as MessageRow[];
     return rows.map(rowToClaim);

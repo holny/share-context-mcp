@@ -172,6 +172,43 @@ describe("Store", () => {
     store.close();
   });
 
+  test("searchCache ranks BM25 relevance: denser match first, newest-first only as tiebreak", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [
+      // seq 1: dense match (short statement, both terms) — must outrank seq 2
+      mkMsg(1, "token refresh flow now uses a sliding window"),
+      // seq 2 (newer): same two terms but buried in a long statement → lower BM25
+      mkMsg(2, "a long rambling status note about many unrelated things, mentioning token and also refresh somewhere in the middle of it all"),
+    ]);
+    const hits = store.searchCache(ch, "token&refresh");
+    expect(hits.map((m) => m.seq)).toEqual([1, 2]);
+    store.close();
+  });
+
+  test("searchCache survives FTS5 metacharacters in query terms", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [mkMsg(1, "plain statement")]);
+    expect(() => store.searchCache(ch, 'a"b OR (')).not.toThrow();
+    expect(store.searchCache(ch, 'a"b OR (')).toEqual([]);
+    expect(() => store.searchCache(ch, 'foo&bar,baz')).not.toThrow();
+    store.close();
+  });
+
+  test("searchCache sees upserted text, not the stale original", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [mkMsg(1, "original wording")]);
+    store.cacheMessages(ch, [mkMsg(1, "edited wording")]);
+    expect(store.searchCache(ch, "edited").map((m) => m.seq)).toEqual([1]);
+    expect(store.searchCache(ch, "original")).toEqual([]);
+    store.close();
+  });
+
   test("searchCache implements `a&b,c&d` = (a AND b) OR (c AND d), case-insensitive", () => {
     const store = new Store(join(dir, "state.db"));
     const ch = "chabcdefgh12";
@@ -183,9 +220,10 @@ describe("Store", () => {
       mkMsg(4, "FOO and BAR mixed"),
     ]);
 
-    // (foo AND bar) OR (baz) → m1, m4, m2, m3 — newest first
+    // (foo AND bar) OR (baz) → m1, m4, m2, m3. Pure-FTS query → BM25 rank order
+    // (relevance first); assert membership, order is pinned by the BM25 test.
     const hits = store.searchCache(ch, "foo&bar,baz");
-    expect(hits.map((m) => m.seq)).toEqual([4, 3, 2, 1]);
+    expect([...hits.map((m) => m.seq)].sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
 
     // (foo AND baz) → no message has both → empty
     expect(store.searchCache(ch, "foo&baz")).toEqual([]);
@@ -194,7 +232,7 @@ describe("Store", () => {
     expect(store.searchCache(ch, "qux,missingword").map((m) => m.seq)).toEqual([2]);
 
     // AND within a group: foo&bar → m1, m4 (both contain both terms)
-    expect(store.searchCache(ch, "foo&bar").map((m) => m.seq)).toEqual([4, 1]);
+    expect([...store.searchCache(ch, "foo&bar").map((m) => m.seq)].sort((a, b) => a - b)).toEqual([1, 4]);
     store.close();
   });
 
