@@ -157,7 +157,22 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   );
   const stmtBanRow = db.prepare("SELECT consumer_ids FROM member_bans WHERE channel_id = ? AND name = ?");
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
+  const stmtUseInviteCode = db.prepare("UPDATE invite_codes SET used_by = ?, status = 'used' WHERE channel_id = ? AND code_id = ? AND status = 'active'");
+  const stmtInviteCode = db.prepare("SELECT owner, used_by, status, expires_at FROM invite_codes WHERE channel_id = ? AND code_id = ?");
   const stmtAudit = db.prepare("INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, ?, ?, ?)");
+  const stmtInsertInviteCode = db.prepare(
+    "INSERT INTO invite_codes(channel_id, code_id, owner, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 'active')",
+  );
+  const stmtSetAdmission = db.prepare(
+    "UPDATE channels SET admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+  );
+  const stmtDirectory = db.prepare(`
+    SELECT c.id, c.admission_mode, c.contact_info,
+           (SELECT COUNT(*) FROM members m WHERE m.channel_id = c.id AND m.status = 'active') AS members
+    FROM channels c
+    WHERE c.admission_mode = 'public' OR c.contact_info IS NOT NULL
+    ORDER BY c.created_at ASC
+  `);
 
   /** Governance audit trail (§4b): every governance operation lands here. */
   function audit(channelId: string, actor: string, action: string, target?: string, result?: string): void {
@@ -324,15 +339,43 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       // reserve the creator's member name (no token yet → not "live",
       // so the creator can still join under it)
       stmtUpsertMember.run(channelId, (memberName as string).trim(), null, null, 1, new Date().toISOString());
-      // Governance: the creating member is creator AND manager (§2).
-      const stmtSetRoles = db.prepare("UPDATE channels SET creator_member = ?, manager_member = ? WHERE id = ?");
-      stmtSetRoles.run((memberName as string).trim(), (memberName as string).trim(), channelId);
-      audit(channelId, (memberName as string).trim(), "channel.created", channelId, "ok");
+      // Governance: the creating member is creator AND manager (§2). Optional
+      // admission mode/policy/contact come from the create payload.
+      const admissionMode = parsed.body.admissionMode;
+      const mode =
+        admissionMode === "public" || admissionMode === "invite" ? admissionMode : "password";
+      const invitePolicy = parsed.body.invitePolicy === "managers-only" ? "managers-only" : "everyone";
+      const contactInfo = typeof parsed.body.contactInfo === "string" ? (parsed.body.contactInfo as string) : null;
+      const stmtSetRoles = db.prepare(
+        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+      );
+      stmtSetRoles.run((memberName as string).trim(), (memberName as string).trim(), mode, invitePolicy, contactInfo, channelId);
+      audit(channelId, (memberName as string).trim(), "channel.created", channelId, `mode=${mode}`);
       return json({ channelId, epoch: 1, nextSeq: 1 });
     }
 
+    // ---- /directory — public listing of opted-in channels (§6) ----
+    if (path === "/directory" && method === "GET") {
+      const q = (url.searchParams.get("q") ?? "").toLowerCase();
+      const rows = stmtDirectory.all() as Array<{
+        id: string;
+        admission_mode: string;
+        contact_info: string | null;
+        members: number;
+      }>;
+      const channels = rows
+        .filter((r) => q === "" || r.id.toLowerCase().includes(q) || (r.contact_info ?? "").toLowerCase().includes(q))
+        .map((r) => ({
+          channelId: r.id,
+          admissionMode: r.admission_mode,
+          members: r.members,
+          ...(r.contact_info ? { contactInfo: r.contact_info } : {}),
+        }));
+      return json({ channels });
+    }
+
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -367,22 +410,47 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (typeof consumerId !== "string" || consumerId.length < 1 || consumerId.length > 64) {
           return jsonError(400, "invalid request: consumerId must be a string of 1..64 characters");
         }
+        // Admission gate per tier (§1): public = open; invite = code required;
+        // password = credential proof. Creator (reserved, not yet joined)
+        // always admits with the credential.
+        const mode = channel.admission_mode ?? "password";
+        const isCreator = channel.creator_member === memberName;
+        if (mode === "invite" && !isCreator) {
+          const codeId = parsed.body.inviteCodeId;
+          if (typeof codeId !== "string" || codeId.length === 0) {
+            return jsonError(403, "invite code required");
+          }
+          const code = stmtInviteCode.get(channelId, codeId) as
+            | { owner: string; used_by: string | null; status: string; expires_at: number | null }
+            | undefined;
+          if (!code || code.status !== "active") return jsonError(403, "invite code invalid");
+          if (code.expires_at !== null && code.expires_at <= now) return jsonError(403, "invite code expired");
+          if (code.used_by !== null) return jsonError(403, "invite code already used");
+          stmtUseInviteCode.run(memberName, channelId, codeId);
+          audit(channelId, memberName, "invite.used", memberName, `code ${codeId} (invited by ${code.owner})`);
+        }
         const proof = parsed.body.proof;
-        if (typeof proof !== "string" || proof.length === 0 || proof.length > 128) {
+        const needsProof = mode === "password" || (isCreator && mode !== "public");
+        if (
+          needsProof &&
+          (typeof proof !== "string" || proof.length === 0 || proof.length > 128)
+        ) {
           return jsonError(400, "invalid request: proof must be a base64 string");
         }
         const key = challengeKey(channelId, memberName);
-        const pending = challenges.get(key);
+        const pending = needsProof ? challenges.get(key) : { nonceB64: "", expiresAt: now + 1000 };
         if (!pending || pending.expiresAt <= now) {
           challenges.delete(key);
           return jsonError(400, "no pending challenge: request one first");
         }
-        // Verify possession WITHOUT learning the password: expected proof =
-        // HMAC-SHA256(verification key, nonce). The verification key cannot
-        // decrypt messages (it is not the channel key).
-        const expected = hmacProof(new Uint8Array(Buffer.from(channel.verify_key, "base64")), pending.nonceB64);
-        if (!safeEqualStr(proof, expected)) {
-          return jsonError(401, "auth failed: wrong password");
+        if (needsProof) {
+          // Verify possession WITHOUT learning the password: expected proof =
+          // HMAC-SHA256(verification key, nonce). The verification key cannot
+          // decrypt messages (it is not the channel key).
+          const expected = hmacProof(new Uint8Array(Buffer.from(channel.verify_key, "base64")), pending.nonceB64);
+          if (!safeEqualStr(proof as string, expected)) {
+            return jsonError(401, "auth failed: wrong password");
+          }
         }
         const member = stmtMemberByName.get(channelId, memberName) as MemberRow | undefined;
         if (member && isLiveToken(member, channel, now)) {
@@ -439,6 +507,67 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         );
         audit(channelId, auth.member.name, "token.refreshed", auth.member.name, "ok");
         return json({ token, epoch: channel.epoch, memberName: auth.member.name });
+      }
+
+      case "invite-codes": {
+        // Register a minted invite code (the code itself is client-minted and
+        // self-contained; the relay only records the ledger entry). Mint
+        // right: manager/creator always; regular members per invite_policy
+        // and their can_invite flag.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const codeId = parsed.body.codeId;
+        const expiresAt = parsed.body.expiresAt;
+        if (typeof codeId !== "string" || codeId.length < 8 || codeId.length > 128) {
+          return jsonError(400, "invalid request: codeId must be a string of 8..128 characters");
+        }
+        const isManagerOrCreator =
+          auth.member.name === auth.channel.manager_member || auth.member.name === auth.channel.creator_member;
+        const policy = auth.channel.invite_policy ?? "everyone";
+        if (!isManagerOrCreator && (policy !== "everyone" || auth.member.can_invite !== 1)) {
+          return jsonError(403, "invite right revoked or managers-only policy");
+        }
+        const exp = typeof expiresAt === "number" && expiresAt > now ? expiresAt : null;
+        stmtInsertInviteCode.run(channelId, codeId, auth.member.name, new Date().toISOString(), exp);
+        audit(channelId, auth.member.name, "invite.minted", codeId, "ok");
+        return json({ ok: true, codeId });
+      }
+
+      case "set-admission": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const name = auth.member.name;
+        if (name !== auth.channel.manager_member && name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const mode = parsed.body.mode;
+        if (mode !== "public" && mode !== "invite" && mode !== "password") {
+          return jsonError(400, "invalid request: mode must be public|invite|password");
+        }
+        const invitePolicy = parsed.body.invitePolicy;
+        if (invitePolicy !== undefined && invitePolicy !== "everyone" && invitePolicy !== "managers-only") {
+          return jsonError(400, "invalid request: invitePolicy must be everyone|managers-only");
+        }
+        const contactInfo = parsed.body.contactInfo;
+        if (contactInfo !== undefined && typeof contactInfo !== "string") {
+          return jsonError(400, "invalid request: contactInfo must be a string");
+        }
+        stmtSetAdmission.run(
+          mode,
+          typeof invitePolicy === "string" ? invitePolicy : auth.channel.invite_policy,
+          typeof contactInfo === "string" ? contactInfo : auth.channel.contact_info,
+          channelId,
+        );
+        audit(channelId, name, "admission.changed", mode, `policy=${auth.channel.invite_policy}`);
+        return json({ ok: true, mode });
       }
 
       case "messages": {
@@ -533,6 +662,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           managerMember: auth.channel.manager_member,
           admissionMode: auth.channel.admission_mode ?? "password",
           invitePolicy: auth.channel.invite_policy ?? "everyone",
+          contactInfo: auth.channel.contact_info,
           members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at, lastActiveAt: m.last_active_at })),
         });
       }

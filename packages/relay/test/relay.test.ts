@@ -467,6 +467,71 @@ describe("blind relay", () => {
     }
   });
 
+  test("admission modes: public direct join, invite code gating, set-admission, directory", async () => {
+    // --- public channel: direct join, no challenge/proof ---
+    const pubId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId: pubId,
+      memberName: "alice",
+      admissionMode: "public",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, pubId),
+    });
+    expect(created.status).toBe(200);
+    const pubJoin = await postJson(`/channels/${pubId}/join`, { memberName: "bob", consumerId: "s/inv000001" });
+    expect(pubJoin.status).toBe(200);
+    const bobToken = ((await pubJoin.json()) as { token: string }).token;
+
+    // --- invite channel: password-proof-only join rejected, code required ---
+    const invId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId: invId,
+      memberName: "carol",
+      admissionMode: "invite",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, invId),
+    });
+    const carolJoined = await joinChannel(invId, "carol", PASSWORD);
+    // creator join still works with password proof (admission credential)
+    expect(carolJoined.status).toBe(200);
+    const invToken = (carolJoined.body as { token: string }).token;
+    // a second member WITHOUT a registered invite code → 403
+    const ch2 = await postJson(`/channels/${invId}/challenge`, { memberName: "dave" });
+    const dnonce = ((await ch2.json()) as { nonceB64: string }).nonceB64;
+    const dproof = proofOf(verifyKeyB64Of(PASSWORD, invId), dnonce);
+    const daveJoin = await postJson(`/channels/${invId}/join`, { memberName: "dave", proof: dproof, consumerId: "s/dave00001", inviteCodeId: "" });
+    expect(daveJoin.status).toBe(403);
+
+    // register an invite code for dave (owner carol), then join succeeds
+    const reg = await postJson(`/channels/${invId}/invite-codes`, { codeId: "code-dave01", expiresAt: Date.now() + 86_400_000 }, invToken);
+    expect(reg.status).toBe(200);
+    const daveJoin2 = await postJson(`/channels/${invId}/join`, { memberName: "dave", proof: dproof, consumerId: "s/dave00001", inviteCodeId: "code-dave01" });
+    expect(daveJoin2.status).toBe(200);
+    const daveToken = ((await daveJoin2.json()) as { token: string }).token;
+    // single-use: the same code cannot admit anyone else
+    const eveJoin = await postJson(`/channels/${invId}/join`, { memberName: "eve", proof: dproof, consumerId: "s/eve000001", inviteCodeId: "code-dave01" });
+    expect(eveJoin.status).toBe(403);
+
+    // --- set-admission: manager-only, audit-logged ---
+    const nonManager = await postJson(`/channels/${invId}/set-admission`, { mode: "public" }, daveToken);
+    expect(nonManager.status).toBe(403);
+    const switchRes = await postJson(`/channels/${invId}/set-admission`, { mode: "public" }, invToken);
+    expect(switchRes.status).toBe(200);
+    const meta = (await (await fetch(`${base}/channels/${invId}/meta`, { headers: { authorization: `Bearer ${invToken}` } })).json()) as { admissionMode: string };
+    expect(meta.admissionMode).toBe("public");
+    // switch took effect: a brand-new member joins WITHOUT any proof
+    const eveJoin2 = await postJson(`/channels/${invId}/join`, { memberName: "eve2", consumerId: "s/eve000002" });
+    expect(eveJoin2.status).toBe(200);
+
+    // --- directory: public listed; password/invite hidden unless contact set ---
+    const dir = (await (await fetch(`${base}/directory?q=`)).json()) as { channels: Array<{ channelId: string; contactInfo?: string }> };
+    const pubEntry = dir.channels.find((c) => c.channelId === pubId);
+    expect(pubEntry).toBeDefined();
+    // password channel without contact info → hidden
+    const pwdId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId: pwdId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, pwdId) });
+    const dir2 = (await (await fetch(`${base}/directory?q=`)).json()) as { channels: Array<{ channelId: string }> };
+    expect(dir2.channels.find((c) => c.channelId === pwdId)).toBeUndefined();
+  });
+
   test("governance schema: creator/manager recorded at create+join, exposed via meta; audit rows written", async () => {    const channelId = randomBytes(8).toString("hex");
     const created = await postJson("/channels", {
       channelId,
