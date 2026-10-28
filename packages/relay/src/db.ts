@@ -40,6 +40,9 @@ export interface MessageRow {
 export function openDb(dbPath: string): Database {
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL;");
+    // M3 migration: add tracking columns if not present
+    try { db.exec("ALTER TABLE members ADD COLUMN last_poll_seq INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { db.exec("ALTER TABLE members ADD COLUMN last_viewed_seq INTEGER NOT NULL DEFAULT 0"); } catch {}
   db.exec(`
     CREATE TABLE IF NOT EXISTS channels(
       id TEXT PRIMARY KEY,
@@ -56,6 +59,8 @@ export function openDb(dbPath: string): Database {
       token_expires_at INTEGER,
       epoch INTEGER NOT NULL,
       joined_at TEXT NOT NULL,
+      last_poll_seq INTEGER NOT NULL DEFAULT 0,
+      last_viewed_seq INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(channel_id, name)
     );
 

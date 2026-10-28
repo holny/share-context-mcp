@@ -22,8 +22,7 @@
     "share-context-server": "./src/bin.ts"
   },
   "files": [
-    "src",
-    "README.md"
+    "src"
   ],
   "mcpName": "io.github.holny/share-context-mcp"
 }

@@ -130,6 +130,12 @@ const channelIdParam = {
 
 export function buildMcpServer(deps: McpServerDeps): McpServer {
   const { store, bridge, onChannelJoined, onChannelLeft } = deps;
+  // Session-scoped delivered cursor: each MCP server process tracks its own
+  // delivery position in process memory, NOT in the shared SQLite. Even the
+  // same agent opening two sessions on the same channel gets independent
+  // views — one session consuming a message does not prevent the other
+  // session from seeing it. Different sessions = different consumers.
+  const delivered = new Map<string, number>();
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
 
   // ---- create_channel ----
@@ -337,7 +343,7 @@ Also re-check after a break and before finalizing work others depend on. Returns
       const prevHigh = store.getCursor(ch);
       await bridge.poll(ch, prevHigh);
       const high = store.getCursor(ch);
-      const start = since ?? store.getDelivered(ch);
+      const start = since ?? delivered.get(ch) ?? 0;
       // Serve at most SERVE_WINDOW claims per call (review F2): an overnight
       // broadcaster backlog must not dump hundreds of claims into one tool
       // result. delivered only advances to the LAST SERVED seq; `remaining`
@@ -352,7 +358,7 @@ Also re-check after a break and before finalizing work others depend on. Returns
       // skipped count, exact across broadcaster-consumed windows too.
       const skipped = Math.max(0, high - start - served.length);
       if (since === undefined || since <= high) {
-        store.setDelivered(ch, Math.max(store.getDelivered(ch), lastServed));
+        delivered.set(ch, Math.max(delivered.get(ch) ?? 0, lastServed));
       }
       const remaining = Math.max(0, high - lastServed);
       setActiveChannel(store, ch);
