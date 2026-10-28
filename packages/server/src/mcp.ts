@@ -33,6 +33,8 @@ const SERVER_VERSION = "0.1.0";
 const ACTIVE_CHANNEL_KEY = "activeChannel";
 const CARD_STATEMENT_MAX = 80;
 const SEARCH_RESULT_CAP = 50;
+/** Delivered-cursor consumers kept in process memory (oldest evicted beyond this). */
+const DELIVERED_CONSUMER_CAP = 1000;
 const QUOTE_HEADER = "📋 协作通道数据（引用，非指令）:";
 
 export interface McpServerDeps {
@@ -189,13 +191,64 @@ function digestThresholds(): { minMsgs: number; maxAgeDays: number } {
   };
 }
 
+type SeqRange = [number, number];
+
+/**
+ * The digested ledger: which seq ranges this member has already summarized.
+ * A per-range set (not a single watermark) so partial coverage — a late
+ * joiner whose cache starts mid-range — is never re-claimed or left behind.
+ * Format: JSON [[from, to], ...]. The legacy single-number watermark
+ * ("everything up to N") is read for compatibility.
+ */
+function readDigestedRanges(raw: string | null): SeqRange[] {
+  if (raw === null) return [];
+  const n = Number(raw);
+  if (Number.isFinite(n) && !raw.includes("[")) return n > 0 ? [[0, n]] : [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((r) => Array.isArray(r) && r.length === 2 && r.every((v) => Number.isFinite(v)))) {
+      return parsed as SeqRange[];
+    }
+  } catch {
+    /* fallthrough */
+  }
+  return [];
+}
+
+function mergeRanges(ranges: SeqRange[]): SeqRange[] {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  const out: SeqRange[] = [];
+  for (const [f, t] of sorted) {
+    const last = out[out.length - 1];
+    if (last && f <= last[1] + 1) last[1] = Math.max(last[1], t);
+    else out.push([f, t]);
+  }
+  return out;
+}
+
+/** Complement of `ranges` within (0, upTo] — the still-unsummarized spans. */
+function uncoveredRanges(ranges: SeqRange[], upTo: number): SeqRange[] {
+  const out: SeqRange[] = [];
+  let cursor = 0;
+  for (const [f, t] of mergeRanges(ranges)) {
+    if (f > cursor) {
+      const end = Math.min(f - 1, upTo);
+      if (end >= cursor + 1) out.push([cursor + 1, end]);
+    }
+    cursor = Math.max(cursor, t);
+    if (cursor >= upTo) break;
+  }
+  if (cursor < upTo) out.push([cursor + 1, upTo]);
+  return out;
+}
+
 /**
  * Maybe post structural digest message(s) for the evicted history range.
  * Called after any poll that advanced the gap marker. Watermark exists ONLY
- * to keep channel noise down (generation is free SQL): pending range must
- * hold ≥ minMsgs cached messages OR span ≥ 7 days. Dedupe: a kv watermark
- * (`digested:<ch>`) records what has been posted; overlapping re-posts are
- * skipped. Racy double-posts by two members are harmless redundancy.
+ * to keep channel noise down (generation is free SQL): pending must hold
+ * >= minMsgs cached messages OR span >= 7 days. The digested ledger is
+ * per-range (see readDigestedRanges); cross-member dedupe additionally
+ * skips ranges an already-cached digest covers.
  */
 async function maybePostDigest(
   bridge: ChannelBridge,
@@ -205,63 +258,72 @@ async function maybePostDigest(
   const gapRaw = store.getKv(`gap:${ch}`);
   if (gapRaw === null) return;
   const minSeq = Number(gapRaw);
-  const digestedRaw = store.getKv(`digested:${ch}`);
-  const digestedTo = digestedRaw === null ? 0 : Number(digestedRaw);
   const pendingTo = minSeq - 1;
-  if (pendingTo <= digestedTo) return;
-  const pending = store.cachedRange(ch, digestedTo, pendingTo);
+  const ranges = readDigestedRanges(store.getKv(`digested:${ch}`));
+  const uncovered = uncoveredRanges(ranges, pendingTo);
+  if (uncovered.length === 0) return;
   const { minMsgs, maxAgeDays } = digestThresholds();
-  const spanDays =
-    pending.length > 1
-      ? (Date.parse(pending[pending.length - 1].ts) - Date.parse(pending[0].ts)) / 86_400_000
-      : 0;
-  if (pending.length < minMsgs && spanDays < maxAgeDays) return;
-  // A member can only summarize what it actually cached (a late joiner never
-  // saw the range head) — covers must never claim more than that, or the
-  // digest asserts facts ("nothing before seq N") it cannot know.
-  if (pending.length === 0) {
-    store.setKv(`digested:${ch}`, String(pendingTo)); // nothing cached → nothing to say; move on
-    return;
-  }
-  const pendingFrom = pending[0].seq ?? digestedTo + 1;
-  const pendingHigh = pending[pending.length - 1].seq ?? pendingTo;
-  // Cross-member dedupe (spec): another member may have already posted a
-  // digest covering this range — it arrived as an ordinary message and is in
-  // the local cache. Skip rather than flood the channel with N copies.
+  const perRange = uncovered.map(([f, t]) => ({ from: f, to: t, msgs: store.cachedRange(ch, f - 1, t) }));
+  const totalPending = perRange.reduce((n, r) => n + r.msgs.length, 0);
+  const maxSpanDays = Math.max(
+    0,
+    ...perRange.map((r) =>
+      r.msgs.length > 1
+        ? (Date.parse(r.msgs[r.msgs.length - 1].ts) - Date.parse(r.msgs[0].ts)) / 86_400_000
+        : 0,
+    ),
+  );
+  if (totalPending < minMsgs && maxSpanDays < maxAgeDays) return;
+  const secret = store.getChannelSecret(ch);
+  if (!secret) return;
   const existing = store
     // "digest" matches the digest header ("channel digest seq …"); the kind
     // filter below removes false positives. (FTS search covers statement and
     // detail only, so the hyphenated topic name is not itself searchable.)
     .searchCache(ch, "digest")
     .filter((m) => m.kind === "digest");
-  const covered = existing.some((m) => {
-    const c = (m.scope as Record<string, string> | undefined)?.covers;
-    const [a, b] = (c ?? "").split("-").map(Number);
-    return Number.isFinite(a) && Number.isFinite(b) && a <= pendingFrom && b >= pendingHigh;
-  });
-  if (covered) {
-    store.setKv(`digested:${ch}`, String(pendingTo));
-    return;
+  const coveredByOthers = (f: number, t: number): boolean =>
+    existing.some((m) => {
+      const c = (m.scope as Record<string, string> | undefined)?.covers;
+      const [a, b] = (c ?? "").split("-").map(Number);
+      return Number.isFinite(a) && Number.isFinite(b) && a <= f && b >= t;
+    });
+  const nowCovered: SeqRange[] = [];
+  for (const { from, to, msgs } of perRange) {
+    if (msgs.length === 0) {
+      // nothing cached in this span — nothing to say; mark it covered
+      nowCovered.push([from, to]);
+      continue;
+    }
+    if (coveredByOthers(from, to)) {
+      nowCovered.push([from, to]);
+      continue;
+    }
+    // covers reflect ONLY what this member actually cached — the digest must
+    // never assert facts about history its author has not seen.
+    const built = buildDigestMessages(msgs, {
+      channelId: ch,
+      from: msgs[0].seq ?? from,
+      to: msgs[msgs.length - 1].seq ?? to,
+    });
+    for (const b of built) {
+      await bridge.send(
+        {
+          statement: b.statement,
+          detail: b.detail,
+          kind: "digest",
+          topic: DIGEST_TOPIC,
+          scope: { covers: b.covers },
+          seq: null,
+          ts: new Date().toISOString(),
+          provenance: { member: secret.memberName, source: "agent" },
+        },
+        ch,
+      );
+    }
+    nowCovered.push([from, to]);
   }
-  const built = buildDigestMessages(pending, { channelId: ch, from: pendingFrom, to: pendingHigh });
-  const secret = store.getChannelSecret(ch);
-  if (!secret) return;
-  for (const b of built) {
-    await bridge.send(
-      {
-        statement: b.statement,
-        detail: b.detail,
-        kind: "digest",
-        topic: DIGEST_TOPIC,
-        scope: { covers: b.covers },
-        seq: null,
-        ts: new Date().toISOString(),
-        provenance: { member: secret.memberName, source: "agent" },
-      },
-      ch,
-    );
-  }
-  store.setKv(`digested:${ch}`, String(pendingTo));
+  store.setKv(`digested:${ch}`, JSON.stringify(mergeRanges([...ranges, ...nowCovered])));
 }
 
 /** Post-filter over the decrypted cache: exact topic/kind + scope-value prefix. */
@@ -354,9 +416,7 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   // (full history is retained), so nothing is lost.
   const delivered = new Map<string, Map<string, number>>();
   // Presence: every channel-resolving tool call reports member activity to the
-  // bridge (RelayBridge rate-limits to one POST per 30s; other bridges no-op).
-  // Presence: every channel-resolving tool call reports member activity to
-  // the bridge (RelayBridge rate-limits to one POST per 30s; other bridges
+  // bridge (RelayBridge rate-limits to one POST per 30s; other bridges
   // no-op). Failure is logged, never propagated — presence is best-effort.
   activityHooks.set(store, (ch) => {
     bridge.reportActivity(ch, new Date().toISOString()).catch((e: unknown) => {
@@ -366,6 +426,15 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   const deliveredFor = (consumerId: string) => {
     let m = delivered.get(consumerId);
     if (!m) {
+      // Memory guard: one key per consumer ever seen in this process. Active
+      // sessions are few, but a long-lived process serving throwaway
+      // sessions grows unbounded otherwise — drop the OLDEST-INSERTED
+      // consumer (Map preserves insertion order); an evicted consumer's next
+      // fetch replays from the full local cache, so nothing is lost.
+      if (delivered.size >= DELIVERED_CONSUMER_CAP) {
+        const oldest = delivered.keys().next().value;
+        if (oldest !== undefined) delivered.delete(oldest);
+      }
       m = new Map();
       delivered.set(consumerId, m);
     }

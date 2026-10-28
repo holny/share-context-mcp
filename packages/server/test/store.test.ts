@@ -275,4 +275,20 @@ describe("Store", () => {
     expect(store.getCursor(ch)).toBe(3);
     store.close();
   });
+
+  test("reopening an existing DB backfills an empty FTS index (pre-upgrade stores)", () => {
+    const path = join(dir, "backfill.db");
+    const s1 = new Store(path);
+    const ch = "chabcdefgh12";
+    s1.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    s1.cacheMessages(ch, [mkMsg(1, "legacy searchable content")]);
+    // simulate a pre-upgrade store: rows cached before the FTS index existed
+    (s1 as unknown as { db: { prepare: (sql: string) => { run: () => void } } }).db
+      .prepare("DELETE FROM messages_fts")
+      .run();
+    s1.close();
+    const s2 = new Store(path);
+    expect(s2.searchCache(ch, "legacy searchable").map((m) => m.seq)).toEqual([1]);
+    s2.close();
+  });
 });

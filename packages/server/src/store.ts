@@ -195,6 +195,19 @@ export class Store {
         tokenize = 'trigram'
       );
     `);
+    // One-time backfill for stores created before the FTS index existed:
+    // rows cached pre-upgrade would otherwise be invisible to >=3-char
+    // searches forever. Runs only when the index is empty while the cache
+    // is not — a populated index means nothing to do.
+    const ftsEmpty = this.db.prepare("SELECT NOT EXISTS (SELECT 1 FROM messages_fts) AS e").get() as { e: number };
+    const hasRows = this.db.prepare("SELECT EXISTS (SELECT 1 FROM messages) AS h").get() as { h: number };
+    if (ftsEmpty.e && hasRows.h) {
+      this.db.exec(`
+        INSERT INTO messages_fts(rowid, statement, detail, topic, kind, scope)
+        SELECT rowid, statement, coalesce(detail, ''), topic, kind, coalesce(scope_json, '')
+        FROM messages
+      `);
+    }
   }
 
   // ---- channels ----

@@ -629,7 +629,7 @@ describe("index card + full-history join fetch (Task 5)", () => {
     const [ct, st] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: `t5-${label}`, version: "0.0.0" });
     await Promise.all([client.connect(ct), server.connect(st)]);
-    return { client, store };
+    return { client, store, bridge };
   };
 
   const mk = (seq: number, statement: string, kind: string, topic: string, ts: string) => ({
@@ -729,7 +729,7 @@ describe("structural digest posting (Task 7)", () => {
     const [ct, st] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: `t7-${label}`, version: "0.0.0" });
     await Promise.all([client.connect(ct), server.connect(st)]);
-    return { client, store };
+    return { client, store, bridge };
   };
 
   test("evicted range with decisions → one digest posted, no duplicate on refetch", async () => {
@@ -828,5 +828,38 @@ describe("structural digest posting (Task 7)", () => {
     expect(digests.length).toBe(1);
     // covers 3-5 (what the author saw), NOT 1-5 (what the range implies)
     expect((digests[0].scope as Record<string, string>).covers).toBe("3-5");
+  }, 60_000);
+
+  test("partial coverage: only the un-digested subrange is posted (per-range dirty set)", async () => {
+    const a = await mkAgent("pc-a");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "pc-a" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    // decision at seq 3; digested ledger says 0-2 was already covered →
+    // only seq 3 (the decision) may be digested
+    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 1", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 2", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: late decision", kind: "decision", topic: "t" } });
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "1";
+    a.store.setKv(`digested:${channelId}`, JSON.stringify([[0, 2]]));
+    a.store.setKv(`gap:${channelId}`, "4");
+    let postedCovers: string | undefined;
+    const self = a.bridge as unknown as {
+      send: (msg: { scope?: Record<string, string> }, ch?: string) => Promise<{ seq: number; deduped: boolean }>;
+    };
+    const original = self.send.bind(a.bridge);
+    self.send = async (msg) => {
+      postedCovers = (msg as { scope?: Record<string, string> }).scope?.covers;
+      return original(msg, channelId);
+    };
+    try {
+      await a.client.callTool({ name: "fetch_updates", arguments: {} });
+      // ledger now covers 0-3 (old 0-2 + new 3-3), merged
+      expect(a.store.getKv(`digested:${channelId}`)).toBe(JSON.stringify([[0, 3]]));
+    } finally {
+      self.send = original;
+      delete process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    }
+    expect(postedCovers).toBe("3-3");
   }, 60_000);
 });
