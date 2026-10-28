@@ -351,17 +351,40 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       db.prepare(
         "INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, 'vote.kicked', ?, ?)",
       ).run(channelId, new Date().toISOString(), vote.initiator, vote.target, successor ?? "regular");
+      // Stat profile attached to the settled frame (names/counters only —
+      // blind-safe). Clients render with their own OS timezone.
+      const prof = (target2: string) => {
+        const total = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND sender = ?").get(channelId, target2) as { n: number }).n;
+        const totalAll = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?").get(channelId) as { n: number }).n;
+        const m = db.prepare("SELECT joined_at, last_active_at FROM members WHERE channel_id = ? AND name = ?").get(channelId, target2) as { joined_at: string; last_active_at: string | null } | undefined;
+        return {
+          member: target2,
+          joinedAt: m?.joined_at,
+          lastActiveAt: m?.last_active_at,
+          totalMessages: total,
+          totalShare: totalAll > 0 ? Math.round((total / totalAll) * 100) : 0,
+        };
+      };
+      const settleFrame: Record<string, unknown> = {
+        type: "vote-settled",
+        voteId,
+        target: vote.target,
+        outcome: "passed",
+        profile: prof(vote.target),
+        ...(successor ? { successor, successorProfile: prof(successor) } : {}),
+      };
+      wsHub?.notifyGovernance(channelId, settleFrame);
     }
     if (!passed && vote.type === "kick") {
       // failure lifts the lineage freeze exactly
       db.prepare("UPDATE invite_codes SET status = 'active' WHERE channel_id = ? AND status = 'frozen'").run(channelId);
+      wsHub?.notifyGovernance(channelId, {
+        type: "vote-settled",
+        voteId,
+        target: vote.target,
+        outcome: "failed",
+      });
     }
-    wsHub?.notifyGovernance(channelId, {
-      type: "vote-settled",
-      voteId,
-      target: vote.target,
-      outcome: passed ? "passed" : "failed",
-    });
   }
 
   function checkSettle(channelId: string, voteId: string): void {
