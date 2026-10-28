@@ -18,6 +18,7 @@ import {
   type ClaimMessage,
 } from "@share-context-mcp/protocol";
 import { startRelay, type RelayHandle } from "../src/index";
+import { applyKick } from "../src/routes";
 
 const PASSWORD = "correct horse battery staple";
 const NEW_PASSWORD = "rotated password #2";
@@ -638,8 +639,7 @@ describe("blind relay", () => {
     }
   });
 
-  test("roles: rotate is manager-only; leave/transfer/dissolve per succession table", async () => {
-    // manager (alice) + regular members bob, carol
+  test("roles: rotate is manager-only; leave/transfer/dissolve per succession table", async () => {    // manager (alice) + regular members bob, carol
     const channelId = randomBytes(8).toString("hex");
     await postJson("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
     const aliceTok = ((await joinChannel(channelId, "alice", PASSWORD, "s/alice0001")).body as { token: string }).token;
@@ -699,5 +699,85 @@ describe("blind relay", () => {
     const leaveRes = await postJson(`/channels/${channelId}/leave`, {}, bobTok);
     expect(leaveRes.status).toBe(200);
     expect((await meta(aliceTok)).managerMember).toBe("alice");
+  });
+
+  test("applyKick: bans, credential invalidation, succession per spec table", async () => {
+    // fixture helper: fresh channel + members
+    const setup = async (names: string[]) => {
+      const channelId = randomBytes(8).toString("hex");
+      await postJson("/channels", { channelId, memberName: names[0], verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+      const tokens: Record<string, string> = {};
+      for (const n of names) {
+        const j = await joinChannel(channelId, n, PASSWORD, `s/${n.padEnd(8, "0")}`);
+        tokens[n] = ((j.body as { token: string }).token);
+      }
+      return { channelId, tokens };
+    };
+
+    // (a) regular member kicked: banned + consumers blacklisted + credential invalidated
+    {
+      const { channelId, tokens } = await setup(["alice", "dave"]);
+      const daveConsumer = "s/dave0000";
+      await applyKick(relay.db, channelId, "dave", "alice");
+      // dave's token dead → 403 banned
+      const meta = await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${tokens.dave}` } });
+      expect(meta.status).toBe(403);
+      // rejoin under a NEW name but the SAME consumer id → rejected
+      const ch = await postJson(`/channels/${channelId}/challenge`, { memberName: "dave2" });
+      const nonce = ((await ch.json()) as { nonceB64: string }).nonceB64;
+      const rejoin = await postJson(`/channels/${channelId}/join`, {
+        memberName: "dave2",
+        proof: proofOf(verifyKeyB64Of(PASSWORD, channelId), nonce),
+        consumerId: daveConsumer,
+      });
+      expect(rejoin.status).toBe(403);
+      // admission credential invalidated: old-credential challenge fails explicitly
+      const chAlice = await postJson(`/channels/${channelId}/challenge`, { memberName: "newmember" });
+      const nonce2 = ((await chAlice.json()) as { nonceB64: string }).nonceB64;
+      const rejoin2 = await postJson(`/channels/${channelId}/join`, {
+        memberName: "newmember",
+        proof: proofOf(verifyKeyB64Of(PASSWORD, channelId), nonce2),
+        consumerId: "s/newmem01",
+      });
+      expect(rejoin2.status).toBe(403);
+      expect(((await rejoin2.json()) as { error: string }).error).toContain("admission credential revoked");
+    }
+
+    // (b) manager kicked (manager ≠ creator) → manager = initiator
+    {
+      const channelId2 = randomBytes(8).toString("hex");
+      await postJson("/channels", { channelId: channelId2, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId2) });
+      const aTok = ((await joinChannel(channelId2, "alice", PASSWORD, "s/a1000001")).body as { token: string }).token;
+      await joinChannel(channelId2, "bob", PASSWORD, "s/b1000001");
+      await joinChannel(channelId2, "carol", PASSWORD, "s/c1000001");
+      // transfer manager to carol (manager ≠ creator ≠ initiator)
+      await postJson(`/channels/${channelId2}/transfer`, { to: "carol" }, aTok);
+      // kick bob (regular member) → no succession
+      const res = applyKick(relay.db, channelId2, "bob", "alice");
+      expect(res.succession).toBeNull();
+      const m = relay.db.prepare("SELECT manager_member FROM channels WHERE id = ?").get(channelId2) as { manager_member: string };
+      expect(m.manager_member).toBe("carol");
+      // now kick the MANAGER (carol) — initiator alice → manager = alice
+      const res2 = applyKick(relay.db, channelId2, "carol", "alice");
+      expect(res2.succession).toBe("manager");
+      const m2 = relay.db.prepare("SELECT manager_member FROM channels WHERE id = ?").get(channelId2) as { manager_member: string };
+      expect(m2.manager_member).toBe("alice");
+    }
+
+    // (c) creator kicked → creator = initiator; (d) creator-as-manager kicked → initiator takes both
+    {
+      const { channelId } = await setup(["alice", "bob", "carol"]);
+      // creator alice kicked by bob → creator = bob (initiator)
+      const r1 = applyKick(relay.db, channelId, "alice", "bob");
+      expect(r1.succession).toBe("creator");
+      const m1 = relay.db.prepare("SELECT creator_member, manager_member FROM channels WHERE id = ?").get(channelId) as { creator_member: string; manager_member: string };
+      expect(m1.creator_member).toBe("bob");
+      // (d) bob (now manager AND creator via (c)) kicked by carol → both roles to carol (initiator)
+      const r2 = applyKick(relay.db, channelId, "bob", "carol");
+      expect(r2.succession).toBe("creator");
+      const m2 = relay.db.prepare("SELECT creator_member, manager_member FROM channels WHERE id = ?").get(channelId) as { creator_member: string; manager_member: string };
+      expect(m2.creator_member).toBe("carol");
+      expect(m2.manager_member).toBe("carol");
+    }
   });
 });

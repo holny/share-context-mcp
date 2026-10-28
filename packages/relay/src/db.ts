@@ -20,6 +20,8 @@ export interface ChannelRow {
   invite_policy: string;
   contact_info: string | null;
   vote_cooldown_until: number | null;
+  /** Governance kick (password tier): joins with the old credential are rejected. */
+  admission_credential_revoked: number;
   /** base64 of HMAC-SHA256(channelKey, "verify") — proves possession, cannot decrypt */
   verify_key: string;
   created_at: string;
@@ -65,6 +67,7 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE channels ADD COLUMN invite_policy TEXT NOT NULL DEFAULT 'everyone'"); } catch {}
     try { db.exec("ALTER TABLE channels ADD COLUMN contact_info TEXT"); } catch {}
     try { db.exec("ALTER TABLE channels ADD COLUMN vote_cooldown_until INTEGER"); } catch {}
+    try { db.exec("ALTER TABLE channels ADD COLUMN admission_credential_revoked INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN can_invite INTEGER NOT NULL DEFAULT 1"); } catch {}
     try { db.exec("ALTER TABLE messages ADD COLUMN sender TEXT"); } catch {}
@@ -135,6 +138,7 @@ export function openDb(dbPath: string): Database {
       invite_policy TEXT NOT NULL DEFAULT 'everyone',
       contact_info TEXT,
       vote_cooldown_until INTEGER,
+      admission_credential_revoked INTEGER NOT NULL DEFAULT 0,
       verify_key TEXT NOT NULL,
       created_at TEXT NOT NULL
     );

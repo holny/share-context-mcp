@@ -36,7 +36,67 @@ interface PendingChallenge {
 // ---- helpers ----
 
 export function jsonError(status: number, error: string): Response {
-  return Response.json({ error }, { status });
+  return new Response(JSON.stringify({ error }), { status, headers: { "content-type": "application/json" } });
+}
+
+/**
+ * Governance kick (§4 vote action): ban the target (tokens revoked, name +
+ * observed consumer ids blacklisted, optional IP), then — password tier —
+ * invalidate the admission credential so the kicked member cannot re-enter
+ * under a NEW name. Succession per §2: kicked manager → initiator takes
+ * manager; kicked creator → initiator takes creator (initiator holding both
+ * takes both). Returns which role moved (null = regular member).
+ */
+export function applyKick(
+  db: Database,
+  channelId: string,
+  target: string,
+  initiator: string,
+  opts: { ip?: string; banIp?: boolean } = {},
+): { succession: "manager" | "creator" | null } {
+  const now = new Date().toISOString();
+  const observed = (
+    db
+      .prepare("SELECT consumer_id FROM member_consumer_ids WHERE channel_id = ? AND member_name = ?")
+      .all(channelId, target) as Array<{ consumer_id: string }>
+  ).map((r) => r.consumer_id);
+  db.prepare(
+    "INSERT INTO member_bans(channel_id, name, consumer_ids, ip, banned_at, banned_by) VALUES (?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(channel_id, name) DO UPDATE SET consumer_ids = excluded.consumer_ids, ip = COALESCE(excluded.ip, member_bans.ip), banned_at = excluded.banned_at, banned_by = excluded.banned_by",
+  ).run(channelId, target, JSON.stringify(observed), opts.banIp && opts.ip ? opts.ip : null, now, `vote:${initiator}`);
+  // Token is KEPT so authenticate() can resolve the member and answer 403
+  // "banned" (the kicked member's server must stop retrying — 401 would look
+  // like a transient auth failure). Status is the revocation.
+  db.prepare("UPDATE members SET status = 'banned' WHERE channel_id = ? AND name = ?").run(channelId, target);
+  const ch = db.prepare("SELECT creator_member, manager_member, admission_mode FROM channels WHERE id = ?").get(channelId) as
+    | { creator_member: string | null; manager_member: string | null; admission_mode: string }
+    | undefined;
+  let succession: "manager" | "creator" | null = null;
+  if (ch) {
+    if (ch.manager_member === target) {
+      db.prepare("UPDATE channels SET manager_member = ? WHERE id = ?").run(initiator, channelId);
+      succession = "manager";
+    }
+    if (ch.creator_member === target) {
+      db.prepare("UPDATE channels SET creator_member = ? WHERE id = ?").run(initiator, channelId);
+      succession = "creator";
+    }
+    if ((ch.admission_mode ?? "password") === "password") {
+      // Invalidate the admission credential: joins with the old credential
+      // fail until the manager/creator registers a new one (rotate --mode
+      // access). Message key untouched — remaining members unaffected.
+      db.prepare("UPDATE channels SET admission_credential_revoked = 1 WHERE id = ?").run(channelId);
+    }
+    db.prepare("INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, ?, ?, ?)").run(
+      channelId,
+      now,
+      initiator,
+      "member.kicked",
+      target,
+      succession ?? "regular",
+    );
+  }
+  return { succession };
 }
 
 function json(data: unknown, status = 200): Response {
@@ -126,7 +186,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     timer.unref();
   }
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until FROM channels WHERE id = ?");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
@@ -157,8 +217,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   );
   const stmtBanRow = db.prepare("SELECT consumer_ids FROM member_bans WHERE channel_id = ? AND name = ?");
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
-  const stmtUseInviteCode = db.prepare("UPDATE invite_codes SET used_by = ?, status = 'used' WHERE channel_id = ? AND code_id = ? AND status = 'active'");
-  const stmtInviteCode = db.prepare("SELECT owner, used_by, status, expires_at FROM invite_codes WHERE channel_id = ? AND code_id = ?");
+  const stmtUseInviteCode = db.prepare("UPDATE invite_codes SET used_by = ?, status = 'used' WHERE channel_id = ? AND code_id = ? AND status = 'active'");  const stmtInviteCode = db.prepare("SELECT owner, used_by, status, expires_at FROM invite_codes WHERE channel_id = ? AND code_id = ?");
   const stmtSetRoles = db.prepare("UPDATE channels SET creator_member = ?, manager_member = ? WHERE id = ?");
   const stmtAudit = db.prepare("INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, ?, ?, ?)");
   const stmtInsertInviteCode = db.prepare(
@@ -452,9 +511,14 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         // Admission gate per tier (§1): public = open; invite = code required;
         // password = credential proof. Creator (reserved, not yet joined)
-        // always admits with the credential.
+        // always admits with the credential. A governance kick invalidates
+        // the credential — only a manager/creator credential rotation
+        // re-enables admission.
         const mode = channel.admission_mode ?? "password";
         const isCreator = channel.creator_member === memberName;
+        if (mode === "password" && channel.admission_credential_revoked === 1 && !isCreator) {
+          return jsonError(403, "admission credential revoked");
+        }
         if (mode === "invite" && !isCreator) {
           const codeId = parsed.body.inviteCodeId;
           if (typeof codeId !== "string" || codeId.length === 0) {
