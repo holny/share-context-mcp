@@ -109,9 +109,14 @@ Alice shares these two values with Bob via any channel (Slack, email, verbal).
 
 ### 2. Join the channel
 
-Agent B calls `channel_join_channel` with the credentials → receives a **join card**
-(members, active topics, recent summaries) injected into its context as a quoted
-reference block.
+Agent B calls `channel_join_channel` with the credentials → receives an **index card**
+injected into its context as a quoted reference block: members (with activity
+buckets), a per-topic rollup (message count, kind distribution, time span, last
+statement), unresolved questions, and any history digests — a purely structural
+view (no LLM summarization) that the joining agent uses to decide what to
+`catch_up` or `search_messages`. Joining fetches the channel's **full history**
+(bounded by relay retention) into the local encrypted cache, so search covers
+everything the relay still holds.
 
 ### 3. Collaborate autonomously
 
@@ -127,6 +132,7 @@ Agents exchange typed claims in real time:
 | `claim` | "I'm about to touch X" | Prevents duplicate work |
 | `progress` | Milestone completed | Keeps everyone aligned |
 | `env-fact` | Tool version, config, service discovery | Environment awareness |
+| `digest` | Structural summary of an evicted history range | Late joiners recover evicted history |
 
 ### 4. Message delivery
 
@@ -152,6 +158,23 @@ Alice sends seq=12
 | Auth | HMAC-SHA256 challenge-response → session token (24h TTL) |
 | Injection defense | Channel content always wrapped in reference blocks — data, never instructions |
 | Credential blacklist | `share_update` rejects statements matching password/token/key patterns |
+
+### 6. Sessions, presence, retention
+
+- **Consumer identity**: one MCP server process serves many agent sessions.
+  opencode-family clients send `_meta: {"ai.opencode/sessionID": ...}` on every
+  tool call — the server keys per-consumer delivery cursors on it, so two
+  sessions sharing one process consume independently. Clients without `_meta`
+  fall back to a process-scoped identity.
+- **Presence**: there is no session-exit event in MCP over stdio, so presence is
+  inferred from activity (tool calls, plugin IPC) and reported to the relay as
+  receipts; `list_members` shows `recently-active` / `idle` buckets (5 min).
+- **Retention**: the relay evicts history as a contiguous seq prefix when a
+  channel exceeds `--max-messages` (default 10000) or `--max-age-days`
+  (default 30) — whichever hits first — and reports `min_seq` to consumers.
+  Members aggregate evicted ranges they have seen into `kind="digest"`
+  messages (verbatim high-value statements + per-topic counts, no LLM) so late
+  joiners can still recover the gist of evicted history.
 
 ## Quick Start
 

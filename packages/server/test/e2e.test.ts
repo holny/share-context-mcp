@@ -275,3 +275,104 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
     30_000,
   );
 });
+
+describe("e2e: retention + digest + consumer identity (Task 8)", () => {
+  let relay: RelayHandle;
+  let baseUrl: string;
+  const procs: Proc[] = [];
+  let prevThreshold: string | undefined;
+
+  beforeAll(async () => {
+    relay = await startRelay({ port: 0, maxMessages: 3 });
+    baseUrl = `http://127.0.0.1:${relay.port}`;
+    prevThreshold = process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "3";
+  });
+
+  afterAll(async () => {
+    if (prevThreshold === undefined) delete process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    else process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = prevThreshold;
+    for (const p of procs) {
+      await p.client.close().catch(() => {});
+      rmSync(p.dir, { recursive: true, force: true });
+    }
+    await relay.stop();
+  });
+
+  async function spawnAgent(label: string): Promise<Proc> {
+    const dir = mkdtempSync(join(tmpdir(), `scm-t8-${label}-`));
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: ["run", ENTRY_PATH],
+      env: {
+        ...process.env,
+        SHARE_CONTEXT_RELAY_URL: baseUrl,
+        SHARE_CONTEXT_DB_PATH: join(dir, "state.db"),
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: `t8-${label}`, version: "0.0.0" });
+    await client.connect(transport);
+    const proc: Proc = { client, dir, stderr: "" };
+    procs.push(proc);
+    return proc;
+  }
+
+  test(
+    "two sessions in one server consume independently; eviction → digest in B's fetch",
+    async () => {
+      const a = await spawnAgent("a");
+      const b = await spawnAgent("b");
+
+      const created = textOf(
+        await a.client.callTool({ name: "create_channel", arguments: { memberName: "alice" } }),
+      );
+      const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+      const password = created.match(/password=([a-z0-9-]+)/)![1];
+
+      await a.client.callTool({ name: "share_update", arguments: { statement: "decided: e2e digest flow", kind: "decision", topic: "digest" } });
+      await a.client.callTool({ name: "share_update", arguments: { statement: "progress on topic one", kind: "progress", topic: "topic-one" } });
+      await a.client.callTool({ name: "share_update", arguments: { statement: "progress on topic two", kind: "progress", topic: "topic-two" } });
+
+      // B joins → full history cached + index card rollup
+      const joined = textOf(
+        await b.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "bob" } }),
+      );
+      const card = JSON.parse(unwrapQuote(joined)) as {
+        topics: Array<{ topic: string; count: number }>;
+      };
+      expect(card.topics.find((t) => t.topic === "digest")?.count).toBe(1);
+      expect(card.topics.find((t) => t.topic === "topic-one")?.count).toBe(1);
+
+      // two sessionIDs sharing B's single server process — independent consumers
+      const call = (name: string, args: Record<string, unknown>, sid?: string) =>
+        b.client.callTool({
+          name,
+          arguments: args,
+          ...(sid === undefined ? {} : { _meta: { "ai.opencode/sessionID": sid } }),
+        });
+      const f1 = JSON.parse(unwrapQuote(textOf(await call("fetch_updates", {}, "ses_aaaa1111")))) as { messages: unknown[] };
+      expect(f1.messages.length).toBe(3);
+      const f2 = JSON.parse(unwrapQuote(textOf(await call("fetch_updates", {}, "ses_bbbb2222")))) as { messages: unknown[] };
+      expect(f2.messages.length).toBe(3);
+      const f1b = JSON.parse(unwrapQuote(textOf(await call("fetch_updates", {}, "ses_aaaa1111")))) as { messages: unknown[] };
+      expect(f1b.messages.length).toBe(0);
+
+      // A sends 3 more → relay evicts seq 1 (minSeq 2..4 across sends); B's
+      // evicted-but-cached range reaches the env-tuned watermark (3)
+      for (let i = 1; i <= 3; i++) {
+        await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "chatter" } });
+      }
+      await call("fetch_updates", {}, "ses_aaaa1111"); // gap advances; digest posted
+      await call("fetch_updates", {}, "ses_aaaa1111"); // digest lands in B's cache
+      const store = b.client; // digest assertion via B's own search through a third session
+      const f3 = JSON.parse(unwrapQuote(textOf(await call("search_messages", { query: "channel-digest", kind: "digest" }, "ses_aaaa1111")))) as {
+        messages: Array<{ statement: string; scope?: Record<string, string> }>;
+        count: number;
+      };
+      expect(f3.count).toBeGreaterThanOrEqual(1);
+      expect(f3.messages.some((m) => m.statement.includes("decided: e2e digest flow"))).toBe(true);
+    },
+    60_000,
+  );
+});
