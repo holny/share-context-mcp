@@ -78,6 +78,8 @@ export class RelayBridge implements ChannelBridge {
   /** Last activity POST time per channel — 30s client-side rate limit (presence receipts). */
   private readonly lastActivityPost = new Map<string, number>();
 
+  readonly governance = true;
+
   /** Consumer id bound into every request (X-SCM-Consumer); registered at join. */
   consumerId = `p/${process.pid}`;
 
@@ -422,11 +424,9 @@ export class RelayBridge implements ChannelBridge {
     };
   }
 
-  /**
-   * Presence receipts: POST the member's last-activity timestamp to the relay,
+  /** Presence receipts: POST the member's last-activity timestamp to the relay,
    * rate-limited to one POST per 30s per channel (presence is bucketed at a
-   * 5-minute granularity downstream — sub-30s precision buys nothing).
-   */
+   * 5-minute granularity downstream — sub-30s precision buys nothing). */
   async reportActivity(channelId: string, lastActiveAt: string): Promise<void> {
     const now = Date.now();
     const last = this.lastActivityPost.get(channelId);
@@ -440,6 +440,30 @@ export class RelayBridge implements ChannelBridge {
     // next 30s of presence reports (the member was active; the relay just
     // did not hear about it).
     this.lastActivityPost.set(channelId, now);
+  }
+
+  /** Open + settled votes (governance). */
+  async votes(channelId: string): Promise<{
+    open: Array<{ id: string; type: string; target: string; endsAt: number }>;
+    history: Array<{ id: string; type: string; target: string; status: string; yes: number; no: number }>;
+  }> {
+    const data = await this.request(`/channels/${channelId}/votes`, {
+      method: "GET",
+      headers: this.authHeaders(channelId),
+    });
+    return {
+      open: (data.open as { id: string; type: string; target: string; endsAt: number }[]) ?? [],
+      history:
+        (data.history as { id: string; type: string; target: string; status: string; yes: number; no: number }[]) ?? [],
+    };
+  }
+
+  async castVote(channelId: string, voteId: string, choice: "yes" | "no"): Promise<void> {
+    await this.request(`/channels/${channelId}/votes/${voteId}/ballot`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({ choice }),
+    });
   }
 
   async rotate(channelId: string, newPassword: string): Promise<void> {

@@ -16,16 +16,16 @@ import { buildDigestMessages } from "./digest";
 import type { ChannelBridge, Store } from "./index";
 
 export const TOOL_NAMES = [
-  "create_channel",
-  "join_channel",
   "share_update",
   "fetch_updates",
   "catch_up",
   "search_messages",
   "set_subscription",
   "list_members",
-  "leave_channel",
-  "rotate_password",
+  "create_channel",
+  "join_channel",
+  "cast_vote",
+  "list_channels",
 ] as const;
 
 const SERVER_NAME = "share-context-mcp";
@@ -470,8 +470,9 @@ Use this to start a collaboration space: one channel per project or workstream (
           .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
       },
     },
-    safe(async ({ name, memberName, gitUrl, s3 }) => {
+    safe(async ({ name, memberName, gitUrl, s3 }, extra) => {
       const { channelId, password } = await bridge.createChannel({ name, memberName, gitUrl, s3 });
+      store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
       setActiveChannel(store, channelId);
       onChannelJoined?.(channelId); // create joins implicitly — start broadcasting
       if (name) store.setKv(`channelName:${channelId}`, name);
@@ -507,8 +508,9 @@ Choose a stable member name your teammates will recognize — directed messages 
           .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
       },
     },
-    safe(async ({ channelId, password, memberName, gitUrl, s3 }) => {
+    safe(async ({ channelId, password, memberName, gitUrl, s3 }, extra) => {
       await bridge.join(channelId, password, memberName, { gitUrl, s3 });
+      store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
       setActiveChannel(store, channelId);
       onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
       // Full-history fetch (spec: retention bounds relay history, so "all of
@@ -618,7 +620,7 @@ NEVER include credentials, secrets, tokens, or sensitive personal information in
       // Keep your own message searchable/catch_up-able: cache it with the
       // assigned seq (the cursor still advances only via poll).
       if (!deduped) store.cacheMessages(ch, [{ ...msg, seq }]);
-      return JSON.stringify({ seq, deduped });
+      return JSON.stringify({ channelId: ch, seq, deduped });
     }),
   );
 
@@ -672,7 +674,17 @@ Also re-check after a break and before finalizing work others depend on. Returns
       }
       const remaining = Math.max(0, high - lastServed);
       setActiveChannel(store, ch);
-      return quoteWrap(JSON.stringify({ messages: served, skipped, cursor: high, remaining }));
+      // Surface open governance votes (relay-backed bridges only) so agents
+      // can perceive and cast via cast_vote without extra polling.
+      let openVotes: Array<{ id: string; type: string; target: string; endsAt: number }> | undefined;
+      try {
+        if (bridge.governance) openVotes = (await bridge.votes(ch)).open;
+      } catch {
+        /* votes are best-effort visibility */
+      }
+      return quoteWrap(
+        JSON.stringify({ channelId: ch, messages: served, skipped, cursor: high, remaining, ...(openVotes ? { openVotes } : {}) }),
+      );
     }),
   );
 
@@ -726,7 +738,7 @@ Use this instead of re-reading everything when looking for a specific decision, 
     safe(async ({ query, topic, kind, channelId }) => {
       const ch = resolveChannel(store, channelId);
       const messages = filterClaims(store.searchCache(ch, query), { topic, kind }).slice(0, SEARCH_RESULT_CAP);
-      return quoteWrap(JSON.stringify({ messages, count: messages.length }));
+      return quoteWrap(JSON.stringify({ channelId: ch, messages, count: messages.length }));
     }),
   );
 
@@ -775,71 +787,54 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
           ? { memberName: m.memberName, joinedAt: m.joinedAt }
           : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
       });
-      return quoteWrap(JSON.stringify({ members }));
+      return quoteWrap(JSON.stringify({ channelId: ch, members }));
     }),
   );
 
-  // ---- leave_channel ----
-  server.registerTool(
-    "leave_channel",
-    {
-      description:
-        "Leave a channel and delete its local state (membership on the relay is untouched in this version). Do this when a collaboration ends or the channel is no longer relevant. Consider posting a goodbye progress message first so teammates know you are gone.",
-      inputSchema: { ...channelIdParam },
-    },
-    safe(async ({ channelId }) => {
-      const ch = resolveChannel(store, channelId);
-      await bridge.leave(ch);
-      onChannelLeft?.(ch); // detach from the broadcaster — plugin stops receiving
-      store.deleteKv(`subscription:${ch}`);
-      store.deleteKv(`channelName:${ch}`);
-      if (store.getKv(ACTIVE_CHANNEL_KEY) === ch) store.deleteKv(ACTIVE_CHANNEL_KEY);
-      return `left channel ${ch}`;
-    }),
-  );
-
-  // ---- rotate_password ----
-  server.registerTool(
-    "rotate_password",
-    {
-      description: `Open a new epoch for the channel with a fresh password (auto-generated grouped password unless you supply one). All existing passwords and sessions stop working — including yours — so you are re-joined automatically; every other member must join_channel again with the new password, which you should share out of band (the new password is shown exactly once in the result).
-
-Rotate when a teammate leaves the project, a password may have leaked, or periodically as hygiene. Old messages stay readable only to those who held the old password; the new epoch starts clean.`,
-      inputSchema: {
-        newPassword: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("Custom new password. Omit to get a generated human-copyable one (recommended)."),
-        ...channelIdParam,
+  // ---- cast_vote ----
+  if (bridge.governance) {
+    server.registerTool(
+      "cast_vote",
+      {
+        description:
+          "Cast your ballot on an open governance vote (e.g. a kick vote). Pass the voteId from an openVotes entry in fetch_updates. The vote target cannot vote; one ballot per member.",
+        inputSchema: {
+          voteId: z.string().min(1).describe("Vote id from an openVotes entry."),
+          choice: z.enum(["yes", "no"]).describe("yes = vote for the proposal (e.g. kick); no = against."),
+          ...channelIdParam,
+        },
       },
-    },
-    safe(async ({ newPassword, channelId }) => {
-      const ch = resolveChannel(store, channelId);
-      const secret = store.getChannelSecret(ch);
-      if (!secret) throw new Error(`unknown channel: ${ch}`);
-      const password = newPassword ?? generateGroupedPassword();
-      await bridge.rotate(ch, password);
-      // rotate invalidated every token, ours included — re-join immediately;
-      // a failed re-join must not mask the rotation result (M-2): the agent
-      // still holds the new password and can join_channel explicitly.
-      let rejoinWarning = "";
-      try {
-        await bridge.join(ch, password, secret.memberName);
-      } catch (err) {
-        rejoinWarning = `\nWARNING: auto-rejoin failed (${
-          err instanceof Error ? err.message : String(err)
-        }) — run join_channel with this password to reconnect.`;
-      }
-      const epoch = store.getChannelSecret(ch)?.epoch ?? 1;
-      setActiveChannel(store, ch);
-      return (
-        `password rotated (epoch ${epoch}). Share with teammates: channel_id=${ch} password=${password}\n` +
-        "Shown only this once — deliver out of band; all members must join_channel again with the new password." +
-        rejoinWarning
-      );
-    }),
-  );
+      safe(async ({ voteId, choice, channelId }) => {
+        const ch = resolveChannel(store, channelId);
+        await bridge.castVote(ch, voteId, choice);
+        return quoteWrap(JSON.stringify({ ok: true, voteId, choice, channelId: ch }));
+      }),
+    );
+
+    // ---- list_channels ----
+    server.registerTool(
+      "list_channels",
+      {
+        description:
+          "List the channels THIS session has joined, with per-channel meta (id, name, membership name, admission mode, your role). Use it after a context reset to rediscover your channels.",
+        inputSchema: {},
+      },
+      safe(async (_args, extra) => {
+        const consumerId = consumerIdFromExtra(extra);
+        const channels = store.listConsumerChannels(consumerId).map(({ channelId: cid, joinedAt }) => {
+          const secret = store.getChannelSecret(cid);
+          return {
+            channelId: cid,
+            name: store.getKv(`channelName:${cid}`) ?? undefined,
+            memberName: secret?.memberName,
+            joinedAt,
+            active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
+          };
+        });
+        return quoteWrap(JSON.stringify({ consumerId, channels }));
+      }),
+    );
+  }
 
   return server;
 }

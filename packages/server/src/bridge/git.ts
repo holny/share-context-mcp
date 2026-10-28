@@ -286,6 +286,16 @@ export class GitBridge implements ChannelBridge {
     this.timers.delete(channelId);
     rmSync(this.workCopy(channelId), { recursive: true, force: true });
   }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async votes(_channelId: string): Promise<{ open: never[]; history: never[] }> {
+    return { open: [], history: [] };
+  }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async castVote(_channelId: string, _voteId: string, _choice: "yes" | "no"): Promise<void> {}
+
+  readonly governance = false;
 }
 
 function deriveGroupedPassword(): string {

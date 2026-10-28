@@ -190,6 +190,12 @@ export class Store {
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS consumer_channels (
+        consumer_id TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        joined_at   TEXT NOT NULL,
+        PRIMARY KEY(consumer_id, channel_id)
+      );
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
         statement, detail, topic, kind, scope,
         tokenize = 'trigram'
@@ -523,8 +529,24 @@ export class Store {
       .run(key, encryptSecret(this.machineKey, plaintext));
   }
 
-  getKv(key: string): string | null {
-    const row = this.db.prepare("SELECT value FROM kvs WHERE key = ?").get(key) as { value: string } | undefined;
+  /** Per-session channel ledger (§6 multi-channel): a consumer's joined channels. */
+  recordConsumerChannel(consumerId: string, channelId: string): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO consumer_channels(consumer_id, channel_id, joined_at) VALUES (?, ?, ?)")
+      .run(consumerId, channelId, new Date().toISOString());
+  }
+
+  listConsumerChannels(consumerId: string): Array<{ channelId: string; joinedAt: string }> {
+    return this.db
+      .prepare("SELECT channel_id, joined_at FROM consumer_channels WHERE consumer_id = ? ORDER BY joined_at ASC")
+      .all(consumerId) as Array<{ channelId: string; joinedAt: string }>;
+  }
+
+  removeConsumerChannel(consumerId: string, channelId: string): void {
+    this.db.prepare("DELETE FROM consumer_channels WHERE consumer_id = ? AND channel_id = ?").run(consumerId, channelId);
+  }
+
+  getKv(key: string): string | null {    const row = this.db.prepare("SELECT value FROM kvs WHERE key = ?").get(key) as { value: string } | undefined;
     return row?.value ?? null;
   }
 

@@ -361,63 +361,6 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(a.store.getKv(`subscription:${channelId}`)).toBe(JSON.stringify(filters));
   });
 
-  test("leave_channel forgets the channel locally", async () => {
-    const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
-    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-    const res = await a.client.callTool({ name: "leave_channel", arguments: { channelId } });
-    expect(isError(res)).toBe(false);
-    expect(a.store.listChannels()).not.toContain(channelId);
-    const after = await a.client.callTool({ name: "fetch_updates", arguments: {} });
-    expect(isError(after)).toBe(true);
-    expect(textOf(after)).toContain("no channel joined yet");
-  });
-
-  test("rotate_password: new password shown, rejoin works, old-epoch message counts as skipped", async () => {
-    const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
-    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-    const oldPassword = created.match(/password=([a-z0-9-]+)/)![1];
-    await a.client.callTool({
-      name: "share_update",
-      arguments: { statement: "pre-rotate message from epoch 1", kind: "progress", topic: "t" },
-    });
-
-    const rotated = textOf(await a.client.callTool({ name: "rotate_password", arguments: {} }));
-    expect(rotated).toContain("epoch 2");
-    const newPassword = rotated.match(/password=([a-z0-9-]+)/)![1];
-    expect(newPassword).toMatch(/^[a-z0-9]{4}(-[a-z0-9]{4}){4}$/);
-    expect(newPassword).not.toBe(oldPassword);
-
-    // rotator's own token was invalidated — implicit proof: share still works (auto re-join)
-    const shared = await a.client.callTool({
-      name: "share_update",
-      arguments: { statement: "post-rotate message from epoch 2", kind: "progress", topic: "t" },
-    });
-    expect(isError(shared)).toBe(false);
-
-    // old password is dead
-    const late = await makeAgent("late");
-    const oldJoin = await late.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password: oldPassword, memberName: "late" },
-    });
-    expect(isError(oldJoin)).toBe(true);
-
-    // join with the new password: the join window delivers epoch-2 messages;
-    // an explicit since=0 fetch re-delivers them and surfaces the old-epoch
-    // envelope as skipped
-    const b = await makeAgent("b");
-    const joined = await b.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password: newPassword, memberName: "b" },
-    });
-    expect(isError(joined)).toBe(false);
-    const body = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: { since: 0 } }))));
-    expect(body.messages.some((m: { statement: string }) => m.statement === "post-rotate message from epoch 2")).toBe(true);
-    expect(body.skipped).toBeGreaterThanOrEqual(1);
-  });
-
   test("channelId defaults to the most recently used channel", async () => {
     const a = await makeAgent("a");
     const c1 = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));

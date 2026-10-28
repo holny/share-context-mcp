@@ -100,4 +100,16 @@ export interface ChannelBridge {
   rotate(channelId: string, newPassword: string): Promise<void>;
   /** Leave: forget the channel locally (relay-side member record stays in v1). */
   leave(channelId: string): Promise<void>;
+  /** Open + settled votes (governance; relay-backed bridges only). */
+  votes(channelId: string): Promise<{
+    open: Array<{ id: string; type: string; target: string; endsAt: number }>;
+    history: Array<{ id: string; type: string; target: string; status: string; yes: number; no: number }>;
+  }>;
+  castVote(channelId: string, voteId: string, choice: "yes" | "no"): Promise<void>;
+  /**
+   * Governance capability (§governance): true only for the relay-backed
+   * bridge — roles/votes/bans/directory are relay-tier features. git/S3
+   * bridges run basic messaging and the MCP surface omits governance tools.
+   */
+  readonly governance: boolean;
 }

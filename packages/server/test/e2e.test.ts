@@ -7,8 +7,8 @@
  * stdio, the exact path production MCP clients take.
  *
  * Lifecycle under test: create → out-of-band password handoff → join card →
- * share ×3 → fetch → topic catch_up → search → rotate (old token dies) →
- * re-join with the new password → keep fetching. Also asserts that neither
+ * share ×3 → fetch → topic catch_up → search → keep fetching (governance
+ * ops moved to the CLI tier). Also asserts that neither
  * server process ever logs a plaintext password to stderr — an assertion made
  * meaningful by a negative-path child (missing relay URL) that provably bails
  * through the same stderr capture.
@@ -98,7 +98,7 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
   }
 
   test(
-    "create → join → share ×3 → fetch → catch_up → search → rotate → 401 → re-join → fetch",
+    "create → join → share ×3 → fetch → catch_up → search → fetch round trip",
     async () => {
       const a = await spawnAgent("a");
       const b = await spawnAgent("b");
@@ -181,60 +181,16 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       expect(hits.count).toBe(2);
       expect(hits.messages.map((m) => m.topic).sort()).toEqual(["auth", "db"]);
 
-      // ---- A rotates: the old password/epoch dies, A auto-rejoins ----
-      const rotated = textOf(await a.client.callTool({ name: "rotate_password", arguments: {} }));
-      expect(rotated).toContain("epoch 2");
-      const newPassword = rotated.match(/password=([a-z0-9-]+)/)![1];
-      expect(newPassword).toMatch(/^[a-z0-9]{4}(-[a-z0-9]{4}){4}$/);
-      expect(newPassword).not.toBe(password);
-
-      // ---- B's old session token is dead: fetch now fails unauthorized ----
-      const stale = await b.client.callTool({ name: "fetch_updates", arguments: {} });
-      expect(isError(stale)).toBe(true);
-      expect(textOf(stale)).toContain("unauthorized");
-
-      // ---- A (auto re-joined) can still share into epoch 2 ----
-      const postRotate = await a.client.callTool({
-        name: "share_update",
-        arguments: {
-          statement: "epoch 2 begins: old password is dead, everyone joins with the new one",
-          kind: "progress",
-          topic: "meta",
-        },
-      });
-      expect(isError(postRotate)).toBe(false);
-
-      // ---- B re-joins with the NEW password and keeps fetching ----
-      const rejoined = await b.client.callTool({
-        name: "join_channel",
-        arguments: { channelId, password: newPassword, memberName: "bob" },
-      });
-      expect(isError(rejoined)).toBe(false);
-      const rejoinedCard = textOf(rejoined);
-      expect(rejoinedCard.startsWith(QUOTE_HEADER)).toBe(true);
-      expect(rejoinedCard).toContain("bob");
-
-      // the join window already delivered the epoch-2 message; a share from A
-      // after the rejoin must flow to B through a plain fetch (epoch-2 key)
-      const second = await a.client.callTool({
-        name: "share_update",
-        arguments: {
-          statement: "back in business: epoch 2 delivery works end to end",
-          kind: "progress",
-          topic: "meta",
-        },
-      });
-      expect(isError(second)).toBe(false);
-      const resumed = JSON.parse(
-        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: {} }))),
-      ) as { messages: Array<{ statement: string }>; skipped: number };
-      expect(resumed.messages.some((m) => m.statement.startsWith("back in business"))).toBe(true);
+      // ---- rotate moved to CLI (breaking, governance iteration) — covered
+      // by relay-level tests + CLI tests; here we verify B's session survives
+      // a plain fetch round trip instead ----
+      const still = await b.client.callTool({ name: "fetch_updates", arguments: {} });
+      expect(isError(still)).toBe(false);
 
       // ---- security: no plaintext password in either server's stderr ----
       // (meaningful only because the test below proves the capture is live)
       for (const p of procs) {
         expect(p.stderr).not.toContain(password);
-        expect(p.stderr).not.toContain(newPassword);
       }
     },
     60_000,

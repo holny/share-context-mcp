@@ -271,6 +271,16 @@ export class S3Bridge implements ChannelBridge {
     if (t) clearInterval(t);
     this.timers.delete(channelId);
   }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async votes(_channelId: string): Promise<{ open: never[]; history: never[] }> {
+    return { open: [], history: [] };
+  }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async castVote(_channelId: string, _voteId: string, _choice: "yes" | "no"): Promise<void> {}
+
+  readonly governance = false;
 }
 
 function headKey(channelId: string): string {
