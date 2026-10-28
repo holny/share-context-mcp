@@ -61,6 +61,13 @@ export interface PollResult {
    * them regardless — they must never block the stream (spec §5.7).
    */
   skipped: number;
+  /**
+   * Lowest seq the relay still retains (relay-backed bridges only). When the
+   * relay has evicted a prefix below the consumer's cursor, the cursor is
+   * raised to minSeq and the gap recorded locally — evicted text is gone and
+   * recoverable only via digest messages.
+   */
+  minSeq?: number;
 }
 
 export interface ChannelBridge {

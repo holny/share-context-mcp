@@ -12,6 +12,8 @@ export interface ChannelRow {
   id: string;
   epoch: number;
   next_seq: number;
+  /** Lowest retained seq (retention Task 6); 1 = nothing evicted. */
+  min_seq: number;
   /** base64 of HMAC-SHA256(channelKey, "verify") — proves possession, cannot decrypt */
   verify_key: string;
   created_at: string;
@@ -44,11 +46,14 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE members ADD COLUMN last_poll_seq INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN last_viewed_seq INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN last_active_at TEXT"); } catch {}
+    // Retention (Task 6): lowest retained seq per channel (1 = nothing evicted).
+    try { db.exec("ALTER TABLE channels ADD COLUMN min_seq INTEGER NOT NULL DEFAULT 1"); } catch {}
   db.exec(`
     CREATE TABLE IF NOT EXISTS channels(
       id TEXT PRIMARY KEY,
       epoch INTEGER NOT NULL DEFAULT 1,
       next_seq INTEGER NOT NULL DEFAULT 1,
+      min_seq INTEGER NOT NULL DEFAULT 1,
       verify_key TEXT NOT NULL,
       created_at TEXT NOT NULL
     );

@@ -23,6 +23,14 @@ export interface RelayOptions {
    * 0 disables the heartbeat. Tests use a short interval to observe pings.
    */
   pingIntervalMs?: number;
+  /**
+   * Retention (spec: count + TTL, whichever hits first). Messages are evicted
+   * as a seq PREFIX (window stays contiguous — consumer cursors stay
+   * decidable). Defaults: 10000 messages / 30 days, overridable via
+   * SHARE_CONTEXT_RELAY_MAX_MESSAGES / SHARE_CONTEXT_RELAY_MAX_AGE_DAYS.
+   */
+  maxMessages?: number;
+  maxAgeDays?: number;
 }
 
 export interface RelayHandle {
@@ -32,10 +40,20 @@ export interface RelayHandle {
   stop(): Promise<void>;
 }
 
+function numEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
 export async function startRelay(options: RelayOptions = {}): Promise<RelayHandle> {
   const db = openDb(options.dbPath ?? ":memory:");
   const hub = createWsHub();
-  const handle = createRelayHandler(db, hub);
+  const handle = createRelayHandler(db, hub, {
+    maxMessages: options.maxMessages ?? numEnv("SHARE_CONTEXT_RELAY_MAX_MESSAGES") ?? 10_000,
+    maxAgeDays: options.maxAgeDays ?? numEnv("SHARE_CONTEXT_RELAY_MAX_AGE_DAYS") ?? 30,
+  });
   const stmtChannelInfo = db.prepare("SELECT epoch, next_seq FROM channels WHERE id = ?");
 
   const server = Bun.serve<WsConnData>({

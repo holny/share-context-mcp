@@ -11,6 +11,8 @@ import { join } from "node:path";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
 import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
 import { RelayBridge } from "../src/bridge/relay";
+import { S3Bridge } from "../src/bridge/s3";
+import { startFakeS3 } from "../src/bridge/fake-s3";
 import { Store } from "../src/store";
 
 function claim(statement: string, member: string, extra: Record<string, unknown> = {}): ClaimMessage {
@@ -76,7 +78,7 @@ describe("RelayBridge against a real relay", () => {
     expect(storeB.getCursor(channelId)).toBe(3);
 
     // incremental poll from the cursor is empty
-    expect(await mbB.poll(channelId, 3)).toEqual({ messages: [], skipped: 0 });
+    expect(await mbB.poll(channelId, 3)).toEqual({ messages: [], skipped: 0, minSeq: 1 });
     // empty poll must not regress the cursor
     expect(storeB.getCursor(channelId)).toBe(3);
   });
@@ -256,5 +258,37 @@ describe("RelayBridge against a real relay", () => {
     const meta = await mbA.meta(channelId);
     const me = meta.members.find((m) => m.memberName === "a");
     expect(me?.lastActiveAt).toBe("2026-10-28T00:00:00Z");
+  });
+
+  test("poll propagates minSeq: cursor raised, gap kv recorded (Review: eviction gap)", async () => {
+    const r2 = await startRelay({ port: 0, maxMessages: 1 });
+    try {
+      const store2 = new Store(join(mkdtempSync(join(tmpdir(), "scm-gap-")), "s.db"));
+      const b2 = new RelayBridge({ baseUrl: `http://127.0.0.1:${r2.port}`, store: store2 });
+      const { channelId } = await b2.createChannel({ memberName: "g" });
+      for (let i = 1; i <= 3; i++) {
+        await b2.send({ statement: `m${i}`, kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "g", source: "agent" } }, channelId);
+      }
+      const res = await b2.poll(channelId, 0);
+      // only seq 3 survives (count bound 1); minSeq 3 > poll-since 0
+      expect(res.minSeq).toBe(3);
+      expect(store2.getCursor(channelId)).toBeGreaterThanOrEqual(3);
+      expect(store2.getKv(`gap:${channelId}`)).toBe("3");
+    } finally {
+      await r2.stop();
+    }
+  });
+
+  test("S3Bridge poll carries no minSeq (no retention concept there)", async () => {
+    const fake = startFakeS3(0);
+    try {
+      const conn = { endpoint: fake.url, bucket: "b", region: "r", accessKeyId: "ak", secretAccessKey: "sk", prefix: "t" };
+      const s = new S3Bridge({ ...conn, defaultS3: conn });
+      const { channelId } = await s.createChannel({ memberName: "s3g" });
+      const res = await s.poll(channelId, 0);
+      expect(res.minSeq).toBeUndefined();
+    } finally {
+      fake.stop();
+    }
   });
 });

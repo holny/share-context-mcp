@@ -105,8 +105,10 @@ export function buildIndexCard(opts: {
   members: ReadonlyArray<{ memberName: string; joinedAt?: string; activity?: string }>;
   msgs: ReadonlyArray<ClaimMessage>;
   pendingQuestions: number;
+  /** Lowest seq the relay still retains; older text is evicted (digest-only). */
+  historyGap?: number;
 }): string {
-  const { channelId, members, msgs, pendingQuestions } = opts;
+  const { channelId, members, msgs, pendingQuestions, historyGap } = opts;
 
   // topic rollup — msgs are newest-first; first hit per topic is the latest
   const byTopic = new Map<string, ClaimMessage[]>();
@@ -144,6 +146,9 @@ export function buildIndexCard(opts: {
     topics,
     digests,
     unresolvedQuestions: pendingQuestions,
+    ...(historyGap !== undefined && historyGap > 1
+      ? { historyGap: `before seq ${historyGap} — older text was evicted by relay retention, recoverable only via digests` }
+      : {}),
     ...(topics.length === 0 && digests.length === 0
       ? { note: "active topics: none yet — the channel is empty; share_update to break the ice" }
       : {}),
@@ -339,7 +344,11 @@ Choose a stable member name your teammates will recognize — directed messages 
       const all = store.searchCache(channelId, "");
       const name = store.getKv(`channelName:${channelId}`);
       const pendingQuestions = all.filter((m) => m.kind === "question").length;
-      const card = JSON.parse(buildIndexCard({ channelId, members: meta.members, msgs: all, pendingQuestions })) as Record<string, unknown>;
+      const gapRaw = store.getKv(`gap:${channelId}`);
+      const historyGap = gapRaw === null ? undefined : Number(gapRaw);
+      const card = JSON.parse(
+        buildIndexCard({ channelId, members: meta.members, msgs: all, pendingQuestions, historyGap }),
+      ) as Record<string, unknown>;
       return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
     }),
   );

@@ -286,7 +286,26 @@ export class RelayBridge implements ChannelBridge {
     const data = (await this.request(`/channels/${channelId}/messages?since=${since}`, {
       method: "GET",
       headers: this.authHeaders(channelId),
-    })) as { messages?: EnvelopeRow[] };
+    })) as { messages?: EnvelopeRow[]; minSeq?: number; nextSeq?: number };
+    // Retention gap handling (spec): when the relay evicted a prefix below
+    // our cursor, raise the cursor to the last seq that can still exist
+    // (min(minSeq, nextSeq-1) — minSeq can equal next_seq when EVERYTHING was
+    // evicted, and next_seq is a RESERVED seq for a future message: raising
+    // to it would silently skip that future message). The gap is recorded
+    // only on real eviction (minSeq > 1); the evicted text is gone and
+    // recoverable only via digest messages.
+    const minSeq = typeof data.minSeq === "number" ? data.minSeq : undefined;
+    const nextSeq = typeof data.nextSeq === "number" ? data.nextSeq : undefined;
+    if (minSeq !== undefined && minSeq > 1) {
+      const raiseTarget = nextSeq !== undefined ? Math.min(minSeq, nextSeq - 1) : minSeq;
+      if (raiseTarget > this.store.getCursor(channelId)) {
+        this.store.setCursor(channelId, raiseTarget);
+      }
+      const gapKey = `gap:${channelId}`;
+      const prev = this.store.getKv(gapKey);
+      const prevNum = prev === null ? 0 : Number(prev);
+      if (minSeq > prevNum) this.store.setKv(gapKey, String(minSeq));
+    }
     const envelopes = data.messages ?? [];
     // Candidate keys, current epoch first (C-1/I-2): an envelope sealed in an
     // earlier epoch is opened with its RETAINED old password (spec §5.5 —
@@ -327,7 +346,7 @@ export class RelayBridge implements ChannelBridge {
     // (Review F3): the broadcaster's background poll passes markActivity:
     // false — self-marking would keep poll mode at the active pace forever.
     if (opts?.markActivity !== false) this.markListeners(channelId);
-    return { messages: out, skipped: envelopes.length - out.length };
+    return { messages: out, skipped: envelopes.length - out.length, minSeq };
   }
 
   /**

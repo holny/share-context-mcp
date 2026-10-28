@@ -359,4 +359,76 @@ describe("blind relay", () => {
     const me = body.members.find((m) => m.memberName === "alice");
     expect(me?.lastActiveAt).toBe(ts);
   });
+
+  test("retention: count bound evicts oldest seqs as a contiguous prefix, minSeq reported", async () => {
+    const r2 = await startRelay({ port: 0, maxMessages: 8 });
+    try {
+      const base2 = `http://127.0.0.1:${r2.port}`;
+      const post = (p: string, b: unknown, t?: string) =>
+        fetch(`${base2}${p}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(t ? { authorization: `Bearer ${t}` } : {}) },
+          body: JSON.stringify(b),
+        });
+      const channelId = randomBytes(8).toString("hex");
+      const created = await post("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+      expect(created.status).toBe(200);
+      const ch = await post(`/channels/${channelId}/challenge`, { memberName: "alice" });
+      const { nonceB64 } = (await ch.json()) as { nonceB64: string };
+      const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
+      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof });
+      const token = ((await joined.json()) as { token: string }).token;
+
+      // send 10 claims → count bound (8) evicts seqs 1-2
+      for (let i = 1; i <= 10; i++) {
+        const key = deriveChannelKey(PASSWORD, channelId);
+        const validated = validateClaim({ ts: new Date().toISOString(), statement: `m${i}`, kind: "progress", topic: "t", provenance: { member: "alice", source: "agent" } });
+        if (!validated.ok) throw new Error(validated.reason);
+        const env = seal(validated.msg, key);
+        const res = await post(`/channels/${channelId}/messages`, { nonce: env.nonce, ciphertext: env.ciphertext, idemKey: validated.msg.idempotencyKey }, token);
+        expect(res.status).toBe(200);
+      }
+      const list = await fetch(`${base2}/channels/${channelId}/messages?since=0`, { headers: { authorization: `Bearer ${token}` } });
+      const body = (await list.json()) as { messages: Array<{ seq: number }>; nextSeq: number; minSeq: number };
+      // contiguous prefix from minSeq — no holes (Review Focus 3)
+      expect(body.messages.map((m) => m.seq)).toEqual([3, 4, 5, 6, 7, 8, 9, 10]);
+      expect(body.minSeq).toBe(3);
+      expect(body.nextSeq).toBe(11);
+    } finally {
+      await r2.stop();
+    }
+  });
+
+  test("retention: TTL bound evicts everything, minSeq = nextSeq (consumer cursor must jump)", async () => {
+    const r3 = await startRelay({ port: 0, maxAgeDays: 0 });
+    try {
+      const base3 = `http://127.0.0.1:${r3.port}`;
+      const post = (p: string, b: unknown, t?: string) =>
+        fetch(`${base3}${p}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(t ? { authorization: `Bearer ${t}` } : {}) },
+          body: JSON.stringify(b),
+        });
+      const channelId = randomBytes(8).toString("hex");
+      await post("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+      const ch = await post(`/channels/${channelId}/challenge`, { memberName: "alice" });
+      const { nonceB64 } = (await ch.json()) as { nonceB64: string };
+      const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
+      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof });
+      const token = ((await joined.json()) as { token: string }).token;
+      for (let i = 1; i <= 2; i++) {
+        const key = deriveChannelKey(PASSWORD, channelId);
+        const validated = validateClaim({ ts: new Date().toISOString(), statement: `m${i}`, kind: "progress", topic: "t", provenance: { member: "alice", source: "agent" } });
+        if (!validated.ok) throw new Error(validated.reason);
+        const env = seal(validated.msg, key);
+        await post(`/channels/${channelId}/messages`, { nonce: env.nonce, ciphertext: env.ciphertext, idemKey: validated.msg.idempotencyKey }, token);
+      }
+      const list = await fetch(`${base3}/channels/${channelId}/messages?since=0`, { headers: { authorization: `Bearer ${token}` } });
+      const body = (await list.json()) as { messages: unknown[]; nextSeq: number; minSeq: number };
+      expect(body.messages).toEqual([]);
+      expect(body.minSeq).toBe(body.nextSeq);
+    } finally {
+      await r3.stop();
+    }
+  });
 });

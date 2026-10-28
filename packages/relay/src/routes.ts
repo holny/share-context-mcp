@@ -89,12 +89,12 @@ function bearerToken(req: Request): string | null {
 
 // ---- route factory ----
 
-export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) => Promise<Response> {
+export function createRelayHandler(db: Database, wsHub?: WsHub, retention: { maxMessages: number; maxAgeDays: number } = { maxMessages: 10_000, maxAgeDays: 30 }): (req: Request) => Promise<Response> {
   // pending challenges, in-memory only: (channelId, memberName) → nonce
   const challenges = new Map<string, PendingChallenge>();
   const challengeKey = (channelId: string, memberName: string) => `${channelId}\n${memberName}`;
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at FROM channels WHERE id = ?");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
@@ -117,6 +117,28 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
   // are allocated atomically with the message (a concurrent rotate cannot
   // split seq from its epoch).
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
+  const stmtMinSeqAbove = db.prepare("SELECT MIN(seq) AS s FROM messages WHERE channel_id = ? AND created_at > ?");
+  const stmtEvictPrefix = db.prepare("DELETE FROM messages WHERE channel_id = ? AND seq < ?");
+  const stmtSetMinSeq = db.prepare("UPDATE channels SET min_seq = ? WHERE id = ?");
+
+  /**
+   * Retention (spec): evict the OLDEST messages as a contiguous seq prefix
+   * when either bound is hit — count (next_seq - maxMessages) or age
+   * (created_at older than maxAgeDays). Eviction must never punch holes: a
+   * consumer cursor below min_seq would make "no data loss" undecidable.
+   */
+  function evictIfNeeded(channelId: string, channel: { next_seq: number; min_seq?: number }): void {
+    const nextSeq = channel.next_seq;
+    const countCutoff = nextSeq - retention.maxMessages;
+    const cutoffTime = new Date(Date.now() - retention.maxAgeDays * 86_400_000).toISOString();
+    const oldestKept = (stmtMinSeqAbove.get(channelId, cutoffTime) as { s: number | null }).s;
+    const timeCutoff = oldestKept ?? nextSeq; // nothing young enough → evict all
+    const cutoff = Math.min(Math.max(1, Math.max(countCutoff, timeCutoff)), nextSeq);
+    const current = channel.min_seq ?? 1;
+    if (cutoff <= current) return;
+    stmtEvictPrefix.run(channelId, cutoff);
+    stmtSetMinSeq.run(cutoff, channelId);
+  }
 
   /** Returns channel+member for a valid Bearer token, or null (caller answers 401). */
   function authenticate(channelId: string, req: Request): { channel: ChannelRow; member: MemberRow } | null {
@@ -302,6 +324,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
             // content. Dedup re-sends nothing (the original insert already
             // notified); poll GET ?since= remains the correctness fallback.
             wsHub?.notifyMessage(channelId, stored.seq, stored.epoch);
+            // Retention runs after each accepted message (spec: count + TTL).
+            evictIfNeeded(channelId, { next_seq: stored.seq + 1, min_seq: auth.channel.min_seq });
           }
           return json({ seq: stored.seq, deduped: stored.deduped });
         }
@@ -318,7 +342,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
             nonce: string;
             ciphertext: string;
           }>;
-          return json({ messages: rows, nextSeq: auth.channel.next_seq });
+          return json({
+            messages: rows,
+            nextSeq: auth.channel.next_seq,
+            minSeq: auth.channel.min_seq ?? 1,
+          });
         }
         return jsonError(405, "method not allowed");
       }
@@ -346,6 +374,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub): (req: Request) 
           channelId: auth.channel.id,
           epoch: auth.channel.epoch,
           nextSeq: auth.channel.next_seq,
+          minSeq: auth.channel.min_seq ?? 1,
           members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at, lastActiveAt: m.last_active_at })),
         });
       }
