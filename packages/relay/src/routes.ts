@@ -74,8 +74,8 @@ function validMemberName(v: unknown): v is string {
 function isLiveToken(m: MemberRow, channel: { epoch: number }, now: number): boolean {
   return (
     m.token_hash !== null &&
-    m.token_expires_at !== null &&
-    m.token_expires_at > now &&
+    // token_expires_at NULL = no expiry (long-lived membership token)
+    (m.token_expires_at === null || m.token_expires_at > now) &&
     m.epoch === channel.epoch
   );
 }
@@ -108,7 +108,7 @@ function validateRetention(r: RelayRetention): RelayRetention {
   return r;
 }
 
-export function createRelayHandler(db: Database, wsHub?: WsHub, retention: RelayRetention = { maxMessages: DEFAULT_MAX_MESSAGES, maxAgeDays: DEFAULT_MAX_AGE_DAYS }, sweepIntervalMs?: number): (req: Request) => Promise<Response> {
+export function createRelayHandler(db: Database, wsHub?: WsHub, retention: RelayRetention = { maxMessages: DEFAULT_MAX_MESSAGES, maxAgeDays: DEFAULT_MAX_AGE_DAYS }, sweepIntervalMs?: number, tokenTtlMs: number | null = null): (req: Request) => Promise<Response> {
   validateRetention(retention);
   // pending challenges, in-memory only: (channelId, memberName) → nonce
   const challenges = new Map<string, PendingChallenge>();
@@ -127,8 +127,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until FROM channels WHERE id = ?");
-  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND name = ?");
-  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND token_hash = ?");
+  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND name = ?");
+  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
@@ -148,6 +148,14 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   // Returns the LIVE epoch alongside the allocated seq so push notifications
   // are allocated atomically with the message (a concurrent rotate cannot
   // split seq from its epoch).
+  const stmtRegisterConsumer = db.prepare(
+    "INSERT INTO member_consumer_ids(channel_id, member_name, consumer_id, last_seen) VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT(channel_id, member_name, consumer_id) DO UPDATE SET last_seen = excluded.last_seen",
+  );
+  const stmtConsumerRegistered = db.prepare(
+    "SELECT 1 FROM member_consumer_ids WHERE channel_id = ? AND member_name = ? AND consumer_id = ?",
+  );
+  const stmtBanRow = db.prepare("SELECT consumer_ids FROM member_bans WHERE channel_id = ? AND name = ?");
   const stmtAllocSeq = db.prepare("UPDATE channels SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq - 1 AS seq, epoch");
   const stmtAudit = db.prepare("INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, ?, ?, ?)");
 
@@ -200,7 +208,16 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   /** Returns channel+member for a valid Bearer token, or null (caller answers 401). */
-  function authenticate(channelId: string, req: Request): { channel: ChannelRow; member: MemberRow } | null {
+  type AuthResult = { channel: ChannelRow; member: MemberRow } | "banned" | null;
+
+  /**
+   * Returns channel+member for a valid Bearer token. Discriminated result:
+   * `null` = unauthorized (401 — do not leak ban status to unproven callers),
+   * `"banned"` = governance revocation (403 — the client must stop retrying,
+   * not re-auth). Consumer binding: when the request presents a consumer id
+   * it must be registered under this membership and not consumer-banned.
+   */
+  function authenticate(channelId: string, req: Request): AuthResult {
     const token = bearerToken(req);
     if (!token) return null;
     const channel = stmtChannel.get(channelId) as ChannelRow | undefined;
@@ -209,6 +226,25 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     if (!member) return null;
     const now = Date.now();
     if (!isLiveToken(member, channel, now)) return null;
+    const memberBanned = member.status === "banned";
+    // Consumer binding: a presented consumer id is auto-registered (a valid
+    // member token IS the membership proof — multi-session processes must
+    // just work); the binding's enforcement point is the BAN check below.
+    const consumer = req.headers.get("x-scm-consumer");
+    let consumerBanned = false;
+    if (consumer !== null && consumer !== "") {
+      const banRow = stmtBanRow.get(channelId, member.name) as { consumer_ids: string | null } | undefined;
+      if (banRow?.consumer_ids) {
+        try {
+          const bannedConsumers: string[] = JSON.parse(banRow.consumer_ids);
+          if (Array.isArray(bannedConsumers) && bannedConsumers.includes(consumer)) consumerBanned = true;
+        } catch { /* malformed ban entry — ignore consumer check */ }
+      }
+      if (!consumerBanned) {
+        stmtRegisterConsumer.run(channelId, member.name, consumer, new Date().toISOString());
+      }
+    }
+    if (memberBanned || consumerBanned) return "banned";
     return { channel, member };
   }
 
@@ -296,7 +332,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -327,6 +363,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           return jsonError(400, `invalid request: memberName must be a string of 1..${MEMBER_NAME_MAX} characters`);
         }
         const memberName = (parsed.body.memberName as string).trim();
+        const consumerId = parsed.body.consumerId;
+        if (typeof consumerId !== "string" || consumerId.length < 1 || consumerId.length > 64) {
+          return jsonError(400, "invalid request: consumerId must be a string of 1..64 characters");
+        }
         const proof = parsed.body.proof;
         if (typeof proof !== "string" || proof.length === 0 || proof.length > 128) {
           return jsonError(400, "invalid request: proof must be a base64 string");
@@ -349,22 +389,62 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           return jsonError(409, "member name already taken");
         }
         const token = randomBytes(TOKEN_BYTES).toString("base64");
+        const expiresAt = tokenTtlMs === null ? null : now + tokenTtlMs;
         stmtUpsertMember.run(
           channelId,
           memberName,
           sha256Hex(token),
-          now + TOKEN_TTL_MS,
+          expiresAt,
           channel.epoch,
           member?.joined_at ?? new Date().toISOString(),
         );
+        stmtRegisterConsumer.run(channelId, memberName, consumerId, new Date().toISOString());
         challenges.delete(key); // one-time use
         audit(channelId, memberName, "member.joined", memberName, "ok");
         return json({ token, epoch: channel.epoch, memberName });
       }
 
+      case "consumers": {
+        // Register an ADDITIONAL consumer id under this membership (multi-
+        // session processes share one member). Token-authenticated.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const consumerId = parsed.body.consumerId;
+        if (typeof consumerId !== "string" || consumerId.length < 1 || consumerId.length > 64) {
+          return jsonError(400, "invalid request: consumerId must be a string of 1..64 characters");
+        }
+        if (auth.member.status === "banned") return jsonError(403, "banned");
+        stmtRegisterConsumer.run(channelId, auth.member.name, consumerId, new Date().toISOString());
+        return json({ ok: true });
+      }
+
+      case "token-refresh": {
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.status === "banned") return jsonError(403, "banned");
+        const token = randomBytes(TOKEN_BYTES).toString("base64");
+        stmtUpsertMember.run(
+          channelId,
+          auth.member.name,
+          sha256Hex(token),
+          tokenTtlMs === null ? null : now + tokenTtlMs,
+          channel.epoch,
+          auth.member.joined_at,
+        );
+        audit(channelId, auth.member.name, "token.refreshed", auth.member.name, "ok");
+        return json({ token, epoch: channel.epoch, memberName: auth.member.name });
+      }
+
       case "messages": {
         if (method === "POST") {
           const auth = authenticate(channelId, req);
+          if (auth === "banned") return jsonError(403, "banned");
           if (!auth) return jsonError(401, "unauthorized");
           const parsed = await readJson(req);
           if (!parsed.ok) return parsed.resp;
@@ -395,6 +475,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         if (method === "GET") {
           const auth = authenticate(channelId, req);
+          if (auth === "banned") return jsonError(403, "banned");
           if (!auth) return jsonError(401, "unauthorized");
           const sinceRaw = url.searchParams.get("since") ?? "0";
           const since = Number(sinceRaw);
@@ -418,6 +499,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       case "activity": {
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
         if (!auth) return jsonError(401, "unauthorized");
         const parsed = await readJson(req);
         if (!parsed.ok) return parsed.resp;
@@ -439,6 +521,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       case "meta": {
         if (method !== "GET") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
         if (!auth) return jsonError(401, "unauthorized");
         const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string; last_active_at: string | null }>;
         return json({
@@ -457,6 +540,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       case "rotate": {
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
         if (!auth) return jsonError(401, "unauthorized");
         // v1: no key chain (spec §5.5). The caller (proven old-password holder
         // via Bearer token) supplies the NEW password's verification key —

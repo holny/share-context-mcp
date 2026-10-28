@@ -34,6 +34,10 @@ export interface MemberRow {
   token_expires_at: number | null;
   epoch: number;
   joined_at: string;
+  /** Governance: active | banned | left */
+  status: string;
+  /** 1 = may mint invite codes */
+  can_invite: number;
 }
 
 export interface MessageRow {

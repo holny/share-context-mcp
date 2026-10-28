@@ -326,7 +326,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
       const proof = hmacProof(new Uint8Array(Buffer.from(verifyKey, "base64")), nonceB64);
       const j = await fetch(`${baseUrl}/channels/${channelId}/join`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ memberName, proof }),
+        body: JSON.stringify({ memberName, proof, consumerId: `s/${memberName.padEnd(10, "0").slice(0, 10)}` }),
       });
       return ((await j.json()) as { token: string }).token;
     };

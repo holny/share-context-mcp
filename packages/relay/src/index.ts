@@ -33,6 +33,12 @@ export interface RelayOptions {
   maxMessages?: number;
   maxAgeDays?: number;
   /**
+   * Membership token lifetime in ms. Default: null = tokens never expire
+   * (membership continuity must not depend on token churn); rotate via
+   * token-refresh or ban via governance.
+   */
+  tokenTtlMs?: number | null;
+  /**
    * TTL sweep interval in ms (default 60_000): insert-driven eviction alone
    * would let idle channels keep ciphertext past maxAgeDays forever.
    */
@@ -66,6 +72,7 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
       maxAgeDays: options.maxAgeDays ?? numEnv("SHARE_CONTEXT_RELAY_MAX_AGE_DAYS") ?? DEFAULT_MAX_AGE_DAYS,
     },
     options.sweepIntervalMs ?? 60_000,
+    options.tokenTtlMs ?? null,
   );
   const stmtChannelInfo = db.prepare("SELECT epoch, next_seq FROM channels WHERE id = ?");
 

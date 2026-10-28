@@ -88,12 +88,13 @@ async function joinChannel(
   channelId: string,
   memberName: string,
   password: string,
+  consumerId = "s/testcons01",
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const ch = await postJson(`/channels/${channelId}/challenge`, { memberName });
   if (ch.status !== 200) return { status: ch.status, body: (await ch.json()) as Record<string, unknown> };
   const { nonceB64 } = (await ch.json()) as { nonceB64: string };
   const proof = proofOf(verifyKeyB64Of(password, channelId), nonceB64);
-  const res = await postJson(`/channels/${channelId}/join`, { memberName, proof });
+  const res = await postJson(`/channels/${channelId}/join`, { memberName, proof, consumerId });
   return { status: res.status, body: (await res.json()) as Record<string, unknown> };
 }
 
@@ -375,7 +376,7 @@ describe("blind relay", () => {
       const ch = await post(`/channels/${channelId}/challenge`, { memberName: "alice" });
       const { nonceB64 } = (await ch.json()) as { nonceB64: string };
       const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
-      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof });
+      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof, consumerId: "s/test0001" });
       const token = ((await joined.json()) as { token: string }).token;
 
       // send 10 claims → count bound (8) evicts seqs 1-2
@@ -413,7 +414,7 @@ describe("blind relay", () => {
       const ch = await post(`/channels/${channelId}/challenge`, { memberName: "alice" });
       const { nonceB64 } = (await ch.json()) as { nonceB64: string };
       const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
-      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof });
+      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof, consumerId: "s/test0001" });
       const token = ((await joined.json()) as { token: string }).token;
       for (let i = 1; i <= 2; i++) {
         const key = deriveChannelKey(PASSWORD, channelId);
@@ -446,7 +447,7 @@ describe("blind relay", () => {
       const ch = await post(`/channels/${channelId}/challenge`, { memberName: "alice" });
       const { nonceB64 } = (await ch.json()) as { nonceB64: string };
       const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
-      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof });
+      const joined = await post(`/channels/${channelId}/join`, { memberName: "alice", proof, consumerId: "s/test0001" });
       const token = ((await joined.json()) as { token: string }).token;
       for (let i = 1; i <= 2; i++) {
         const key = deriveChannelKey(PASSWORD, channelId);
@@ -466,8 +467,7 @@ describe("blind relay", () => {
     }
   });
 
-  test("governance schema: creator/manager recorded at create+join, exposed via meta; audit rows written", async () => {
-    const channelId = randomBytes(8).toString("hex");
+  test("governance schema: creator/manager recorded at create+join, exposed via meta; audit rows written", async () => {    const channelId = randomBytes(8).toString("hex");
     const created = await postJson("/channels", {
       channelId,
       memberName: "alice",
@@ -497,5 +497,79 @@ describe("blind relay", () => {
       .all(channelId) as Array<{ action: string; actor: string; result: string }>;
     expect(rows.map((r) => r.action)).toContain("channel.created");
     expect(rows.map((r) => r.action)).toContain("member.joined");
+  });
+
+  test("tokens: consumer binding, ban enforcement, refresh rotation", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+    const joined = await joinChannel(channelId, "alice", PASSWORD, "s/cons0001");
+    const token = (joined.body as { token: string }).token;
+    const authed = (p: string, t = token, consumer?: string) =>
+      fetch(`${base}${p}`, { headers: { authorization: `Bearer ${t}`, ...(consumer ? { "x-scm-consumer": consumer } : {}) } });
+
+    // additional consumer registration via /consumers
+    const reg = await postJson(`/channels/${channelId}/consumers`, { consumerId: "s/cons0002" }, token);
+    expect(reg.status).toBe(200);
+    // both consumers valid
+    expect((await authed(`/channels/${channelId}/meta`, token, "s/cons0001")).status).toBe(200);
+    expect((await authed(`/channels/${channelId}/meta`, token, "s/cons0002")).status).toBe(200);
+    // unregistered consumer on a token-authed request → auto-registered
+    // (valid member token IS the membership proof); ban enforcement is the
+    // separate banned-consumer check
+    expect((await authed(`/channels/${channelId}/meta`, token, "s/unknown99")).status).toBe(200);
+
+    // ban enforcement: member.status = banned → 403 even with valid token
+    relay.db.prepare("UPDATE members SET status = 'banned' WHERE channel_id = ? AND name = 'alice'").run(channelId);
+    expect((await authed(`/channels/${channelId}/meta`)).status).toBe(403);
+    relay.db.prepare("UPDATE members SET status = 'active' WHERE channel_id = ? AND name = 'alice'").run(channelId);
+
+    // consumer-level ban: banned consumer id rejected, other consumer still fine
+    relay.db
+      .prepare("UPDATE member_bans SET consumer_ids = ? WHERE channel_id = ? AND name = 'alice'")
+      .run(JSON.stringify(["s/cons0001"]), channelId);
+    relay.db
+      .prepare("INSERT OR IGNORE INTO member_bans(channel_id, name, consumer_ids, banned_at, banned_by) VALUES (?, 'alice', ?, ?, 'manager')")
+      .run(channelId, JSON.stringify(["s/cons0001"]), new Date().toISOString());
+    expect((await authed(`/channels/${channelId}/meta`, token, "s/cons0001")).status).toBe(403);
+    expect((await authed(`/channels/${channelId}/meta`, token, "s/cons0002")).status).toBe(200);
+    relay.db.prepare("DELETE FROM member_bans WHERE channel_id = ? AND name = 'alice'").run(channelId);
+
+    // token refresh: new token works, old revoked
+    const ref = await postJson(`/channels/${channelId}/token-refresh`, {}, token);
+    expect(ref.status).toBe(200);
+    const newToken = ((await ref.json()) as { token: string }).token;
+    expect(newToken).not.toBe(token);
+    expect((await authed(`/channels/${channelId}/meta`, newToken)).status).toBe(200);
+    expect((await authed(`/channels/${channelId}/meta`, token)).status).toBe(401);
+  });
+
+  test("token TTL: null = never expires (default)", async () => {
+    const r2 = await startRelay({ port: 0, tokenTtlMs: null, dbPath: join(dir, "ttl.db") });
+    try {
+      const b2 = `http://127.0.0.1:${r2.port}`;
+      const channelId = randomBytes(8).toString("hex");
+      const created = await fetch(`${b2}/channels`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) }),
+      });
+      expect(created.status).toBe(200);
+      const ch = await fetch(`${b2}/channels/${channelId}/challenge`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ memberName: "alice" }),
+      });
+      const { nonceB64 } = (await ch.json()) as { nonceB64: string };
+      const proof = proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64);
+      const joined = await fetch(`${b2}/channels/${channelId}/join`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ memberName: "alice", proof, consumerId: "s/ttl00001" }),
+      });
+      const token = ((await joined.json()) as { token: string }).token;
+      // simulate the passage of time: token_expires_at must be NULL (no expiry)
+      const row = r2.db.prepare("SELECT token_expires_at FROM members WHERE channel_id = ? AND name = 'alice'").get(channelId) as { token_expires_at: number | null };
+      expect(row.token_expires_at).toBeNull();
+      const meta = await fetch(`${b2}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${token}` } });
+      expect(meta.status).toBe(200);
+    } finally {
+      await r2.stop();
+    }
   });
 });

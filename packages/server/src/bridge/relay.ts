@@ -78,6 +78,9 @@ export class RelayBridge implements ChannelBridge {
   /** Last activity POST time per channel — 30s client-side rate limit (presence receipts). */
   private readonly lastActivityPost = new Map<string, number>();
 
+  /** Consumer id bound into every request (X-SCM-Consumer); registered at join. */
+  consumerId = `p/${process.pid}`;
+
   constructor(opts: { baseUrl: string; store: Store }) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.store = opts.store;
@@ -99,7 +102,19 @@ export class RelayBridge implements ChannelBridge {
   private authHeaders(channelId: string): Record<string, string> {
     const token = this.loadToken(channelId);
     if (!token) throw new Error(`not joined: ${channelId}`);
-    return { authorization: `Bearer ${token}` };
+    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+    if (this.consumerId) headers["x-scm-consumer"] = this.consumerId;
+    return headers;
+  }
+
+  /**
+   * Bind this process's consumer id: sent as a header on every request and
+   * registered at the relay (per-member consumer ledger). If the relay
+   * answers `consumer not registered` (e.g. a NEW session joined by another
+   * consumer of the same member), requests self-heal via POST /consumers.
+   */
+  setConsumer(consumerId: string): void {
+    this.consumerId = consumerId;
   }
 
   /**
@@ -183,7 +198,7 @@ export class RelayBridge implements ChannelBridge {
     const joined = (await this.request(`/channels/${channelId}/join`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ memberName, proof }),
+      body: JSON.stringify({ memberName, proof, consumerId: this.consumerId }),
     })) as { token?: string; epoch?: number };
     if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
     this.tokens.set(channelId, joined.token);
