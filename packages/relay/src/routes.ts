@@ -187,7 +187,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked FROM channels WHERE id = ?");
-  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND name = ?");
+  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
@@ -342,6 +342,15 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           "UPDATE members SET can_invite = 0 WHERE channel_id = ? AND name IN (SELECT used_by FROM invite_codes WHERE channel_id = ? AND owner = ?) AND name != ? AND name != ?",
         ).run(channelId, channelId, vote.target, vote.target, vote.initiator);
       }
+      // Successor stat profile (§4 notice): when the target held a role, the
+      // notice names the successor — roles already moved by applyKick.
+      const ch2 = db.prepare("SELECT creator_member, manager_member FROM channels WHERE id = ?").get(channelId) as
+        | { creator_member: string | null; manager_member: string | null }
+        | undefined;
+      const successor = ch2?.manager_member ?? null;
+      db.prepare(
+        "INSERT INTO audit_log(channel_id, ts, actor, action, target, result) VALUES (?, ?, ?, 'vote.kicked', ?, ?)",
+      ).run(channelId, new Date().toISOString(), vote.initiator, vote.target, successor ?? "regular");
     }
     if (!passed && vote.type === "kick") {
       // failure lifts the lineage freeze exactly
@@ -663,7 +672,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -1100,6 +1109,33 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         stmtSetCredential.run(verifyKeyB64, 0, channelId);
         audit(channelId, auth.member.name, "credential.rotated", auth.member.name, "access mode");
         return json({ ok: true });
+      }
+
+      case "member-stats": {
+        if (method !== "GET") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const name = url.searchParams.get("name") ?? auth.member.name;
+        const member = stmtMemberByName.get(channelId, name) as MemberRow | undefined;
+        if (!member) return jsonError(404, "member not found");
+        const total = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND sender = ?").get(channelId, name) as { n: number }).n;
+        const channelTotal = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?").get(channelId) as { n: number }).n;
+        const perDay: Array<{ day: string; count: number; share: number }> = [];
+        for (let i = 6; i >= 0; i--) {
+          const day = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+          const c = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND sender = ? AND created_at LIKE ?").get(channelId, name, `${day}%`) as { n: number }).n;
+          const dayTotal = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND created_at LIKE ?").get(channelId, `${day}%`) as { n: number }).n;
+          perDay.push({ day, count: c, share: dayTotal > 0 ? Math.round((c / dayTotal) * 100) : 0 });
+        }
+        return json({
+          member: name,
+          joinedAt: member.joined_at,
+          totalMessages: total,
+          totalShare: channelTotal > 0 ? Math.round((total / channelTotal) * 100) : 0,
+          lastActiveAt: member.last_active_at,
+          perDay,
+        });
       }
 
       case "messages": {

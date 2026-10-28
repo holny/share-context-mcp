@@ -40,6 +40,8 @@ export interface MemberRow {
   status: string;
   /** 1 = may mint invite codes */
   can_invite: number;
+  /** ISO ts of the last activity receipt (presence buckets). */
+  last_active_at: string | null;
 }
 
 export interface MessageRow {

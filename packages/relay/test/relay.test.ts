@@ -819,4 +819,19 @@ describe("blind relay", () => {
     const restoredRow = relay.db.prepare("SELECT can_invite FROM members WHERE channel_id = ? AND name = 'carol'").get(channelId) as { can_invite: number };
     expect(restoredRow.can_invite).toBe(1);
   });
+
+  test("member-stats: totals, share, per-day array from the sender column", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", { channelId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/alice0001")).body as { token: string };
+    for (let i = 1; i <= 3; i++) await sendClaim(alice.token, channelId, `msg ${i}`, { topic: "t" });
+    const stats = (await (
+      await fetch(`${base}/channels/${channelId}/member-stats?name=alice`, { headers: { authorization: `Bearer ${alice.token}` } })
+    ).json()) as { member: string; totalMessages: number; totalShare: number; perDay: Array<{ count: number }> };
+    expect(stats.member).toBe("alice");
+    expect(stats.totalMessages).toBe(3);
+    expect(stats.totalShare).toBe(100);
+    expect(stats.perDay).toHaveLength(7);
+    expect(stats.perDay[6].count).toBe(3);
+  });
 });
