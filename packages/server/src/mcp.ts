@@ -12,6 +12,7 @@ import { z } from "zod";
 import { CLAIM_KINDS, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { INSTRUCTIONS } from "./instructions";
 import { generateGroupedPassword } from "./bridge/relay";
+import { buildDigestMessages } from "./digest";
 import type { ChannelBridge, Store } from "./index";
 
 export const TOOL_NAMES = [
@@ -158,6 +159,66 @@ export function buildIndexCard(opts: {
 
 function setActiveChannel(store: Store, channelId: string): void {
   store.setKv(ACTIVE_CHANNEL_KEY, channelId);
+}
+
+// ---- structural digest posting (spec §history, Task 7) ----
+
+const DIGEST_TOPIC = "channel-digest";
+
+function digestThresholds(): { minMsgs: number; maxAgeDays: number } {
+  const envN = Number(process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS);
+  return {
+    minMsgs: Number.isInteger(envN) && envN > 0 ? envN : 500,
+    maxAgeDays: 7,
+  };
+}
+
+/**
+ * Maybe post structural digest message(s) for the evicted history range.
+ * Called after any poll that advanced the gap marker. Watermark exists ONLY
+ * to keep channel noise down (generation is free SQL): pending range must
+ * hold ≥ minMsgs cached messages OR span ≥ 7 days. Dedupe: a kv watermark
+ * (`digested:<ch>`) records what has been posted; overlapping re-posts are
+ * skipped. Racy double-posts by two members are harmless redundancy.
+ */
+async function maybePostDigest(
+  bridge: ChannelBridge,
+  store: Store,
+  ch: string,
+): Promise<void> {
+  const gapRaw = store.getKv(`gap:${ch}`);
+  if (gapRaw === null) return;
+  const minSeq = Number(gapRaw);
+  const digestedRaw = store.getKv(`digested:${ch}`);
+  const digestedTo = digestedRaw === null ? 0 : Number(digestedRaw);
+  const pendingTo = minSeq - 1;
+  if (pendingTo <= digestedTo) return;
+  const pending = store.cachedRange(ch, digestedTo, pendingTo);
+  const { minMsgs, maxAgeDays } = digestThresholds();
+  const spanDays =
+    pending.length > 1
+      ? (Date.parse(pending[pending.length - 1].ts) - Date.parse(pending[0].ts)) / 86_400_000
+      : 0;
+  if (pending.length < minMsgs && spanDays < maxAgeDays) return;
+  const built = buildDigestMessages(pending, { channelId: ch, from: digestedTo + 1, to: pendingTo });
+  const secret = store.getChannelSecret(ch);
+  if (!secret) return;
+  for (const b of built) {
+    await bridge.send(
+      {
+        statement: b.statement,
+        detail: b.detail,
+        kind: "digest",
+        topic: DIGEST_TOPIC,
+        scope: { covers: b.covers },
+        seq: null,
+        ts: new Date().toISOString(),
+        provenance: { member: secret.memberName, source: "agent" },
+      },
+      ch,
+    );
+  }
+  store.setKv(`digested:${ch}`, String(pendingTo));
 }
 
 /** Post-filter over the decrypted cache: exact topic/kind + scope-value prefix. */
@@ -349,6 +410,7 @@ Choose a stable member name your teammates will recognize — directed messages 
       const card = JSON.parse(
         buildIndexCard({ channelId, members: meta.members, msgs: all, pendingQuestions, historyGap }),
       ) as Record<string, unknown>;
+      await maybePostDigest(bridge, store, channelId);
       return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
     }),
   );
@@ -458,6 +520,7 @@ Also re-check after a break and before finalizing work others depend on. Returns
       const prevHigh = store.getCursor(ch);
       await bridge.poll(ch, prevHigh);
       const high = store.getCursor(ch);
+      await maybePostDigest(bridge, store, ch);
       const start = since ?? consumerDelivered.get(ch) ?? 0;
       // Serve at most SERVE_WINDOW claims per call (review F2): an overnight
       // broadcaster backlog must not dump hundreds of claims into one tool

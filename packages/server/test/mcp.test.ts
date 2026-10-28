@@ -685,8 +685,7 @@ describe("index card + full-history join fetch (Task 5)", () => {
   }, 60_000);
 
   test("re-join does not move the cursor backward or duplicate cached rows", async () => {
-    const seedStore = new Store(join(tmp(), "seed.db"));
-    const seeder = new RelayBridge({ baseUrl, store: seedStore });
+    const seedStore = new Store(join(tmp(), "seed.db"));    const seeder = new RelayBridge({ baseUrl, store: seedStore });
     const { channelId, password } = await seeder.createChannel({ memberName: "seed2" });
     await seeder.send({ statement: "only message", kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "seed2", source: "agent" } }, channelId);
     const a = await mkAgent("rejoiner");
@@ -697,5 +696,79 @@ describe("index card + full-history join fetch (Task 5)", () => {
     await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "rejoiner" } });
     expect(a.store.getCursor(channelId)).toBeGreaterThanOrEqual(cursorAfterFirst);
     expect(a.store.searchCache(channelId, "").length).toBe(2); // no duplicates
+  }, 60_000);
+});
+
+describe("structural digest posting (Task 7)", () => {
+  let relay7: RelayHandle;
+  let baseUrl: string;
+  const dirs7: string[] = [];
+  let prevThreshold: string | undefined;
+
+  beforeAll(async () => {
+    relay7 = await startRelay({ port: 0, maxMessages: 3 });
+    baseUrl = `http://127.0.0.1:${relay7.port}`;
+    prevThreshold = process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "3"; // force the watermark with a tiny fixture
+  });
+  afterAll(async () => {
+    if (prevThreshold === undefined) delete process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    else process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = prevThreshold;
+    await relay7?.stop();
+    for (const d of dirs7) rmSync(d, { recursive: true, force: true });
+  });
+  const tmp = () => {
+    const d = mkdtempSync(join(tmpdir(), "scm-digest-"));
+    dirs7.push(d);
+    return d;
+  };
+  const mkAgent = async (label: string) => {
+    const store = new Store(join(tmp(), `${label}.db`));
+    const bridge = new RelayBridge({ baseUrl, store });
+    const server = buildMcpServer({ store, bridge });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `t7-${label}`, version: "0.0.0" });
+    await Promise.all([client.connect(ct), server.connect(st)]);
+    return { client, store };
+  };
+
+  test("evicted range with decisions → one digest posted, no duplicate on refetch", async () => {
+    const a = await mkAgent("a");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    // 6 messages: 1 decision + 5 progress; relay retains only the last 3 →
+    // minSeq advances to 4, so the evicted-but-cached pending range (0,3]
+    // holds 3 messages = the env-tuned watermark. The member caches as it
+    // goes (fetch between sends) — a digest can only cover what this server
+    // has actually seen.
+    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: WAL mode for cache", kind: "decision", topic: "db" } });
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    for (let i = 1; i <= 5; i++) {
+      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "db" } });
+      if (i <= 2) await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    }
+    // fetch → gap kv advances → watermark (3 evicted-but-cached ≥ 3) → digest
+    // posted; the digest lands on the relay AFTER this poll, so the NEXT
+    // fetch is what caches it locally.
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    const digests = a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest");
+    expect(digests.length).toBe(1);
+    expect(digests[0].statement).toContain("decided: WAL mode for cache");
+    expect((digests[0].scope as Record<string, string>).covers).toBe("1-3");
+    // refetch → no duplicate (digested watermark + covers dedupe)
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    expect(a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest").length).toBe(1);
+  }, 60_000);
+
+  test("evicted range with zero high-value messages → no digest posted", async () => {
+    const a = await mkAgent("b");
+    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "b" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    for (let i = 1; i <= 4; i++) {
+      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+    }
+    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    expect(a.store.searchCache(channelId, "channel-digest").filter((m) => m.kind === "digest").length).toBe(0);
   }, 60_000);
 });
