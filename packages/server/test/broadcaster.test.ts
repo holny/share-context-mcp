@@ -67,7 +67,7 @@ class FakeBridge implements Pick<ChannelBridge, "poll" | "listen"> {
     const messages = q.filter((m) => typeof m.seq === "number" && (m.seq as number) > since);
     // Real bridge contract: cache + advance the cursor over the whole window.
     if (messages.length > 0) this.store.recordCursorFromMessages(channelId, messages);
-    return { messages, skipped: this.skippedByChannel.get(channelId) ?? 0 };
+    return { messages, skipped: this.skippedByChannel.get(channelId) ?? 0, encryptedCount: 0 };
   }
 
   listen(channelId: string, onNotify: (seq: number) => void): BridgeListener {

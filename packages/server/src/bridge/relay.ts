@@ -65,6 +65,10 @@ interface EnvelopeRow {
   seq: number;
   nonce: string;
   ciphertext: string;
+  /** Encrypted-toggle stamp (§11): 1 = sealed under a keyed envelope. */
+  encrypted?: number;
+  /** Present on encrypted rows: the key version the sender sealed with. */
+  keyVersion?: number;
 }
 
 export class RelayBridge implements ChannelBridge {
@@ -313,6 +317,15 @@ export class RelayBridge implements ChannelBridge {
       memberName,
       epoch: typeof meta.epoch === "number" ? meta.epoch : 1,
     });
+    // Sync the encrypted-toggle state (§11): a joining member must know the
+    // channel is encrypted and at which key version — it holds no key yet
+    // (keys travel out-of-band), so sends will fail with a readable error
+    // and polls will surface encryptedCount until the key is handed over.
+    this.store.setEncryptionState(
+      channelId,
+      meta.encrypted === true,
+      typeof meta.keyVersion === "number" ? meta.keyVersion : 0,
+    );
     this.defaultChannelId = channelId;
   }
 
@@ -320,7 +333,28 @@ export class RelayBridge implements ChannelBridge {
     const ch = this.channelIdFor(msg, channelId);
     const validated = validateClaim(msg);
     if (!validated.ok) throw new Error(validated.reason);
-    const envelope: SealedEnvelope = seal(validated.msg, this.channelKey(ch));
+    if (!this.store.getChannelSecret(ch)) throw new Error(`unknown channel: ${ch}`);
+    // Encrypted toggle (§11): encrypted channels seal with the CURRENT
+    // keyring key and carry its version; unencrypted channels carry
+    // plaintext JSON (the relay stores content in the clear by design).
+    const encState = this.store.encryptionState(ch);
+    let envelope: SealedEnvelope;
+    let keyVersion: number | undefined;
+    if (encState.encrypted) {
+      const key = this.store.messageKey(ch, encState.keyVersion);
+      if (!key) {
+        throw new Error(
+          `no message key for version ${encState.keyVersion} — ask the channel manager for the current key before sending`,
+        );
+      }
+      envelope = seal(validated.msg, key);
+      keyVersion = encState.keyVersion;
+    } else {
+      envelope = {
+        nonce: randomBytes(12).toString("base64"), // unused in plaintext mode; wire format stays uniform
+        ciphertext: Buffer.from(JSON.stringify(validated.msg), "utf8").toString("base64"),
+      };
+    }
     const res = (await this.request(`/channels/${ch}/messages`, {
       method: "POST",
       headers: { ...this.authHeaders(ch), "content-type": "application/json" },
@@ -328,6 +362,7 @@ export class RelayBridge implements ChannelBridge {
         nonce: envelope.nonce,
         ciphertext: envelope.ciphertext,
         idemKey: validated.msg.idempotencyKey,
+        ...(keyVersion !== undefined ? { keyVersion } : {}),
       }),
     })) as { seq?: unknown; deduped?: unknown };
     // A successful send is activity (spec §5.8): poll-mode listeners of this
@@ -379,20 +414,50 @@ export class RelayBridge implements ChannelBridge {
     }
     const out: ClaimMessage[] = [];
     let best = 0; // index of the last key that opened an envelope
+    let encryptedCount = 0; // encrypted rows this member could NOT open
     for (const env of envelopes) {
-      for (let i = 0; i < keys.length; i++) {
+      const isEncryptedRow = env.encrypted === 1;
+      // Encrypted rows (§11): the row's keyVersion selects the keyring entry;
+      // the channel key is NOT a fallback that can open them (keys are
+      // independent random secrets) — but trying it is harmless.
+      const candidates: Uint8Array[] = [];
+      if (isEncryptedRow && typeof env.keyVersion === "number") {
+        const ringKey = this.store.messageKey(channelId, env.keyVersion);
+        if (ringKey) candidates.push(ringKey);
+      }
+      candidates.push(...keys);
+      let opened: ClaimMessage | null = null;
+      for (let i = 0; i < candidates.length; i++) {
         try {
-          const msg = open({ nonce: env.nonce, ciphertext: env.ciphertext }, keys[(best + i) % keys.length]);
-          // Spec §5.9 server-side clamp: truncate (never drop) overlong
-          // content so the cache stays truthful to the cursor.
-          msg.statement = msg.statement.slice(0, LIMITS.statementMax);
-          if (msg.detail !== undefined) msg.detail = msg.detail.slice(0, LIMITS.detailMax);
-          out.push({ ...msg, seq: env.seq });
-          best = (best + i) % keys.length;
+          opened = open({ nonce: env.nonce, ciphertext: env.ciphertext }, candidates[(best + i) % candidates.length]);
+          best = (best + i) % candidates.length;
           break;
         } catch {
-          // wrong epoch key — try the next candidate before giving up
+          // wrong key — try the next candidate before giving up
         }
+      }
+      if (!opened && !isEncryptedRow) {
+        // Plaintext rows (§11 default): base64(JSON) with no seal. Legacy
+        // sealed rows stamped encrypted=0 fall through JSON parse to the
+        // key candidates above.
+        try {
+          const parsed = JSON.parse(Buffer.from(env.ciphertext, "base64").toString("utf8")) as ClaimMessage;
+          if (typeof parsed?.statement === "string" && typeof parsed?.kind === "string" && typeof parsed?.topic === "string") {
+            opened = parsed;
+          }
+        } catch {
+          // not plaintext JSON — legacy sealed row already tried above
+        }
+      }
+      if (opened) {
+        const msg = opened;
+        // Spec §5.9 server-side clamp: truncate (never drop) overlong
+        // content so the cache stays truthful to the cursor.
+        msg.statement = msg.statement.slice(0, LIMITS.statementMax);
+        if (msg.detail !== undefined) msg.detail = msg.detail.slice(0, LIMITS.detailMax);
+        out.push({ ...msg, seq: env.seq });
+      } else if (isEncryptedRow) {
+        encryptedCount++;
       }
     }
     if (out.length > 0) this.store.cacheMessages(channelId, out);
@@ -406,7 +471,7 @@ export class RelayBridge implements ChannelBridge {
     // (Review F3): the broadcaster's background poll passes markActivity:
     // false — self-marking would keep poll mode at the active pace forever.
     if (opts?.markActivity !== false) this.markListeners(channelId);
-    return { messages: out, skipped: envelopes.length - out.length, minSeq };
+    return { messages: out, skipped: envelopes.length - out.length, encryptedCount, minSeq };
   }
 
   /**
@@ -470,7 +535,30 @@ export class RelayBridge implements ChannelBridge {
       admissionMode: data.admissionMode as string | undefined,
       invitePolicy: data.invitePolicy as string | undefined,
       contactInfo: (data.contactInfo as string | null | undefined) ?? null,
+      encrypted: data.encrypted === true,
+      keyVersion: typeof data.keyVersion === "number" ? data.keyVersion : 0,
     };
+  }
+
+  /**
+   * Encrypted toggle (§11, manager/creator CLI op): flips the channel
+   * boolean at the relay. Toggle-ON mints the next key version CLIENT-SIDE
+   * (random 32 bytes, independent of the admission credential) and stores it
+   * in the local keyring; the relay only counts versions. Toggle-OFF leaves
+   * the keyring intact so old encrypted rows stay readable.
+   */
+  async setEncryption(channelId: string, encrypted: boolean): Promise<void> {
+    const res = await this.request(`/channels/${channelId}/set-encryption`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({ encrypted }),
+    });
+    const keyVersion = typeof res.keyVersion === "number" ? res.keyVersion : 0;
+    if (encrypted) {
+      if (keyVersion < 1) throw new Error("relay did not mint a key version for the encrypted channel");
+      this.store.setMessageKey(channelId, keyVersion, new Uint8Array(randomBytes(32)));
+    }
+    this.store.setEncryptionState(channelId, encrypted, keyVersion);
   }
 
   /** Presence receipts: POST the member's last-activity timestamp to the relay,
@@ -535,8 +623,7 @@ export class RelayBridge implements ChannelBridge {
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
   }
 
-  async leave(channelId: string, opts?: { transferTo?: string }): Promise<void> {
-    // Governance leave (§2): succession + dissolution live at the relay.
+  async leave(channelId: string, opts?: { transferTo?: string }): Promise<void> {    // Governance leave (§2): succession + dissolution live at the relay.
     // Local cleanup only after the relay accepted the departure.
     await this.request(`/channels/${channelId}/leave`, {
       method: "POST",

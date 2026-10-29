@@ -190,9 +190,9 @@ export class S3Bridge implements ChannelBridge {
   async poll(channelId: string, since: number, _opts?: { markActivity?: boolean }): Promise<PollResult> {
     const s = this.secret(channelId);
     const head = await this.getJson<{ nextSeq: number; epoch: number }>(s, `channels/${channelId}/state/head.json`);
-    if (!head) return { messages: [], skipped: 0 };
+    if (!head) return { messages: [], skipped: 0, encryptedCount: 0 };
     const high = head.data.nextSeq - 1;
-    if (high <= since) return { messages: [], skipped: 0 };
+    if (high <= since) return { messages: [], skipped: 0, encryptedCount: 0 };
     const conn = this.conn(s);
     // List every message key after the padded `since` position, ascending.
     const listPrefix = `${conn.prefix}/channels/${channelId}/messages/`;
@@ -227,7 +227,7 @@ export class S3Bridge implements ChannelBridge {
       if (!delivered) skipped++;
     }
     out.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    return { messages: out, skipped };
+    return { messages: out, skipped, encryptedCount: 0 };
   }
 
   async meta(channelId: string): Promise<ChannelMeta> {

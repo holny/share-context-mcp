@@ -22,6 +22,10 @@ export interface ChannelRow {
   vote_cooldown_until: number | null;
   /** Governance kick (password tier): joins with the old credential are rejected. */
   admission_credential_revoked: number;
+  /** Encrypted toggle (governance v2 §11): 1 = new messages carry key_version. */
+  encrypted: number;
+  /** Message-key version counter; bumps on every toggle-ON (blind counter). */
+  key_version: number;
   /** base64 of HMAC-SHA256(channelKey, "verify") — proves possession, cannot decrypt */
   verify_key: string;
   created_at: string;
@@ -104,6 +108,12 @@ export function openDb(dbPath: string): Database {
     // User/consumer model (governance v2 §3): members reference a
     // relay-global user row; the session token binds to the user.
     try { db.exec("ALTER TABLE members ADD COLUMN user_id TEXT"); } catch {}
+    // Encrypted toggle (governance v2 §11): channel-level boolean + key
+    // version counter, INDEPENDENT of admission mode; per-message stamps.
+    try { db.exec("ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { db.exec("ALTER TABLE channels ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { db.exec("ALTER TABLE messages ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { db.exec("ALTER TABLE messages ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
     db.exec(`
       CREATE TABLE IF NOT EXISTS users(
         user_id TEXT PRIMARY KEY,
@@ -207,6 +217,8 @@ export function openDb(dbPath: string): Database {
       contact_info TEXT,
       vote_cooldown_until INTEGER,
       admission_credential_revoked INTEGER NOT NULL DEFAULT 0,
+      encrypted INTEGER NOT NULL DEFAULT 0,
+      key_version INTEGER NOT NULL DEFAULT 0,
       verify_key TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
@@ -235,6 +247,8 @@ export function openDb(dbPath: string): Database {
       ciphertext TEXT NOT NULL,
       idem_key TEXT NOT NULL,
       created_at TEXT NOT NULL,
+      encrypted INTEGER NOT NULL DEFAULT 0,
+      key_version INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(channel_id, seq)
     );
 

@@ -728,7 +728,7 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
       // DELTA mode: poll the relay, serve the undelivered window.
       const consumerDelivered = deliveredFor(consumerIdFromExtra(extra));
       const prevHigh = store.getCursor(ch);
-      await bridge.poll(ch, prevHigh);
+      const pollResult = await bridge.poll(ch, prevHigh);
       const high = store.getCursor(ch);
       // Digest failure must not break the fetch (see joinCard note).
       await maybePostDigest(bridge, store, ch).catch((e: unknown) => {
@@ -756,6 +756,18 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
       // Surface open governance votes so agents can perceive and cast via
       // cast_vote without extra polling.
       const openVotes = await openVotesIfAny(ch);
+      // Encrypted-toggle visibility (§11): how many sealed messages arrived
+      // that this member cannot read, with a hint naming who holds the keys.
+      const encryptedCount = pollResult.encryptedCount ?? 0;
+      let encryptedNote: string | undefined;
+      if (encryptedCount > 0) {
+        let managerName = "the channel manager";
+        try {
+          const meta = await bridge.meta(ch);
+          managerName = meta.managerMember ?? meta.creatorMember ?? managerName;
+        } catch { /* meta is decorative here — keep the generic hint */ }
+        encryptedNote = `[🔒 ${encryptedCount} messages encrypted — contact ${managerName} for access]`;
+      }
       return quoteWrap(
         JSON.stringify({
           channelId: ch,
@@ -763,6 +775,8 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
           skipped,
           cursor: high,
           remaining,
+          encryptedCount,
+          ...(encryptedNote ? { encryptedNote } : {}),
           ...(openVotes ? { openVotes } : {}),
         }),
       );

@@ -186,7 +186,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     timer.unref();
   }
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked FROM channels WHERE id = ?");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
@@ -203,9 +203,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   `);
   const stmtClearTokens = db.prepare("UPDATE members SET token_hash = NULL, token_expires_at = NULL WHERE channel_id = ?");
   const stmtBumpEpoch = db.prepare("UPDATE channels SET epoch = epoch + 1 WHERE id = ?");
-  const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, sender, nonce, ciphertext, idem_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, sender, nonce, ciphertext, idem_key, created_at, encrypted, key_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
   const stmtMessageByIdem = db.prepare("SELECT seq FROM messages WHERE channel_id = ? AND idem_key = ?");
-  const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
+  const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext, encrypted, key_version FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
   // Returns the LIVE epoch alongside the allocated seq so push notifications
   // are allocated atomically with the message (a concurrent rotate cannot
   // split seq from its epoch).
@@ -711,7 +711,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   const storeMessage = db.transaction(
-    (channelId: string, sender: string, nonce: string, ciphertext: string, idemKey: string): { seq: number; epoch: number; deduped: boolean } => {
+    (channelId: string, sender: string, nonce: string, ciphertext: string, idemKey: string, encrypted: number, keyVersion: number): { seq: number; epoch: number; deduped: boolean } => {
       const existing = stmtMessageByIdem.get(channelId, idemKey) as { seq: number } | undefined;
       if (existing) {
         return { seq: existing.seq, epoch: 0, deduped: true };
@@ -724,7 +724,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         // unreachable: channel existence verified in authenticate()
         throw new Error("channel vanished mid-transaction");
       }
-      stmtInsertMessage.run(channelId, allocated.seq, sender, nonce, ciphertext, idemKey, new Date().toISOString());
+      stmtInsertMessage.run(channelId, allocated.seq, sender, nonce, ciphertext, idemKey, new Date().toISOString(), encrypted, keyVersion);
       return { seq: allocated.seq, epoch: allocated.epoch, deduped: false };
     },
   );
@@ -842,7 +842,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit|me))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|set-encryption|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit|me))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -1426,6 +1426,37 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         });
       }
 
+      case "set-encryption": {
+        // Encrypted toggle (§11): manager/creator flips the channel-level
+        // boolean. Toggle-ON bumps key_version (the client generates and
+        // holds the actual key — the relay stays blind, counting versions).
+        // Toggle-OFF leaves the counter intact: old encrypted rows remain
+        // readable to key holders; new messages go out plaintext.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const wanted = parsed.body.encrypted;
+        if (typeof wanted !== "boolean") {
+          return jsonError(400, "invalid request: encrypted must be a boolean");
+        }
+        let keyVersion = auth.channel.key_version ?? 0;
+        if (wanted) {
+          keyVersion += 1;
+          db.prepare("UPDATE channels SET encrypted = 1, key_version = ? WHERE id = ?").run(keyVersion, channelId);
+        } else {
+          db.prepare("UPDATE channels SET encrypted = 0 WHERE id = ?").run(channelId);
+        }
+        audit(channelId, auth.member.name, "encryption.changed", channelId, wanted ? `on keyVersion=${keyVersion}` : `off keyVersion=${keyVersion}`);
+        wsHub?.notifyGovernance(channelId, { type: "encryption-changed", encrypted: wanted, keyVersion });
+        return json({ ok: true, encrypted: wanted, keyVersion });
+      }
+
       case "dissolve": {
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
@@ -1470,7 +1501,23 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           if (Buffer.from(ciphertext, "base64").length > MAX_CIPHERTEXT_BYTES) {
             return jsonError(413, "message too large: ciphertext must be at most 8192 bytes");
           }
-          const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey);
+          // Encrypted-toggle stamping (§11): the RELAY owns the row stamps —
+          // clients cannot lie a row into (or out of) the encrypted state.
+          // Re-read the live channel row: the auth snapshot may predate a
+          // concurrent set-encryption.
+          const liveChannel = stmtChannel.get(channelId) as ChannelRow | undefined;
+          const channelEncrypted = (liveChannel?.encrypted ?? 0) === 1;
+          let encrypted = 0;
+          let keyVersion = 0;
+          if (channelEncrypted) {
+            const kv = parsed.body.keyVersion;
+            if (typeof kv !== "number" || !Number.isInteger(kv) || kv < 1) {
+              return jsonError(400, "invalid request: keyVersion (integer >= 1) required on an encrypted channel");
+            }
+            encrypted = 1;
+            keyVersion = kv;
+          }
+          const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey, encrypted, keyVersion);
           if (!stored.deduped) {
             // Push-wake only (spec §5.7): notifications carry seq+epoch, never
             // content. Dedup re-sends nothing (the original insert already
@@ -1494,9 +1541,17 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
             seq: number;
             nonce: string;
             ciphertext: string;
+            encrypted: number;
+            key_version: number;
           }>;
           return json({
-            messages: rows,
+            messages: rows.map((r) => ({
+              seq: r.seq,
+              nonce: r.nonce,
+              ciphertext: r.ciphertext,
+              encrypted: r.encrypted,
+              ...(r.encrypted === 1 ? { keyVersion: r.key_version } : {}),
+            })),
             nextSeq: auth.channel.next_seq,
             minSeq: auth.channel.min_seq ?? 1,
           });
@@ -1542,6 +1597,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           admissionMode: auth.channel.admission_mode ?? "password",
           invitePolicy: auth.channel.invite_policy ?? "everyone",
           contactInfo: auth.channel.contact_info,
+          encrypted: (auth.channel.encrypted ?? 0) === 1,
+          keyVersion: auth.channel.key_version ?? 0,
           members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at, lastActiveAt: m.last_active_at })),
         });
       }

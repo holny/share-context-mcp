@@ -57,6 +57,9 @@ export interface ChannelMeta {
   invitePolicy?: string;
   contactInfo?: string | null;
   minSeq?: number;
+  /** Encrypted toggle (§11, relay-backed bridges). */
+  encrypted?: boolean;
+  keyVersion?: number;
 }
 
 export interface PollResult {
@@ -68,6 +71,13 @@ export interface PollResult {
    * them regardless — they must never block the stream (spec §5.7).
    */
   skipped: number;
+  /**
+   * Encrypted rows (encrypted toggle, §11) in the window this member could
+   * NOT open — no keyring entry for the row's key version. Subset of
+   * `skipped`; surfaced so the agent can be told how many messages exist
+   * that it cannot read.
+   */
+  encryptedCount: number;
   /**
    * Lowest seq the relay still retains (relay-backed bridges only). When the
    * relay has evicted a prefix below the consumer's cursor, the cursor is

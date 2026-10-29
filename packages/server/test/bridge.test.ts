@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
-import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
+import { validateClaim, deriveChannelKey, seal, type ClaimMessage } from "@share-context-mcp/protocol";
 import { RelayBridge } from "../src/bridge/relay";
 import { S3Bridge } from "../src/bridge/s3";
 import { startFakeS3 } from "../src/bridge/fake-s3";
@@ -78,7 +78,7 @@ describe("RelayBridge against a real relay", () => {
     expect(storeB.getCursor(channelId)).toBe(3);
 
     // incremental poll from the cursor is empty
-    expect(await mbB.poll(channelId, 3)).toEqual({ messages: [], skipped: 0, minSeq: 1 });
+    expect(await mbB.poll(channelId, 3)).toEqual({ messages: [], skipped: 0, minSeq: 1, encryptedCount: 0 });
     // empty poll must not regress the cursor
     expect(storeB.getCursor(channelId)).toBe(3);
   });
@@ -208,8 +208,22 @@ describe("RelayBridge against a real relay", () => {
   });
 
   test("C-1: cursor high-waters over the relay window — 201 old-epoch envelopes cannot livelock or block a fresh member", async () => {
-    const { channelId } = await mbA.createChannel({ memberName: "a" });
-    for (let i = 1; i <= 201; i++) await mbA.send(claim(`old epoch ${i}`, "a"));
+    const { channelId, password: oldPassword } = await mbA.createChannel({ memberName: "a" });
+    // Seed 201 SEALED envelopes under the OLD epoch key via raw HTTP —
+    // bypassing the bridge's plaintext default, because the scenario under
+    // test is undecryptable CIPHERTEXT (exactly what a pre-rotate member's
+    // sealed messages look like to a fresh joiner).
+    const oldKey = deriveChannelKey(oldPassword, channelId);
+    for (let i = 1; i <= 201; i++) {
+      const result = validateClaim(claim(`old epoch ${i}`, "a"));
+      if (!result.ok) throw new Error(`fixture invalid: ${result.reason}`);
+      const env = seal(result.msg, oldKey);
+      await fetch(`${baseUrl}/channels/${channelId}/messages`, {
+        method: "POST",
+        headers: { ...mbA.authHeaders(channelId), "content-type": "application/json" },
+        body: JSON.stringify({ nonce: env.nonce, ciphertext: env.ciphertext, idemKey: `c1-${i}` }),
+      });
+    }
     await mbA.rotate(channelId, "brand-new-password");
     await mbA.join(channelId, "brand-new-password", "a");
     const newMsg = await mbA.send(claim("new epoch begins", "a"));
