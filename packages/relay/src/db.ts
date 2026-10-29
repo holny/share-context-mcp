@@ -108,6 +108,11 @@ export function openDb(dbPath: string): Database {
     // User/consumer model (governance v2 §3): members reference a
     // relay-global user row; the session token binds to the user.
     try { db.exec("ALTER TABLE members ADD COLUMN user_id TEXT"); } catch {}
+    // Activity/permission roles (governance v2 §4/§5): one permission role
+    // (governance tier) + one activity role (daily scan) per member.
+    try { db.exec("ALTER TABLE members ADD COLUMN permission_role TEXT NOT NULL DEFAULT 'regular'"); } catch {}
+    try { db.exec("ALTER TABLE members ADD COLUMN activity_role TEXT"); } catch {}
+    try { db.exec("ALTER TABLE members ADD COLUMN activity_expires_at INTEGER"); } catch {}
     // Encrypted toggle (governance v2 §11): channel-level boolean + key
     // version counter, INDEPENDENT of admission mode; per-message stamps.
     try { db.exec("ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
@@ -236,6 +241,9 @@ export function openDb(dbPath: string): Database {
       status TEXT NOT NULL DEFAULT 'active',
       can_invite INTEGER NOT NULL DEFAULT 1,
       user_id TEXT,
+      permission_role TEXT NOT NULL DEFAULT 'regular',
+      activity_role TEXT,
+      activity_expires_at INTEGER,
       PRIMARY KEY(channel_id, name)
     );
 
