@@ -80,7 +80,7 @@ export function createWsHub(): WsHub {
     notifyGovernance(channelId, frame) {
       const s = channels.get(channelId);
       if (!s) return;
-      const text = JSON.stringify({ type: "governance", ...frame });
+      const text = JSON.stringify({ governance: true, ...frame });
       for (const ws of s) ws.send(text);
     },
 

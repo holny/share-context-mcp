@@ -319,6 +319,7 @@ export class Store {
     const tx = this.db.transaction((ch: string) => {
       this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(ch);
       this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(ch);
+      this.db.prepare("DELETE FROM consumer_channels WHERE channel_id = ?").run(ch);
       // FTS mirror cleanup: orphan rows are otherwise only reclaimed lazily
       // when a later insert happens to reuse their rowid.
       this.db
@@ -538,7 +539,7 @@ export class Store {
 
   listConsumerChannels(consumerId: string): Array<{ channelId: string; joinedAt: string }> {
     return this.db
-      .prepare("SELECT channel_id, joined_at FROM consumer_channels WHERE consumer_id = ? ORDER BY joined_at ASC")
+      .prepare("SELECT channel_id AS channelId, joined_at FROM consumer_channels WHERE consumer_id = ? ORDER BY joined_at ASC")
       .all(consumerId) as Array<{ channelId: string; joinedAt: string }>;
   }
 

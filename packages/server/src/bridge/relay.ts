@@ -243,7 +243,7 @@ export class RelayBridge implements ChannelBridge {
 
   // ---- ChannelBridge ----
 
-  async createChannel(opts: { name?: string; memberName: string; gitUrl?: string }): Promise<{ channelId: string; password: string }> {
+  async createChannel(opts: { name?: string; memberName: string; gitUrl?: string; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }> {
     // `name` is a local display label in v1; the blind relay stores no title.
     void opts.name;
     const channelId = generateChannelId();
@@ -255,6 +255,8 @@ export class RelayBridge implements ChannelBridge {
       body: JSON.stringify({
         channelId,
         memberName: opts.memberName,
+        admissionMode: opts.admissionMode,
+        contactInfo: opts.contactInfo,
         verifyKeyB64: deriveVerifyKeyB64(key),
       }),
     });
@@ -361,11 +363,17 @@ export class RelayBridge implements ChannelBridge {
     // earlier epoch is opened with its RETAINED old password (spec §5.5 —
     // local holders of the old key keep reading old-epoch ciphertext). A
     // member who never held the old password simply fails to open it.
+    // Self-contained credentials (scmc1-): the message key unwraps from the
+    // credential, NOT from HKDF(password) — C-1 fix.
     const secret = this.store.getChannelSecret(channelId);
     if (!secret) throw new Error(`unknown channel: ${channelId}`);
-    const keys: Uint8Array[] = [deriveChannelKey(secret.password, channelId)];
+    const keys: Uint8Array[] = [this.channelKey(channelId)];
     for (const { password } of this.store.epochPasswords(channelId)) {
-      keys.push(deriveChannelKey(password, channelId));
+      keys.push(
+        password.startsWith("scmc1-")
+          ? parseAdmissionCredential(password)
+          : deriveChannelKey(password, channelId),
+      );
     }
     const out: ClaimMessage[] = [];
     let best = 0; // index of the last key that opened an envelope

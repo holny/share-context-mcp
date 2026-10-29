@@ -50,6 +50,13 @@ export interface ChannelMember {
 export interface ChannelMeta {
   members: ChannelMember[];
   nextSeq: number;
+  /** Governance roles (relay-backed bridges). */
+  creatorMember?: string | null;
+  managerMember?: string | null;
+  admissionMode?: string;
+  invitePolicy?: string;
+  contactInfo?: string | null;
+  minSeq?: number;
 }
 
 export interface PollResult {

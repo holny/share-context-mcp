@@ -18,6 +18,11 @@ function arg(name: string): string | undefined {
   return undefined;
 }
 
+/** Bare boolean flag: `--name` present (no value consumed). */
+function flag(name: string): boolean {
+  return process.argv.includes(`--${name}`) || process.argv.some((a) => a.startsWith(`--${name}=`));
+}
+
 function relayUrl(): string {
   return (arg("relay-url") ?? process.env.SHARE_CONTEXT_RELAY_URL ?? "http://127.0.0.1:8931").replace(/\/+$/, "");
 }
@@ -60,10 +65,15 @@ async function cmdCreateChannel() {
 }
 
 async function cmdJoin() {
-  const { Store } = await import("@share-context-mcp/server");
-  const { RelayBridge } = await import("@share-context-mcp/server");
+  const { Store, RelayBridge } = await import("@share-context-mcp/server");
   const store = new Store(dbPath());
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
+  const inviteCode = arg("invite-code");
+  if (inviteCode) {
+    await bridge.joinWithInvite(arg("channel-id")!, inviteCode, arg("member")!);
+    console.log(`\n✅ Joined channel ${arg("channel-id")} as ${arg("member")} (via invite code)\n`);
+    return;
+  }
   await bridge.join(arg("channel-id")!, arg("password")!, arg("member")!);
   console.log(`\n✅ Joined channel ${arg("channel-id")} as ${arg("member")}\n`);
 }
@@ -78,7 +88,8 @@ async function cmdStatus() {
     try {
       const meta = await bridge.meta(ch);
       console.log(`\n📡 ${ch} (${store.getChannelSecret(ch)?.memberName ?? "?"})`);
-      console.log(`   members: ${meta.members.map((m) => m.memberName).join(", ")}`);
+      console.log(`   creator: ${meta.creatorMember ?? "?"}  manager: ${meta.managerMember ?? "?"}  mode: ${meta.admissionMode ?? "password"}${meta.contactInfo ? `\n   contact: ${meta.contactInfo}` : ""}`);
+      console.log(`   members: ${meta.members.map((m) => `${m.memberName}${m.lastActiveAt ? "" : " (idle)"}`).join(", ")}`);
     } catch (e) { console.log(`\n📡 ${ch} — error`); }
   }
 }
@@ -245,7 +256,7 @@ async function cmdChannelTransfer() {
 
 async function cmdChannelDissolve() {
   const id = requireId();
-  if (!arg("yes")) { console.error("This permanently deletes the channel for everyone. Re-run with --yes to confirm."); process.exit(1); }
+  if (!flag("yes")) { console.error("This permanently deletes the channel for everyone. Re-run with --yes to confirm."); process.exit(1); }
   const { store, bridge } = await govBridge();
   const res = await fetch(`${relayUrl()}/channels/${id}/dissolve`, {
     method: "POST",
@@ -285,8 +296,8 @@ async function cmdRotate() {
   const secret = store.getChannelSecret(id);
   if (!secret) { console.error(`Error: not joined: ${id}`); process.exit(1); }
   const memberCount = (await (await fetch(`${relayUrl()}/channels/${id}/meta`, { headers: bridge.authHeaders(id) })).json() as { members: unknown[] }).members.length;
-  const { mintAdmissionCredential, deriveChannelKey } = await import("@share-context-mcp/protocol");
-  const channelKey = deriveChannelKey(secret.password ?? "", id);
+  const { mintAdmissionCredential } = await import("@share-context-mcp/protocol");
+  const channelKey = bridge.channelKey(id);
   const { credential, verifyKeyB64 } = mintAdmissionCredential(channelKey);
   if (mode === "access") {
     // credential swap only: new verify hash, same wrapped key, tokens kept
@@ -297,19 +308,21 @@ async function cmdRotate() {
     });
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (res.status >= 400) { console.error(`Error: ${body.error ?? res.status}`); process.exit(1); }
+    store.upsertChannel({ channelId: id, password: credential, memberName: secret.memberName, epoch: secret.epoch });
     console.log(`✅ admission credential rotated (access mode).\nNew credential (share with NEW members only — existing members are unaffected):\n${credential}`);
     if (memberCount > 1) console.log(`\nNote: ${memberCount - 1} other member(s) keep their tokens — no action needed for them.`);
   } else {
     // full: new password → new channel key + epoch bump (current rotate endpoint)
     const newPassword = arg("password") ?? randomBytes(20).toString("base64url");
     await bridge.rotate(id, newPassword);
-    console.log(`✅ FULL rotation: new password = ${newPassword}\n⚠️  ${memberCount - 1} other member(s) MUST re-join with this password — their old session is dead.`);
+    console.log(`✅ FULL rotation: new password = ${newPassword}\n⚠️  ALL members (including you) MUST re-join with this password — every old session is dead.`);
   }
 }
 
 async function cmdInvite() {
   const id = requireId();
   const ttlHours = Number(arg("ttl") ?? 168);
+  if (Number.isNaN(ttlHours) || ttlHours <= 0) { console.error("Error: --ttl must be a positive number of hours"); process.exit(1); }
   const { store, bridge } = await govBridge();
   const secret = store.getChannelSecret(id);
   if (!secret) { console.error(`Error: not joined: ${id}`); process.exit(1); }
@@ -325,14 +338,8 @@ async function cmdInvite() {
 async function cmdTokenRefresh() {
   const id = requireId();
   const { bridge } = await govBridge();
-  const res = await fetch(`${relayUrl()}/channels/${id}/token-refresh`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...bridge.authHeaders(id) },
-    body: JSON.stringify({}),
-  });
-  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  if (res.status >= 400) { console.error(`Error: ${body.error ?? res.status}`); process.exit(1); }
-  console.log("✅ token refreshed");
+  await bridge.refreshToken(id);
+  console.log("✅ token refreshed (new token stored locally; the old one is dead)");
 }
 
 async function cmdVoteStart() {
@@ -343,7 +350,7 @@ async function cmdVoteStart() {
   const body: Record<string, unknown> = { type, target };
   const reason = arg("reason");
   if (reason) body.reason = reason;
-  if (arg("revoke-invitees")) body.revokeInvitees = true;
+  if (flag("revoke-invitees")) body.revokeInvitees = true;
   const out = await relayPostJson(channelId, "/votes", body);
   console.log(`✅ vote ${out.voteId} opened (target: ${target}) — closes in 48h or at early resolution`);
 }

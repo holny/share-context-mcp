@@ -293,7 +293,6 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   const stmtInitiatorLastFail = db.prepare(
     "SELECT MAX(ends_at) AS t FROM votes WHERE channel_id = ? AND initiator = ? AND status = 'failed'",
   );
-  const stmtSettleFreeze = db.prepare("UPDATE invite_codes SET status = 'revoked' WHERE channel_id = ? AND status = 'frozen'");
 
   /** Active member names — the vote denominator universe. */
   function activeMemberNames(channelId: string): string[] {
@@ -561,8 +560,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     const member = stmtMemberByToken.get(channelId, sha256Hex(token)) as MemberRow | undefined;
     if (!member) {
       if (process.env.SCM_DEBUG) {
-        const all = db.prepare("SELECT channel_id, name, substr(token_hash,1,10) AS h, status FROM members").all();
-        console.error("auth-debug: no member by token", channelId, sha256Hex(token).slice(0, 10), JSON.stringify(all));
+        // Same-channel only: never dump cross-channel member data.
+        const all = db.prepare("SELECT name, status FROM members WHERE channel_id = ?").all(channelId);
+        console.error("auth-debug: no member by token", channelId, JSON.stringify(all));
       }
       return null;
     }
@@ -572,20 +572,22 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       return null;
     }
     const memberBanned = member.status === "banned";
-    // Consumer binding: a presented consumer id is auto-registered (a valid
-    // member token IS the membership proof — multi-session processes must
-    // just work); the binding's enforcement point is the BAN check below.
+    // Consumer binding: a presented consumer id must not be consumer-banned
+    // (any ban row in the channel — same rule as the admission gate), and is
+    // auto-registered/refreshed. Writes are skipped for read-only requests
+    // (last_seen refresh is a write; polling hot paths stay read-only).
     const consumer = req.headers.get("x-scm-consumer");
     let consumerBanned = false;
+    const isWrite = req.method !== "GET";
     if (consumer !== null && consumer !== "") {
-      const banRow = stmtBanRow.get(channelId, member.name) as { consumer_ids: string | null } | undefined;
-      if (banRow?.consumer_ids) {
+      const banRows = db.prepare("SELECT name, consumer_ids FROM member_bans WHERE channel_id = ? AND consumer_ids IS NOT NULL").all(channelId) as Array<{ name: string; consumer_ids: string }>;
+      for (const row of banRows) {
         try {
-          const bannedConsumers: string[] = JSON.parse(banRow.consumer_ids);
+          const bannedConsumers: string[] = JSON.parse(row.consumer_ids);
           if (Array.isArray(bannedConsumers) && bannedConsumers.includes(consumer)) consumerBanned = true;
         } catch { /* malformed ban entry — ignore consumer check */ }
       }
-      if (!consumerBanned) {
+      if (!consumerBanned && isWrite) {
         stmtRegisterConsumer.run(channelId, member.name, consumer, new Date().toISOString());
       }
     }
@@ -1441,8 +1443,10 @@ export function authenticateUpgradeToken(db: Database, channelId: string, token:
     | undefined;
   if (!channel) return null;
   const member = db.prepare(
-    "SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at FROM members WHERE channel_id = ? AND token_hash = ?",
+    "SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status FROM members WHERE channel_id = ? AND token_hash = ?",
   ).get(channelId, sha256Hex(token)) as MemberRow | undefined;
   if (!member || !isLiveToken(member, channel, Date.now())) return null;
+  // Governance: banned members lose realtime too (F-1/H-6 parity with HTTP).
+  if (member.status === "banned") return null;
   return { channelId, memberName: member.name, epoch: channel.epoch };
 }

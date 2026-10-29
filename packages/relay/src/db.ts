@@ -47,6 +47,7 @@ export interface MemberRow {
 export interface MessageRow {
   channel_id: string;
   seq: number;
+  sender: string | null;
   nonce: string;
   ciphertext: string;
   idem_key: string;
@@ -73,6 +74,17 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN can_invite INTEGER NOT NULL DEFAULT 1"); } catch {}
     try { db.exec("ALTER TABLE messages ADD COLUMN sender TEXT"); } catch {}
+    // Role backfill: pre-governance databases have NULL creator/manager —
+    // adopt the earliest joined member (the original creator) so management
+    // operations keep working (H-7).
+    try {
+      db.exec(`
+        UPDATE channels SET creator_member = (
+          SELECT name FROM members WHERE members.channel_id = channels.id ORDER BY members.joined_at ASC LIMIT 1
+        ) WHERE creator_member IS NULL;
+        UPDATE channels SET manager_member = creator_member WHERE manager_member IS NULL;
+      `);
+    } catch {}
     db.exec(`
       CREATE TABLE IF NOT EXISTS member_bans(
         channel_id TEXT NOT NULL REFERENCES channels(id),
