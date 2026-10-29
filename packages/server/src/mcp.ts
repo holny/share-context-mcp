@@ -11,10 +11,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { CLAIM_KINDS, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { INSTRUCTIONS } from "./instructions";
-import { generateGroupedPassword } from "./bridge/relay";
 import { buildDigestMessages } from "./digest";
 import type { ChannelBridge, Store } from "./index";
 
+/**
+ * Tool surface for the DEFAULT (relay-backed) bridge. git/S3 bridges omit
+ * `cast_vote` (relay-tier governance). Responses all echo `channelId`.
+ */
 export const TOOL_NAMES = [
   "share_update",
   "fetch_updates",
@@ -25,8 +28,8 @@ export const TOOL_NAMES = [
   "create_channel",
   "join_channel",
   "leave_channel",
-  "cast_vote",
   "list_channels",
+  "cast_vote",
 ] as const;
 
 const SERVER_NAME = "share-context-mcp";
@@ -678,10 +681,14 @@ Also re-check after a break and before finalizing work others depend on. Returns
       // Surface open governance votes (relay-backed bridges only) so agents
       // can perceive and cast via cast_vote without extra polling.
       let openVotes: Array<{ id: string; type: string; target: string; endsAt: number }> | undefined;
-      try {
-        if (bridge.governance) openVotes = (await bridge.votes(ch)).open;
-      } catch {
-        /* votes are best-effort visibility */
+      if (bridge.governance) {
+        try {
+          openVotes = (await bridge.votes(ch)).open;
+        } catch (e: unknown) {
+          // best-effort visibility — but auth failures matter to the agent
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes("401") || msg.includes("403")) console.error(`share-context-mcp: votes visibility failed: ${msg}`);
+        }
       }
       return quoteWrap(
         JSON.stringify({ channelId: ch, messages: served, skipped, cursor: high, remaining, ...(openVotes ? { openVotes } : {}) }),
@@ -767,7 +774,7 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
     safe(async ({ filters, channelId }) => {
       const ch = resolveChannel(store, channelId);
       store.setSubscription(ch, filters);
-      return JSON.stringify({ ok: true, filters });
+      return JSON.stringify({ ok: true, filters, channelId: ch });
     }),
   );
 

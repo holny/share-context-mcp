@@ -357,7 +357,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const filters = [{ kinds: ["decision", "contract"] }, { topic: "auth" }];
     const res = await a.client.callTool({ name: "set_subscription", arguments: { filters } });
-    expect(JSON.parse(textOf(res))).toEqual({ ok: true, filters });
+    expect(JSON.parse(textOf(res))).toEqual({ ok: true, filters, channelId });
     expect(a.store.getKv(`subscription:${channelId}`)).toBe(JSON.stringify(filters));
   });
 

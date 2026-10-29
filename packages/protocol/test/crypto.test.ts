@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deriveChannelKey, seal, open, hmacProof } from "../src/crypto";
+import { deriveChannelKey, seal, open, hmacProof, mintAdmissionCredential, parseAdmissionCredential, mintInviteCode, parseInviteCode } from "../src/crypto";
 import { validateClaim, type ClaimMessage } from "../src/schema";
 
 function validInput() {
@@ -99,5 +99,38 @@ describe("hmacProof", () => {
       .update(Buffer.from(nonceB64, "base64"))
       .digest("base64");
     expect(hmacProof(key, nonceB64)).toBe(expected);
+  });
+});
+
+describe("self-contained credentials", () => {
+  const channelKey = deriveChannelKey("test-password", "testchannel01");
+
+  test("admission credential round trip unwraps the exact channel key", () => {
+    const { credential, verifyKeyB64 } = mintAdmissionCredential(channelKey);
+    expect(credential.startsWith("scmc1-")).toBe(true);
+    const unwrapped = parseAdmissionCredential(credential);
+    expect(Array.from(unwrapped)).toEqual(Array.from(channelKey));
+    expect(verifyKeyB64).not.toBeNull();
+  });
+
+  test("message key never derives from the credential text", () => {
+    const { credential } = mintAdmissionCredential(channelKey);
+    const wrong = deriveChannelKey(credential, "testchannel01");
+    expect(Array.from(wrong)).not.toEqual(Array.from(channelKey));
+  });
+
+  test("invite code round trip: code id, key, expiry", () => {
+    const codeId = "code-abc12345";
+    const { code, codeId: outId, expiresAt } = mintInviteCode(channelKey, codeId, 86_400_000);
+    expect(outId).toBe(codeId);
+    const parsed = parseInviteCode(code);
+    expect(parsed.codeId).toBe(codeId);
+    expect(Array.from(parsed.channelKey)).toEqual(Array.from(channelKey));
+    expect(Math.abs((parsed.expiresAt ?? 0) - expiresAt)).toBeLessThan(2000);
+  });
+
+  test("parse rejects tampered/truncated credentials", () => {
+    expect(() => parseAdmissionCredential("scmc1-garbage")).toThrow();
+    expect(() => parseInviteCode("scmc1-garbage")).toThrow();
   });
 });

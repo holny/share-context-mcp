@@ -193,12 +193,13 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
   const stmtUpsertMember = db.prepare(`
-    INSERT INTO members(channel_id, name, token_hash, token_expires_at, epoch, joined_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO members(channel_id, name, token_hash, token_expires_at, epoch, joined_at, status)
+    VALUES (?, ?, ?, ?, ?, ?, 'active')
     ON CONFLICT(channel_id, name) DO UPDATE SET
       token_hash = excluded.token_hash,
       token_expires_at = excluded.token_expires_at,
-      epoch = excluded.epoch
+      epoch = excluded.epoch,
+      status = 'active'
   `);
   const stmtClearTokens = db.prepare("UPDATE members SET token_hash = NULL, token_expires_at = NULL WHERE channel_id = ?");
   const stmtBumpEpoch = db.prepare("UPDATE channels SET epoch = epoch + 1 WHERE id = ?");
@@ -594,6 +595,13 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     if (memberBanned || consumerBanned) return "banned";
     return { channel, member };
   }
+
+  const stmtMemberStatsPerDay = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND created_at LIKE ?",
+  );
+  const stmtMemberStatsSenderDay = db.prepare(
+    "SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND sender = ? AND created_at LIKE ?",
+  );
 
   function requireValidatedBody(
     body: Record<string, unknown>,
@@ -1214,8 +1222,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const parsed = await readJson(req);
         if (!parsed.ok) return parsed.resp;
         const verifyKeyB64 = parsed.body.verifyKeyB64;
-        if (typeof verifyKeyB64 !== "string" || verifyKeyB64.length < 16 || verifyKeyB64.length > 128) {
-          return jsonError(400, "invalid request: verifyKeyB64 required");
+        const decodedLen = typeof verifyKeyB64 === "string" ? Buffer.from(verifyKeyB64, "base64").length : 0;
+        if (typeof verifyKeyB64 !== "string" || decodedLen !== 32) {
+          return jsonError(400, "invalid request: verifyKeyB64 must be a base64 32-byte key");
         }
         stmtSetCredential.run(verifyKeyB64, 0, channelId);
         audit(channelId, auth.member.name, "credential.rotated", auth.member.name, "access mode");
@@ -1235,8 +1244,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const perDay: Array<{ day: string; count: number; share: number }> = [];
         for (let i = 6; i >= 0; i--) {
           const day = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
-          const c = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND sender = ? AND created_at LIKE ?").get(channelId, name, `${day}%`) as { n: number }).n;
-          const dayTotal = (db.prepare("SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND created_at LIKE ?").get(channelId, `${day}%`) as { n: number }).n;
+          const c = (stmtMemberStatsSenderDay.get(channelId, name, `${day}%`) as { n: number }).n;
+          const dayTotal = (stmtMemberStatsPerDay.get(channelId, `${day}%`) as { n: number }).n;
           perDay.push({ day, count: c, share: dayTotal > 0 ? Math.round((c / dayTotal) * 100) : 0 });
         }
         return json({
@@ -1257,8 +1266,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
           return jsonError(403, "manager or creator only");
         }
-        dissolve(channelId);
         audit(channelId, auth.member.name, "channel.dissolved", channelId, "explicit");
+        dissolve(channelId);
         wsHub?.invalidateChannel(channelId, 0);
         return json({ ok: true });
       }

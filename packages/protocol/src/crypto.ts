@@ -88,6 +88,13 @@ export function open(env: { nonce: string; ciphertext: string }, key: Uint8Array
  * Challenge-response proof of key possession without revealing the key:
  * base64(HMAC-SHA256(key, raw nonce bytes decoded from nonceB64)).
  */
+/** Canonical admission-verify key: HMAC-SHA256(channelKey, "verify"), base64.
+ *  Single source of truth — the bridge, mint and CLI all share this. */
+export function deriveVerifyKeyB64(channelKey: Uint8Array): string {
+  assertKey(channelKey);
+  return Buffer.from(createHmac("sha256", Buffer.from(channelKey)).update("verify").digest()).toString("base64");
+}
+
 export function hmacProof(key: Uint8Array, nonceB64: string): string {
   assertKey(key);
   return createHmac("sha256", Buffer.from(key))
@@ -107,8 +114,10 @@ export function hmacProof(key: Uint8Array, nonceB64: string): string {
 const CREDENTIAL_PREFIX = "scmc1";
 const CRED_WRAP_INFO = "share-context-mcp/admit-wrap";
 
+const B32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
 function b32(buf: Uint8Array): string {
-  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  const alphabet = B32_ALPHABET;
   let bits = 0;
   let value = 0;
   let out = "";
@@ -125,7 +134,7 @@ function b32(buf: Uint8Array): string {
 }
 
 function b32decode(s: string): Uint8Array {
-  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  const alphabet = B32_ALPHABET;
   const clean = s.toLowerCase().replace(/-/g, "");
   let bits = 0;
   let value = 0;
@@ -150,33 +159,47 @@ function b32decode(s: string): Uint8Array {
  * the key itself stays opaque. Returns the credential and the verify key to
  * register at the relay.
  */
-export function mintAdmissionCredential(channelKey: Uint8Array): { credential: string; verifyKeyB64: string } {
-  assertKey(channelKey);
-  const ws = randomBytes(32);
+interface WrappedBlob {
+  ws: Uint8Array;
+  nonce: Uint8Array;
+  ct: Uint8Array;
+}
+
+function wrapWith(ws: Uint8Array, plaintext: Uint8Array): Uint8Array {
   const wrapKey = new Uint8Array(hkdfSync("sha256", ws, new Uint8Array(0), Buffer.from(CRED_WRAP_INFO), KEY_LEN));
   const nonce = randomBytes(NONCE_LEN);
   const cipher = createCipheriv("aes-256-gcm", wrapKey, nonce);
-  const ct = Buffer.concat([cipher.update(Buffer.from(channelKey)), cipher.final(), cipher.getAuthTag()]);
-  const credential = `${CREDENTIAL_PREFIX}-${b32(Buffer.concat([ws, nonce, ct]))}`
+  // nonce IS the blob prefix — unwrapWith reads it from there.
+  return Buffer.concat([nonce, cipher.update(Buffer.from(plaintext)), cipher.final(), cipher.getAuthTag()]);
+}
+
+function unwrapWith(ws: Uint8Array, blob: Uint8Array): Uint8Array {
+  const wrapKey = new Uint8Array(hkdfSync("sha256", ws, new Uint8Array(0), Buffer.from(CRED_WRAP_INFO), KEY_LEN));
+  const nonce = blob.slice(0, NONCE_LEN);
+  const data = blob.slice(NONCE_LEN);
+  const ct = data.slice(0, data.length - AUTH_TAG_LEN);
+  const tag = data.slice(data.length - AUTH_TAG_LEN);
+  const decipher = createDecipheriv("aes-256-gcm", wrapKey, nonce);
+  decipher.setAuthTag(tag);
+  return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(ct)), decipher.final()]));
+}
+
+export function mintAdmissionCredential(channelKey: Uint8Array): { credential: string; verifyKeyB64: string } {
+  assertKey(channelKey);
+  const ws = randomBytes(32);
+  const blob = wrapWith(ws, channelKey);
+  const credential = `${CREDENTIAL_PREFIX}-${b32(Buffer.concat([ws, blob]))}`
     .replace(/(.{5})/g, "$1-")
     .replace(/-$/, "");
-  const verifyKeyB64 = Buffer.from(createHmac("sha256", Buffer.from(channelKey)).update("verify").digest()).toString("base64");
-  return { credential, verifyKeyB64 };
+  return { credential, verifyKeyB64: deriveVerifyKeyB64(channelKey) };
 }
 
 /** Parse + unwrap: channel key from a minted admission credential. */
 export function parseAdmissionCredential(credential: string): Uint8Array {
   const raw = b32decode(credential.replace(new RegExp(`^${CREDENTIAL_PREFIX}-`), "").replace(/-/g, ""));
-  if (raw.length < 32 + NONCE_LEN + AUTH_TAG_LEN) throw new Error("credential: too short");
+  if (raw.length < 32 + NONCE_LEN) throw new Error("credential: too short");
   const ws = raw.slice(0, 32);
-  const nonce = raw.slice(32, 32 + NONCE_LEN);
-  const data = raw.slice(32 + NONCE_LEN);
-  const ct = data.slice(0, data.length - AUTH_TAG_LEN);
-  const tag = data.slice(data.length - AUTH_TAG_LEN);
-  const wrapKey = new Uint8Array(hkdfSync("sha256", ws, new Uint8Array(0), Buffer.from(CRED_WRAP_INFO), KEY_LEN));
-  const decipher = createDecipheriv("aes-256-gcm", wrapKey, nonce);
-  decipher.setAuthTag(tag);
-  return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(ct)), decipher.final()]));
+  return unwrapWith(ws, raw.slice(32));
 }
 
 /**
@@ -188,17 +211,20 @@ export function mintInviteCode(
   codeId: string,
   ttlMs: number,
 ): { code: string; codeId: string; expiresAt: number } {
-  const ws = randomBytes(32);
-  const wrapKey = new Uint8Array(hkdfSync("sha256", ws, new Uint8Array(0), Buffer.from(CRED_WRAP_INFO), KEY_LEN));
-  const nonce = randomBytes(NONCE_LEN);
-  const cipher = createCipheriv("aes-256-gcm", wrapKey, nonce);
+  assertKey(channelKey);
+  const idBytes = Buffer.from(codeId, "utf8");
+  if (idBytes.length === 0 || idBytes.length > 16) {
+    throw new Error("invite code: codeId must be 1..16 bytes");
+  }
   const expiresAt = Date.now() + ttlMs;
-  const payload = Buffer.from(JSON.stringify({ key: Buffer.from(channelKey).toString("base64"), exp: expiresAt }), "utf8");  const ct = Buffer.concat([cipher.update(payload), cipher.final(), cipher.getAuthTag()]);
+  const ws = randomBytes(32);
+  const payload = Buffer.from(JSON.stringify({ key: Buffer.from(channelKey).toString("base64"), exp: expiresAt }), "utf8");
+  const blob = wrapWith(ws, payload);
   // codeId is fixed-width (16 bytes, NUL-padded) so the round trip is exact
   // for arbitrary ids ≤ 16 chars.
   const idBuf = Buffer.alloc(16);
-  idBuf.write(codeId, 0, "utf8");
-  const code = `${CREDENTIAL_PREFIX}-${b32(Buffer.concat([idBuf, ws, nonce, ct]))}`;
+  idBytes.copy(idBuf);
+  const code = `${CREDENTIAL_PREFIX}-${b32(Buffer.concat([idBuf, ws, blob]))}`;
   return { code, codeId, expiresAt };
 }
 
@@ -216,11 +242,17 @@ export function parseInviteCode(code: string): { codeId: string; channelKey: Uin
   const wrapKey = new Uint8Array(hkdfSync("sha256", ws, new Uint8Array(0), Buffer.from(CRED_WRAP_INFO), KEY_LEN));
   const decipher = createDecipheriv("aes-256-gcm", wrapKey, nonce);
   decipher.setAuthTag(tag);
-  const payload = JSON.parse(Buffer.concat([decipher.update(Buffer.from(ct)), decipher.final()]).toString("utf8")) as {
-    key: string;
-    exp?: number;
-  };
-  return { codeId, channelKey: new Uint8Array(Buffer.from(payload.key, "base64")), expiresAt: payload.exp ?? null };
+  let payload: { key?: unknown; exp?: unknown };
+  try {
+    payload = JSON.parse(Buffer.concat([decipher.update(Buffer.from(ct)), decipher.final()]).toString("utf8"));
+  } catch {
+    throw new Error("invite code: malformed payload");
+  }
+  if (typeof payload.key !== "string") throw new Error("invite code: malformed payload");
+  const channelKey = new Uint8Array(Buffer.from(payload.key, "base64"));
+  assertKey(channelKey);
+  const expiresAt = typeof payload.exp === "number" ? payload.exp : null;
+  return { codeId, channelKey, expiresAt };
 }
 
 export { idempotencyKey } from "./schema";

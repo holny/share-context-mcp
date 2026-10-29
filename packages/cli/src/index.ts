@@ -147,23 +147,23 @@ Commands:
   leave                        Leave channels (--channel-id <id> [--transfer-to <name>])
 
   channel list                 Channels this member holds
-  channel info <id>            Members, roles, admission mode, contact
-  channel bans <id>            Banned members (name, consumer ids, ip, by)
-  channel unban <id> --name N  Restore entry rights (manager/creator)
-  channel revoke-invite <id> --name N   Strip a member's invite right
-  channel grant-invite <id> --name N    Restore a member's invite right
-  channel transfer <id> --to N Creator hands the manager role to N
-  channel dissolve <id>        Delete the channel (manager/creator)
+  channel info --id <id>       Members, roles, admission mode, contact
+  channel bans --id <id>       Banned members (name, consumer ids, ip, by)
+  channel unban --id <id> --name N   Restore entry rights (manager/creator)
+  channel revoke-invite --id <id> --name N   Strip a member's invite right
+  channel grant-invite --id <id> --name N    Restore a member's invite right
+  channel transfer --id <id> --to N   Creator hands the manager role to N
+  channel dissolve --id <id> [--yes]   Delete the channel (manager/creator)
   channel set-admission <id> --mode public|invite|password
                                [--invite-policy everyone|managers-only] [--contact "..."]
-  rotate <id> --mode access|full [--password <pw>]
+  rotate --id <id> --mode access|full [--password <pw>]
                                access (default): new admission credential only;
                                full: + message key (all members need the new credential)
-  invite <id> [--ttl hours]    Mint an invite code (invite tier, per invite rights)
-  token refresh <id>           Rotate this member's channel token
+  invite --id <id> [--ttl hours]   Mint an invite code (invite tier, per invite rights)
+  token refresh --id <id>      Rotate this member's channel token
   vote start --channel <id> --type kick --target <name> [--reason R] [--revoke-invitees]
-  vote list <id>               Open + settled votes with tallies
-  audit <id>                   Governance audit log
+  vote list --id <id>          Open + settled votes with tallies
+  audit --id <id>              Governance audit log
   directory [query]            Search opt-in channels on the relay
   help                         Show help`);
 }
@@ -186,7 +186,9 @@ function requireId(): string {
 async function relayGetJson(id: string, path: string): Promise<Record<string, unknown>> {
   const { bridge } = await govBridge();
   const res = await fetch(`${relayUrl()}/channels/${id}${path}`, { headers: bridge.authHeaders(id) });
-  return (await res.json()) as Record<string, unknown>;
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (res.status >= 400) { console.error(`Error: ${body.error ?? res.status}`); process.exit(1); }
+  return body;
 }
 
 async function relayPostJson(id: string, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {  const { bridge } = await govBridge();
@@ -227,7 +229,8 @@ async function cmdChannelUnban() {
   const name = arg("name");
   if (!name) { console.error("Error: --name required"); process.exit(1); }
   const out = await relayPostJson(id, "/unban", { name });
-  console.log(`✅ ${name} unbanned${out.reminder ? ` — ${out.reminder}` : ""} (readmission still needs valid credentials)`);
+  if (out.ok === false) console.log(`⚠️  ${name} had no active ban — nothing changed.`);
+  else console.log(`✅ ${name} unbanned${out.reminder ? ` — ${out.reminder}` : ""} (readmission still needs valid credentials)`);
 }
 
 async function cmdChannelRevokeInvite() {
