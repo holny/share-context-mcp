@@ -13,7 +13,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { hmacProof } from "@share-context-mcp/protocol";
-import type { ChannelRow, MemberRow } from "./db";
+import type { ChannelRow, MemberRow, UserRow } from "./db";
 import type { WsHub } from "./ws";
 
 // ---- tunables (spec §5.5: token TTL 24h default) ----
@@ -187,8 +187,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked FROM channels WHERE id = ?");
-  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at FROM members WHERE channel_id = ? AND name = ?");
-  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND token_hash = ?");
+  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
+  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
@@ -492,6 +492,89 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   function audit(channelId: string, actor: string, action: string, target?: string, result?: string): void {
     stmtAudit.run(channelId, new Date().toISOString(), actor, action, target ?? null, result ?? null);
   }
+
+  // ---- user / consumer model (governance v2 §3) ----
+
+  const stmtUserByName = db.prepare("SELECT user_id FROM users WHERE name = ?");
+  const stmtInsertUser = db.prepare(
+    "INSERT INTO users(user_id, name, ip, os_type, os_version, mcp_version, token_hash, registered_at, last_active_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  const stmtUpdateUserProfile = db.prepare(
+    "UPDATE users SET ip = COALESCE(?, ip), os_type = COALESCE(?, os_type), os_version = COALESCE(?, os_version), mcp_version = COALESCE(?, mcp_version), token_hash = ?, last_active_at = ? WHERE user_id = ?",
+  );
+  const stmtUserByTokenHash = db.prepare("SELECT user_id FROM users WHERE token_hash = ?");
+  const stmtBindUserToken = db.prepare("UPDATE users SET token_hash = ? WHERE user_id = ?");
+  const stmtUserById = db.prepare("SELECT user_id, name, ip, os_type, os_version, mcp_version, registered_at, last_active_at FROM users WHERE user_id = ?");
+  const stmtUpsertConsumer = db.prepare(
+    "INSERT INTO consumers(consumer_id, user_id, agent_type, agent_version, session_id, last_active_at) VALUES (?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(consumer_id) DO UPDATE SET user_id = excluded.user_id, agent_type = COALESCE(excluded.agent_type, consumers.agent_type), agent_version = COALESCE(excluded.agent_version, consumers.agent_version), session_id = COALESCE(excluded.session_id, consumers.session_id), last_active_at = excluded.last_active_at",
+  );
+  const stmtTouchConsumer = db.prepare(
+    "INSERT INTO consumers(consumer_id, user_id, last_active_at) VALUES (?, ?, ?) " +
+      "ON CONFLICT(consumer_id) DO UPDATE SET user_id = excluded.user_id, last_active_at = excluded.last_active_at",
+  );
+  const stmtConsumersOfUser = db.prepare(
+    "SELECT consumer_id, agent_type, agent_version, session_id, last_active_at FROM consumers WHERE user_id = ? ORDER BY last_active_at DESC",
+  );
+
+  const USER_NAME_MAX = 64;
+  const USER_FIELD_MAX = 64;
+
+  function validUserField(v: unknown, max = USER_FIELD_MAX): v is string {
+    return typeof v === "string" && v.trim().length >= 1 && v.trim().length <= max;
+  }
+
+  function clientIp(req: Request): string | null {
+    const fwd = req.headers.get("x-forwarded-for");
+    if (fwd) {
+      const first = fwd.split(",")[0]?.trim();
+      if (first) return first;
+    }
+    return req.headers.get("x-real-ip");
+  }
+
+  /**
+   * Find-or-create the relay-global user for a join. Identity key: user name
+   * (client sends its machine hostname; legacy clients fall back to the
+   * member name). Profile fields are refresh-on-join (COALESCE keeps the
+   * first-seen value when a later join omits them); the token hash is
+   * overwritten — the LATEST issued token is the live user token.
+   */
+  function upsertUser(spec: { name: string; ip: string | null; osType?: string; osVersion?: string; mcpVersion?: string }, tokenHash: string): string {
+    const now = new Date().toISOString();
+    const existing = stmtUserByName.get(spec.name) as { user_id: string } | undefined;
+    if (existing) {
+      stmtUpdateUserProfile.run(spec.ip, spec.osType ?? null, spec.osVersion ?? null, spec.mcpVersion ?? null, tokenHash, now, existing.user_id);
+      return existing.user_id;
+    }
+    const userId = `u${randomBytes(8).toString("hex")}`;
+    stmtInsertUser.run(userId, spec.name, spec.ip, spec.osType ?? null, spec.osVersion ?? null, spec.mcpVersion ?? null, tokenHash, now, now);
+    return userId;
+  }
+
+  /** Parse the optional join/consumers `user` block into bounded strings. */
+  function parseUserSpec(body: Record<string, unknown>, fallbackName: string): { name: string; osType?: string; osVersion?: string; mcpVersion?: string } {
+    const raw = body.user;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return { name: fallbackName };
+    }
+    const u = raw as Record<string, unknown>;
+    return {
+      name: validUserField(u.name, USER_NAME_MAX) ? (u.name as string).trim() : fallbackName,
+      ...(validUserField(u.osType) ? { osType: (u.osType as string).trim() } : {}),
+      ...(validUserField(u.osVersion) ? { osVersion: (u.osVersion as string).trim() } : {}),
+      ...(validUserField(u.mcpVersion) ? { mcpVersion: (u.mcpVersion as string).trim() } : {}),
+    };
+  }
+
+  function parseAgentSpec(body: Record<string, unknown>): { agentType?: string; agentVersion?: string; sessionId?: string } {
+    return {
+      ...(validUserField(body.agentType, 32) ? { agentType: (body.agentType as string).trim() } : {}),
+      ...(validUserField(body.agentVersion, 32) ? { agentVersion: (body.agentVersion as string).trim() } : {}),
+      ...(validUserField(body.sessionId, 128) ? { sessionId: (body.sessionId as string).trim() } : {}),
+    };
+  }
+
   const stmtMinSeqAbove = db.prepare("SELECT MIN(seq) AS s FROM messages WHERE channel_id = ? AND created_at > ?");
   const stmtEvictPrefix = db.prepare("DELETE FROM messages WHERE channel_id = ? AND seq < ?");
   const stmtSetMinSeq = db.prepare("UPDATE channels SET min_seq = MAX(min_seq, ?) WHERE id = ?");
@@ -590,6 +673,15 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       }
       if (!consumerBanned && isWrite) {
         stmtRegisterConsumer.run(channelId, member.name, consumer, new Date().toISOString());
+        // User/consumer ledger (governance v2 §3): a valid token + a fresh
+        // consumer id is a registration — the consumer auto-joins the user's
+        // ledger without an explicit /consumers call. The user's own
+        // last_active_at rides the same write.
+        if (member.user_id) {
+          const nowIso = new Date().toISOString();
+          stmtTouchConsumer.run(consumer, member.user_id, nowIso);
+          db.prepare("UPDATE users SET last_active_at = ? WHERE user_id = ?").run(nowIso, member.user_id);
+        }
       }
     }
     if (memberBanned || consumerBanned) return "banned";
@@ -750,7 +842,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit|me))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -863,18 +955,35 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           member?.joined_at ?? new Date().toISOString(),
         );
         stmtRegisterConsumer.run(channelId, memberName, consumerId, new Date().toISOString());
+        // User/consumer model (§3): the token binds to the relay-global USER,
+        // not the channel. Find-or-create the user (identity key: client
+        // hostname; legacy clients fall back to the member name), bind the
+        // token, link the member row, and register the consumer under it.
+        const agentSpec = parseAgentSpec(parsed.body);
+        const userSpec = parseUserSpec(parsed.body, memberName);
+        const userId = upsertUser({ ...userSpec, ip: clientIp(req) }, sha256Hex(token));
+        db.prepare("UPDATE members SET user_id = ? WHERE channel_id = ? AND name = ?").run(userId, channelId, memberName);
+        stmtUpsertConsumer.run(
+          consumerId,
+          userId,
+          agentSpec.agentType ?? null,
+          agentSpec.agentVersion ?? null,
+          agentSpec.sessionId ?? null,
+          new Date().toISOString(),
+        );
         if (pendingInviteCodeId !== null) {
           // Admission succeeded — consume the code (F-4).
           stmtUseInviteCode.run(memberName, channelId, pendingInviteCodeId);
         }
         challenges.delete(key); // one-time use
         audit(channelId, memberName, "member.joined", memberName, "ok");
-        return json({ token, epoch: channel.epoch, memberName });
+        return json({ token, epoch: channel.epoch, memberName, userId });
       }
 
       case "consumers": {
         // Register an ADDITIONAL consumer id under this membership (multi-
-        // session processes share one member). Token-authenticated.
+        // session processes share one member). Token-authenticated. Also
+        // recorded in the user-level consumer ledger (governance v2 §3).
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
         if (auth === "banned") return jsonError(403, "banned");
@@ -887,7 +996,61 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         if (auth.member.status === "banned") return jsonError(403, "banned");
         stmtRegisterConsumer.run(channelId, auth.member.name, consumerId, new Date().toISOString());
+        if (auth.member.user_id) {
+          const agentSpec = parseAgentSpec(parsed.body);
+          stmtUpsertConsumer.run(
+            consumerId,
+            auth.member.user_id,
+            agentSpec.agentType ?? null,
+            agentSpec.agentVersion ?? null,
+            agentSpec.sessionId ?? null,
+            new Date().toISOString(),
+          );
+        }
         return json({ ok: true });
+      }
+
+      case "me": {
+        // Identity card of the authenticated member's relay-global user
+        // (governance v2 §3): profile + the consumer ledger (agent
+        // processes/sessions) registered under it.
+        if (method !== "GET") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const userId = auth.member.user_id;
+        if (!userId) {
+          // Pre-model member (joined before the users table existed): the
+          // identity is channel-local only.
+          return json({ userId: null, user: null, consumers: [] });
+        }
+        const user = stmtUserById.get(userId) as
+          | { user_id: string; name: string; ip: string | null; os_type: string | null; os_version: string | null; mcp_version: string | null; registered_at: string; last_active_at: string }
+          | undefined;
+        if (!user) return json({ userId: null, user: null, consumers: [] });
+        const consumers = stmtConsumersOfUser.all(userId) as Array<{
+          consumer_id: string; agent_type: string | null; agent_version: string | null; session_id: string | null; last_active_at: string;
+        }>;
+        return json({
+          userId,
+          user: {
+            userId: user.user_id,
+            name: user.name,
+            ip: user.ip,
+            osType: user.os_type,
+            osVersion: user.os_version,
+            mcpVersion: user.mcp_version,
+            registeredAt: user.registered_at,
+            lastActiveAt: user.last_active_at,
+          },
+          consumers: consumers.map((c) => ({
+            consumerId: c.consumer_id,
+            agentType: c.agent_type ?? undefined,
+            agentVersion: c.agent_version ?? undefined,
+            sessionId: c.session_id ?? undefined,
+            lastActiveAt: c.last_active_at,
+          })),
+        });
       }
 
       case "token-refresh": {
@@ -905,8 +1068,13 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           channel.epoch,
           auth.member.joined_at,
         );
+        // Rebind the user-scoped token: the refreshed token becomes the live
+        // user token; the old one stops resolving everywhere.
+        if (auth.member.user_id) {
+          stmtBindUserToken.run(sha256Hex(token), auth.member.user_id);
+        }
         audit(channelId, auth.member.name, "token.refreshed", auth.member.name, "ok");
-        return json({ token, epoch: channel.epoch, memberName: auth.member.name });
+        return json({ token, epoch: channel.epoch, memberName: auth.member.name, ...(auth.member.user_id ? { userId: auth.member.user_id } : {}) });
       }
 
       case "invite-codes": {

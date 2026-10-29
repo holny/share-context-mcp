@@ -42,6 +42,33 @@ export interface MemberRow {
   can_invite: number;
   /** ISO ts of the last activity receipt (presence buckets). */
   last_active_at: string | null;
+  /** Owning relay-global user (user/consumer model, governance v2 §3). */
+  user_id: string | null;
+}
+
+/** Relay-global user identity (governance v2 §3). The session token binds to
+ * the USER: one token → one relay connection → one user → N consumers → N
+ * channel memberships. */
+export interface UserRow {
+  user_id: string;
+  name: string;
+  ip: string | null;
+  os_type: string | null;
+  os_version: string | null;
+  mcp_version: string | null;
+  token_hash: string | null;
+  registered_at: string;
+  last_active_at: string;
+}
+
+/** An agent process/session under a user (governance v2 §3, 1 user : N). */
+export interface ConsumerRow {
+  consumer_id: string;
+  user_id: string;
+  agent_type: string | null;
+  agent_version: string | null;
+  session_id: string | null;
+  last_active_at: string;
 }
 
 export interface MessageRow {
@@ -74,6 +101,33 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE members ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN can_invite INTEGER NOT NULL DEFAULT 1"); } catch {}
     try { db.exec("ALTER TABLE messages ADD COLUMN sender TEXT"); } catch {}
+    // User/consumer model (governance v2 §3): members reference a
+    // relay-global user row; the session token binds to the user.
+    try { db.exec("ALTER TABLE members ADD COLUMN user_id TEXT"); } catch {}
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS users(
+        user_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        ip TEXT,
+        os_type TEXT,
+        os_version TEXT,
+        mcp_version TEXT,
+        token_hash TEXT,
+        registered_at TEXT NOT NULL,
+        last_active_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name);
+      CREATE INDEX IF NOT EXISTS idx_users_token ON users(token_hash);
+      CREATE TABLE IF NOT EXISTS consumers(
+        consumer_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(user_id),
+        agent_type TEXT,
+        agent_version TEXT,
+        session_id TEXT,
+        last_active_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_consumers_user ON consumers(user_id);
+    `);
     // Role backfill: pre-governance databases have NULL creator/manager —
     // adopt the earliest joined member (the original creator) so management
     // operations keep working (H-7).
@@ -169,6 +223,7 @@ export function openDb(dbPath: string): Database {
       last_active_at TEXT,
       status TEXT NOT NULL DEFAULT 'active',
       can_invite INTEGER NOT NULL DEFAULT 1,
+      user_id TEXT,
       PRIMARY KEY(channel_id, name)
     );
 
