@@ -14,7 +14,7 @@
 
 - Relay stays blind: it stores ciphertext only; never see plaintext, topics, kinds, or member activity content (seq/counters/timestamps are allowed metadata).
 - `statement` ≤ 500 chars, `detail` per `LIMITS` (`packages/protocol/src/schema.ts`) — digest messages must respect these; chunk when needed.
-- Public-facing copy (tool descriptions, README, commit messages) in English; zero "bocom" references in any synced file.
+- Public-facing copy (tool descriptions, README, commit messages) in English; zero internal fork-name references in any synced file.
 - No new user-facing configuration beyond the four relay/env vars in the spec; no LLM anywhere.
 - All tests run with `bun test` from repo root; each task ends green.
 - `PollResult.cursor`/store cursor semantics unchanged: high-water monotonic per channel; store cursor must never move backward.
