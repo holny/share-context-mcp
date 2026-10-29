@@ -1218,11 +1218,14 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           audit(channelId, name, "role.reverted", creator, "manager");
           wsHub?.notifyGovernance(channelId, { type: "role-changed", manager: creator });
         }
-        // Dissolution: no active members remain.
+        // Dissolution: no active members remain. The audit entry is written
+        // BEFORE the wipe — dissolve() deletes this channel's audit_log rows,
+        // so an entry written after would be silently lost (ordering matters
+        // for any external audit sink too).
         const activeLeft = stmtActiveCount.get(channelId) as { n: number };
         if ((activeLeft?.n ?? 0) === 0) {
-          dissolve(channelId);
           audit(channelId, name, "channel.dissolved", channelId, "last member left");
+          dissolve(channelId);
           // Dissolved: evict every live connection for the dead channel.
           wsHub?.invalidateChannel(channelId, 0);
         } else {

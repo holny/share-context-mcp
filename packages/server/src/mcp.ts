@@ -828,7 +828,21 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
       }
       // leave
       const ch = resolveChannel(store, channelId);
-      await bridge.leave(ch, transferTo ? { transferTo } : undefined);
+      // Relay errors never strand local state (T6): a dissolved/dead channel
+      // 404s or 401s at the relay, but this machine's ledger, secrets and
+      // broadcaster attachment must still be cleaned — the member's intent
+      // to leave is local and final.
+      try {
+        await bridge.leave(ch, transferTo ? { transferTo } : undefined);
+      } catch (err) {
+        console.error(
+          `share-context-mcp: relay leave failed for ${ch} (cleaning up locally anyway): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        // the bridge's own cleanup (channel row, messages, keys, token) is
+        // skipped when the relay call throws — repeat it here (idempotent)
+        store.removeChannel(ch);
+        store.deleteKv(`token:${ch}`);
+      }
       onChannelLeft?.(ch); // detach from the broadcaster — plugin stops receiving
       store.removeConsumerChannel(consumerIdFromExtra(extra), ch);
       store.deleteKv(`subscription:${ch}`);
