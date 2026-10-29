@@ -81,12 +81,14 @@ export class RelayBridge implements ChannelBridge {
   private readonly lastActivityPost = new Map<string, number>();
 
   readonly governance = true;
+  readonly relayUrl: string;
 
   /** Consumer id bound into every request (X-SCM-Consumer); registered at join. */
   consumerId = `p/${process.pid}`;
 
   constructor(opts: { baseUrl: string; store: Store }) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.relayUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = this.relayUrl;
     this.store = opts.store;
   }
 
@@ -462,6 +464,12 @@ export class RelayBridge implements ChannelBridge {
     return {
       members: (data.members as ChannelMember[]) ?? [],
       nextSeq: data.nextSeq as number,
+      minSeq: typeof data.minSeq === "number" ? data.minSeq : undefined,
+      creatorMember: (data.creatorMember as string | null | undefined) ?? null,
+      managerMember: (data.managerMember as string | null | undefined) ?? null,
+      admissionMode: data.admissionMode as string | undefined,
+      invitePolicy: data.invitePolicy as string | undefined,
+      contactInfo: (data.contactInfo as string | null | undefined) ?? null,
     };
   }
 

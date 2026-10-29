@@ -1,15 +1,17 @@
 /**
- * MCP tool surface (spec §5.3) — the agent-facing product.
+ * MCP tool surface (spec §13, governance v2) — the agent-facing product.
  *
- * Every tool description below is product-grade copy validated by the M1
- * behavior spike (agents autonomously shared 94.7% of decisions with this
- * wording); change it only with a behavioral reason. All tool output that
- * embeds channel content is wrapped in a reference block (header + "> " per
- * line) per the injection-defense requirement (spec §5.2/§5.9).
+ * Seven tools (consolidated from eleven): send_message, fetch_messages,
+ * channel, list, cast_vote, channel_info, join_from_blob. Every tool
+ * description below is product-grade copy; change it only with a behavioral
+ * reason. All tool output that embeds channel content is wrapped in a
+ * reference block (header + "> " per line) per the injection-defense
+ * requirement (spec §5.2/§5.9).
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { CLAIM_KINDS, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
+import { hostname } from "node:os";
 import { INSTRUCTIONS } from "./instructions";
 import { buildDigestMessages } from "./digest";
 import type { ChannelBridge, Store } from "./index";
@@ -19,17 +21,13 @@ import type { ChannelBridge, Store } from "./index";
  * `cast_vote` (relay-tier governance). Responses all echo `channelId`.
  */
 export const TOOL_NAMES = [
-  "share_update",
-  "fetch_updates",
-  "catch_up",
-  "search_messages",
-  "set_subscription",
-  "list_members",
-  "create_channel",
-  "join_channel",
-  "leave_channel",
-  "list_channels",
+  "send_message",
+  "fetch_messages",
+  "channel",
+  "list",
   "cast_vote",
+  "channel_info",
+  "join_from_blob",
 ] as const;
 
 const SERVER_NAME = "share-context-mcp";
@@ -45,13 +43,13 @@ export interface McpServerDeps {
   store: Store;
   bridge: ChannelBridge;
   /**
-   * Called after a tool successfully joins a channel (join_channel, and
-   * create_channel which joins implicitly). The stdio entrypoint wires this to
+   * Called after a tool successfully joins a channel (channel join, and
+   * channel create which joins implicitly). The stdio entrypoint wires this to
    * Broadcaster.addChannel so runtime joins start broadcasting immediately.
    */
   onChannelJoined?: (channelId: string) => void;
   /**
-   * Called when a tool leaves a channel (leave_channel). The stdio entrypoint
+   * Called when a tool leaves a channel (channel leave). The stdio entrypoint
    * wires this to Broadcaster.removeChannel so the plugin stops receiving
    * events for channels the agent has left.
    */
@@ -86,7 +84,7 @@ function resolveChannel(store: Store, channelId?: string): string {
 function resolveChannelInner(store: Store, channelId?: string): string {
   if (channelId !== undefined && channelId !== "") {
     if (!store.getChannelSecret(channelId)) {
-      throw new Error(`not joined to channel ${channelId} — use join_channel first`);
+      throw new Error(`not joined to channel ${channelId} — use channel(action:"join") first`);
     }
     return channelId;
   }
@@ -94,11 +92,11 @@ function resolveChannelInner(store: Store, channelId?: string): string {
   if (active && store.getChannelSecret(active)) return active;
   const channels = store.listChannels();
   if (channels.length === 0) {
-    throw new Error("no channel joined yet — use create_channel or join_channel");
+    throw new Error('no channel joined yet — use channel(action:"create") or channel(action:"join")');
   }
   const last = channels[channels.length - 1];
   if (store.getChannelSecret(last)) return last;
-  throw new Error("no channel joined yet — use create_channel or join_channel");
+  throw new Error('no channel joined yet — use channel(action:"create") or channel(action:"join")');
 }
 
 /**
@@ -106,8 +104,8 @@ function resolveChannelInner(store: Store, channelId?: string): string {
  * channel: members + activity buckets, per-topic rollup (count, kind
  * distribution, time span, last statement), unresolved questions, digest
  * entries covering relay-evicted history. Purely structural (zero LLM): the
- * joining agent's own LLM reads this card and decides what to catch_up or
- * search. Computed fresh on join — SQL aggregation is sub-ms at retention
+ * joining agent's own LLM reads this card and decides what to fetch.
+ * Computed fresh on join — SQL aggregation is sub-ms at retention
  * bounds, so there is nothing to cache.
  */
 export function buildIndexCard(opts: {
@@ -136,7 +134,7 @@ export function buildIndexCard(opts: {
   const day = (ts: string) => ts.slice(5, 10);
   // Card is injected wholesale into the joining session — an unbounded topic
   // list would grow with channel age. Keep the most recently active topics;
-  // catch_up/search cover the long tail.
+  // filtered fetches cover the long tail.
   const CARD_TOPIC_CAP = 30;
   const topics = [...byTopic.entries()]
     .map(([topic, list]) => {
@@ -159,7 +157,7 @@ export function buildIndexCard(opts: {
     .slice(0, CARD_TOPIC_CAP);
   return JSON.stringify({
     channelId,
-    // same projection as list_members — activity bucket instead of raw ISO
+    // same projection as list(scope:"members") — activity bucket instead of raw ISO
     members: members.map((m) => {
       const activity = activityBucket(m.lastActiveAt);
       return activity === undefined
@@ -173,9 +171,9 @@ export function buildIndexCard(opts: {
       ? { historyGap: `before seq ${historyGap} — older text was evicted by relay retention, recoverable only via digests` }
       : {}),
     ...(topics.length === 0 && digests.length === 0
-      ? { note: "active topics: none yet — the channel is empty; share_update to break the ice" }
+      ? { note: "active topics: none yet — the channel is empty; send_message to break the ice" }
       : {}),
-    hint: "use catch_up or search_messages to dig into a topic's history",
+    hint: "use fetch_messages (topic/kind/query filters) to dig into a topic's history",
   });
 }
 
@@ -408,6 +406,60 @@ const channelIdParam = {
     .describe("Target channel. Omit to use your most recently used channel."),
 };
 
+// ---- join blob (spec §14: copy-paste onboarding) ----
+
+export interface JoinBlob {
+  relayUrl?: string;
+  channelId: string;
+  credential?: string;
+  inviteCode?: string;
+  channelName?: string;
+  admissionMode?: string;
+}
+
+/**
+ * Parse a join blob: base64(JSON). The CLI produces it with encodeJoinBlob
+ * (protocol); here we only need the decode side. Throws readable errors on
+ * malformed input — surfaced as a tool error, never a crash.
+ */
+export function parseJoinBlob(blob: string): JoinBlob {
+  let json: string;
+  try {
+    json = Buffer.from(blob.trim(), "base64").toString("utf8");
+  } catch {
+    throw new Error("invalid join blob: not valid base64");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error("invalid join blob: payload is not JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("invalid join blob: payload must be a JSON object");
+  }
+  const b = parsed as Record<string, unknown>;
+  if (typeof b.channelId !== "string" || b.channelId.length === 0) {
+    throw new Error("invalid join blob: channelId missing");
+  }
+  if (typeof b.credential !== "string" && typeof b.inviteCode !== "string") {
+    throw new Error("invalid join blob: needs credential or inviteCode");
+  }
+  return {
+    relayUrl: typeof b.relayUrl === "string" ? b.relayUrl : undefined,
+    channelId: b.channelId,
+    credential: typeof b.credential === "string" ? b.credential : undefined,
+    inviteCode: typeof b.inviteCode === "string" ? b.inviteCode : undefined,
+    channelName: typeof b.channelName === "string" ? b.channelName : undefined,
+    admissionMode: typeof b.admissionMode === "string" ? b.admissionMode : undefined,
+  };
+}
+
+/** Default member name when a blob join does not carry one: machine hostname. */
+function defaultMemberName(): string {
+  return hostname().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "agent";
+}
+
 export function buildMcpServer(deps: McpServerDeps): McpServer {
   const { store, bridge, onChannelJoined, onChannelLeft } = deps;
   // Consumer-scoped delivered cursor: one MCP server process serves many
@@ -446,119 +498,69 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   };
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
 
-  // ---- create_channel ----
-  server.registerTool(
-    "create_channel",
-    {
-      description: `Create a new shared context channel and join it as the first member. Returns the channel_id and password — the password is the ONLY way teammates can join and is shown exactly once, so pass it to them out of band (chat, verbally) together with the channel_id.
+  /**
+   * Shared tail of every join (channel join + join_from_blob): pull the full
+   * retained history into the local cache, then build the structural index
+   * card the joining agent reads to orient itself.
+   */
+  const joinCard = async (ch: string): Promise<string> => {
+    // Full-history fetch (spec: retention bounds relay history, so "all of
+    // it" is finite): page from the local cursor until caught up with the
+    // relay head. The relay hands out pages in seq ASC order capped at 200,
+    // so loop until the cursor stops advancing or reaches nextSeq - 1. A
+    // re-joining member starts from its stored cursor — the cursor never
+    // moves backward and already-cached messages are not re-pulled.
+    const meta = await bridge.meta(ch);
+    let since = store.getCursor(ch);
+    for (let pages = 0; pages < 10_000; pages++) {
+      await bridge.poll(ch, since);
+      const advanced = store.getCursor(ch);
+      if (advanced <= since) break; // empty page — caught up
+      since = advanced;
+      if (since >= meta.nextSeq - 1) break; // reached relay head
+    }
+    const all = store.searchCache(ch, "");
+    const name = store.getKv(`channelName:${ch}`);
+    const pendingQuestions = all.filter((m) => m.kind === "question").length;
+    const gapRaw = store.getKv(`gap:${ch}`);
+    const historyGap = gapRaw === null ? undefined : Number(gapRaw);
+    const card = JSON.parse(
+      buildIndexCard({ channelId: ch, members: meta.members, msgs: all, pendingQuestions, historyGap }),
+    ) as Record<string, unknown>;
+    await maybePostDigest(bridge, store, ch).catch((e: unknown) => {
+      // Digests are best-effort housekeeping — a failed post must not turn
+      // a successful poll into a tool error. The digested watermark is only
+      // advanced after a successful send, so the next fetch retries.
+      console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
+    });
+    return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
+  };
 
-Use this to start a collaboration space: one channel per project or workstream (e.g. "repo-x-dev", "incident-42"). After creating, share the credentials with your teammates, then use share_update to start exchanging context.`,
-      inputSchema: {
-        name: z
-          .string()
-          .max(64)
-          .optional()
-          .describe("Optional display name for the channel, e.g. \"checkout-refactor\"."),
-        memberName: z
-          .string()
-          .min(1)
-          .max(32)
-          .describe("Your member name on the channel, shown to teammates (must be unique per channel), e.g. \"alice\"."),
-        gitUrl: z
-          .string()
-          .optional()
-          .describe("GitBridge only: the git repo URL that backs this channel (one repo per channel; created via your git credentials)."),
-        s3: z
-          .record(z.unknown())
-          .optional()
-          .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
-        admissionMode: z.enum(["public", "invite", "password"]).optional().describe("Admission mode. Default: password."),
-        contactInfo: z.string().max(256).optional().describe("Contact info for directory listing (invite/password tiers, opt-in)."),
-      },
-    },
-    safe(async ({ name, memberName, gitUrl, s3, admissionMode, contactInfo }, extra) => {
-      const { channelId, password } = await bridge.createChannel({ name, memberName, gitUrl, s3, admissionMode, contactInfo });
-      store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
-      setActiveChannel(store, channelId);
-      onChannelJoined?.(channelId); // create joins implicitly — start broadcasting
-      if (name) store.setKv(`channelName:${channelId}`, name);
-      return (
-        `channel created. Share with teammates: channel_id=${channelId} password=${password}\n` +
-        "The password is shown only this once — deliver it out of band; never post it back through the channel."
-      );
-    }),
-  );
-
-  // ---- join_channel ----
-  server.registerTool(
-    "join_channel",
-    {
-      description: `Join an existing shared context channel with the channel_id and password a teammate gave you, under your member name. On success you get a join card: the channel's members and its active topics (each with the last statement and seq), so you can decide which topics to catch_up on.
-
-Choose a stable member name your teammates will recognize — directed messages and mentions use it. After joining, check fetch_updates to see the latest activity.`,
-      inputSchema: {
-        channelId: z.string().min(1).describe("Channel id received from a teammate."),
-        password: z.string().min(1).describe("Channel password received from a teammate."),
-        memberName: z
-          .string()
-          .min(1)
-          .max(32)
-          .describe("Your member name, unique within the channel, e.g. \"bob\"."),
-        gitUrl: z
-          .string()
-          .optional()
-          .describe("GitBridge only: the git repo URL backing the channel."),
-        s3: z
-          .record(z.unknown())
-          .optional()
-          .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
-      },
-    },
-    safe(async ({ channelId, password, memberName, gitUrl, s3 }, extra) => {
-      await bridge.join(channelId, password, memberName, { gitUrl, s3 });
-      store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
-      setActiveChannel(store, channelId);
-      onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
-      // Full-history fetch (spec: retention bounds relay history, so "all of
-      // it" is finite): page from the local cursor until caught up with the
-      // relay head. The relay hands out pages in seq ASC order capped at 200,
-      // so loop until the cursor stops advancing or reaches nextSeq - 1. A
-      // re-joining member starts from its stored cursor — the cursor never
-      // moves backward and already-cached messages are not re-pulled.
-      const meta = await bridge.meta(channelId);
-      let since = store.getCursor(channelId);
-      for (let pages = 0; pages < 10_000; pages++) {
-        await bridge.poll(channelId, since);
-        const advanced = store.getCursor(channelId);
-        if (advanced <= since) break; // empty page — caught up
-        since = advanced;
-        if (since >= meta.nextSeq - 1) break; // reached relay head
+  /**
+   * Open-votes visibility for fetch_messages/channel_info (governance
+   * bridges only). Auth failures are LOGGED (never swallowed silently) —
+   * a 401/403 means the token died or the member was banned, and the agent
+   * must see that in stderr; other errors are transient relay noise.
+   */
+  const openVotesIfAny = async (ch: string): Promise<Array<{ id: string; type: string; target: string; endsAt: number }> | undefined> => {
+    if (!bridge.governance) return undefined;
+    try {
+      return (await bridge.votes(ch)).open;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("401") || msg.includes("403")) {
+        console.error(`share-context-mcp: votes visibility failed: ${msg}`);
+        return undefined;
       }
-      const all = store.searchCache(channelId, "");
-      const name = store.getKv(`channelName:${channelId}`);
-      const pendingQuestions = all.filter((m) => m.kind === "question").length;
-      const gapRaw = store.getKv(`gap:${channelId}`);
-      const historyGap = gapRaw === null ? undefined : Number(gapRaw);
-      const card = JSON.parse(
-        buildIndexCard({ channelId, members: meta.members, msgs: all, pendingQuestions, historyGap }),
-      ) as Record<string, unknown>;
-      await maybePostDigest(bridge, store, channelId).catch((e: unknown) => {
-        // Digests are best-effort housekeeping — a failed post must not turn
-        // a successful poll into a tool error. The digested watermark is only
-        // advanced after a successful send, so the next fetch retries.
-        console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
-      });
-      return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
-    }),
-  );
+      return undefined; // transient relay noise — votes stay best-effort
+    }
+  };
 
-  // ---- share_update ----
+  // ---- send_message ----
   server.registerTool(
-    "share_update",
+    "send_message",
     {
-      description: `Broadcast a one-line update to your teammates over the shared context channel. Call this PROACTIVELY as things happen while you work — do not wait for a human or a teammate to ask.
-
-Share immediately when you:
+      description: `Broadcast a one-line update to your teammates over the shared context channel. Call this PROACTIVELY and immediately — do not wait to be asked — when you:
 - make a decision that affects shared design or behavior (kind="decision");
 - change or plan to change an interface, API, or contract other code depends on (kind="contract");
 - hit a pitfall or gotcha others will likely hit too (kind="howto");
@@ -623,41 +625,112 @@ NEVER include credentials, secrets, tokens, or sensitive personal information in
       };
       const { seq, deduped } = await bridge.send(msg, ch);
       setActiveChannel(store, ch);
-      // Keep your own message searchable/catch_up-able: cache it with the
+      // Keep your own message searchable/fetchable: cache it with the
       // assigned seq (the cursor still advances only via poll).
       if (!deduped) store.cacheMessages(ch, [{ ...msg, seq }]);
       return JSON.stringify({ channelId: ch, seq, deduped });
     }),
   );
 
-  // ---- fetch_updates ----
+  // ---- fetch_messages (delta fetch + history read-back + search + filters) ----
   server.registerTool(
-    "fetch_updates",
+    "fetch_messages",
     {
-      description: `Pull the latest messages your teammates have posted to the shared context channel. Messages arrive continuously; what was true when you started a task may have changed.
+      description: `Pull messages from the shared context channel. One tool, four modes — picked by which parameters you pass:
 
-You MUST check this:
-1. before starting any new task — a teammate may have posted a decision, claim, or environment fact that changes your plan;
-2. before modifying anything a teammate may own or depend on — check for claims and contract changes in that area first.
+1. DELTA (default, no filters): new messages since your last fetch. You MUST check this before starting any new task and before modifying anything a teammate may own — a decision, claim, or env-fact may have landed that changes your plan. Also re-check after a break and before finalizing work others depend on.
+2. HISTORY (topic / kind / scopePrefix): read back the newest matching messages from local cache, pulling from the relay when the cache is short — for getting up to speed after joining or resuming work ("what happened in topic auth while I was away?").
+3. SEARCH (query): keyword search over the decrypted local history. Query syntax "a&b,c&d" = (a AND b) OR (c AND d), e.g. "rotation&cookie, jwt". Use it instead of re-reading everything when hunting a specific decision, pitfall, or fact. Combine with topic/kind to narrow.
+4. SUBSCRIBE (setFilters): declare which kinds/topics matter to you right now as a filter list; a message matching ANY filter should reach you even when you are not actively fetching.
 
-Also re-check after a break and before finalizing work others depend on. Returns {messages (newest last), skipped, cursor}: skipped counts envelopes that could not be decrypted (normally 0; a growing number means the channel password was rotated and you should join_channel again), cursor is the seq to resume from.`,
+Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: messages newest-last for delta, matching-batch otherwise; skipped counts envelopes that could not be decrypted (normally 0; a growing number means the channel password was rotated and you should join again); remaining > 0 means more delta messages await — fetch again.`,
       inputSchema: {
         since: z
           .number()
           .int()
           .nonnegative()
           .optional()
-          .describe("Only return messages with seq greater than this. Omit to get everything since your last fetch."),
+          .describe("Delta mode: only messages with seq greater than this. Omit to get everything since your last fetch."),
+        query: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Search mode: keyword expression "a&b,c&d" = (a AND b) OR (c AND d), case-insensitive over statement+detail.'),
+        topic: z.string().optional().describe("History/search mode: only messages with this exact topic."),
+        kind: z.enum(CLAIM_KINDS).optional().describe("History/search mode: only messages of this kind."),
+        scopePrefix: z
+          .string()
+          .optional()
+          .describe('History mode: only messages whose scope values start with this prefix, e.g. "acme/api".'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("Max messages to return (history/search default 20; delta default 200)."),
+        setFilters: z
+          .array(
+            z.object({
+              kinds: z.array(z.enum(CLAIM_KINDS)).optional().describe("Match any of these kinds."),
+              scopePrefix: z.string().optional().describe("Match messages whose scope values start with this prefix."),
+              topic: z.string().optional().describe("Match this exact topic."),
+            }),
+          )
+          .min(1)
+          .optional()
+          .describe("Subscribe mode: filter list; a message matching ANY filter is pushed to you."),
         ...channelIdParam,
       },
     },
-    safe(async ({ since, channelId }, extra) => {
+    safe(async ({ since, query, topic, kind, scopePrefix, limit, setFilters, channelId }, extra) => {
       const ch = resolveChannel(store, channelId);
+      // SUBSCRIBE mode: a config action, not a fetch — store and acknowledge.
+      if (setFilters !== undefined) {
+        store.setSubscription(ch, setFilters);
+        return JSON.stringify({ ok: true, filters: setFilters, channelId: ch });
+      }
+      // SEARCH mode: pure local keyword retrieval (no relay round trip).
+      if (query !== undefined) {
+        const messages = filterClaims(store.searchCache(ch, query), { topic, kind }).slice(
+          0,
+          Math.min(limit ?? SEARCH_RESULT_CAP, SEARCH_RESULT_CAP),
+        );
+        return quoteWrap(
+          JSON.stringify({ channelId: ch, messages, skipped: 0, cursor: store.getCursor(ch), remaining: 0 }),
+        );
+      }
+      // HISTORY mode: newest matching messages, oldest first in the batch;
+      // one relay pull when the local cache cannot fill the limit.
+      if (topic !== undefined || kind !== undefined || scopePrefix !== undefined) {
+        const lim = limit ?? 20;
+        const pick = () => filterClaims(store.searchCache(ch, ""), { topic, kind, scopePrefix }).slice(0, lim);
+        let messages = pick();
+        if (messages.length < lim) {
+          const meta = await bridge.meta(ch);
+          if (meta.nextSeq > store.getCursor(ch)) {
+            await bridge.poll(ch, store.getCursor(ch));
+            messages = pick();
+          }
+        }
+        const openVotes = await openVotesIfAny(ch);
+        return quoteWrap(
+          JSON.stringify({
+            channelId: ch,
+            messages: messages.slice().reverse(),
+            skipped: 0,
+            cursor: store.getCursor(ch),
+            remaining: 0,
+            ...(openVotes ? { openVotes } : {}),
+          }),
+        );
+      }
+      // DELTA mode: poll the relay, serve the undelivered window.
       const consumerDelivered = deliveredFor(consumerIdFromExtra(extra));
       const prevHigh = store.getCursor(ch);
       await bridge.poll(ch, prevHigh);
       const high = store.getCursor(ch);
-      // Digest failure must not break the fetch (see join_channel note).
+      // Digest failure must not break the fetch (see joinCard note).
       await maybePostDigest(bridge, store, ch).catch((e: unknown) => {
         console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
       });
@@ -667,7 +740,7 @@ Also re-check after a break and before finalizing work others depend on. Returns
       // result. delivered only advances to the LAST SERVED seq; `remaining`
       // tells the agent to fetch again.
       const messages = high > start ? store.cachedRange(ch, start, high) : [];
-      const SERVE_WINDOW = 200;
+      const SERVE_WINDOW = Math.min(limit ?? 200, 200);
       const truncated = messages.length > SERVE_WINDOW;
       const served = truncated ? messages.slice(0, SERVE_WINDOW) : messages;
       const lastServed = served.length > 0 ? (served[served.length - 1].seq ?? high) : start;
@@ -680,124 +753,231 @@ Also re-check after a break and before finalizing work others depend on. Returns
       }
       const remaining = Math.max(0, high - lastServed);
       setActiveChannel(store, ch);
-      // Surface open governance votes (relay-backed bridges only) so agents
-      // can perceive and cast via cast_vote without extra polling.
-      let openVotes: Array<{ id: string; type: string; target: string; endsAt: number }> | undefined;
-      if (bridge.governance) {
-        try {
-          openVotes = (await bridge.votes(ch)).open;
-        } catch (e: unknown) {
-          // best-effort visibility — but auth failures matter to the agent
-          const msg = e instanceof Error ? e.message : String(e);
-          if (msg.includes("401") || msg.includes("403")) console.error(`share-context-mcp: votes visibility failed: ${msg}`);
-        }
-      }
+      // Surface open governance votes so agents can perceive and cast via
+      // cast_vote without extra polling.
+      const openVotes = await openVotesIfAny(ch);
       return quoteWrap(
-        JSON.stringify({ channelId: ch, messages: served, skipped, cursor: high, remaining, ...(openVotes ? { openVotes } : {}) }),
+        JSON.stringify({
+          channelId: ch,
+          messages: served,
+          skipped,
+          cursor: high,
+          remaining,
+          ...(openVotes ? { openVotes } : {}),
+        }),
       );
     }),
   );
 
-  // ---- catch_up ----
+  // ---- channel (create | join | leave) ----
   server.registerTool(
-    "catch_up",
+    "channel",
     {
-      description: `Read back recent channel history from your local cache, filtered by topic, kind, or scope — for getting up to speed after joining, resuming work, or digging into one subject. Returns the newest messages (oldest first within the batch). If the local cache holds fewer than the limit and newer messages exist on the relay, one fetch is made first.
+      description: `Manage channel membership — one tool with three actions:
 
-Typical uses: after join_channel to explore a topic from the card; before resuming a task ("what happened in topic auth while I was away?"); with kind="negative-result" to avoid retrying known dead ends.`,
+- action="create": start a new shared context channel and join it as the first member. Returns the channel_id and password — the password is the ONLY way teammates can join and is shown exactly once, so pass it to them out of band (chat, verbally) together with the channel_id. One channel per project or workstream (e.g. "repo-x-dev", "incident-42").
+- action="join": join an existing channel with the channel_id and password a teammate gave you, under your member name. On success you get a join card: the channel's members and its active topics (each with the last statement and seq), so you can decide what to fetch. Choose a stable member name your teammates will recognize — directed messages and mentions use it.
+- action="leave": leave a channel. Relay-side succession and dissolution rules apply: a leaving creator transfers roles (transferTo, or the default most-active rule); the last active member leaving dissolves the channel. You can re-join later with valid credentials.`,
       inputSchema: {
-        topic: z.string().optional().describe("Only messages with this exact topic."),
-        kind: z.enum(CLAIM_KINDS).optional().describe("Only messages of this kind."),
-        scopePrefix: z
+        action: z.enum(["create", "join", "leave"]).describe("Which membership action to perform."),
+        name: z
+          .string()
+          .max(64)
+          .optional()
+          .describe('create: optional display name for the channel, e.g. "checkout-refactor".'),
+        memberName: z
+          .string()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe('create/join: your member name on the channel, shown to teammates (unique per channel), e.g. "alice".'),
+        password: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("join: channel password received from a teammate."),
+        ...channelIdParam,
+        gitUrl: z
           .string()
           .optional()
-          .describe("Only messages whose scope values start with this prefix, e.g. \"acme/api\"."),
-        limit: z.number().int().min(1).max(200).default(20).describe("Max messages to return (default 20)."),
-        ...channelIdParam,
+          .describe("create/join (GitBridge only): the git repo URL that backs this channel."),
+        s3: z
+          .record(z.unknown())
+          .optional()
+          .describe("create/join (S3Bridge only): S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
+        admissionMode: z
+          .enum(["public", "invite", "password"])
+          .optional()
+          .describe("create: admission mode. Default: password."),
+        contactInfo: z
+          .string()
+          .max(256)
+          .optional()
+          .describe("create: contact info for directory listing (invite/password tiers, opt-in)."),
+        transferTo: z
+          .string()
+          .optional()
+          .describe('leave: creator only — hand roles to this active member when leaving. Omit for the default rule.'),
       },
     },
-    safe(async ({ topic, kind, scopePrefix, limit, channelId }) => {
-      const ch = resolveChannel(store, channelId);
-      const pick = () => filterClaims(store.searchCache(ch, ""), { topic, kind, scopePrefix }).slice(0, limit);
-      let messages = pick();
-      if (messages.length < limit) {
-        const meta = await bridge.meta(ch);
-        if (meta.nextSeq > store.getCursor(ch)) {
-          await bridge.poll(ch, store.getCursor(ch));
-          messages = pick();
+    safe(async (args, extra) => {
+      const { action, name, memberName, password, channelId, gitUrl, s3, admissionMode, contactInfo, transferTo } = args;
+      if (action === "create") {
+        if (typeof memberName !== "string" || memberName.length === 0) {
+          throw new Error('channel(action:"create") requires memberName');
         }
+        const { channelId: newId, password: newPassword } = await bridge.createChannel({
+          name,
+          memberName,
+          gitUrl,
+          s3,
+          admissionMode,
+          contactInfo,
+        });
+        store.recordConsumerChannel(consumerIdFromExtra(extra), newId);
+        setActiveChannel(store, newId);
+        onChannelJoined?.(newId); // create joins implicitly — start broadcasting
+        if (name) store.setKv(`channelName:${newId}`, name);
+        return (
+          `channel created. Share with teammates: channel_id=${newId} password=${newPassword}\n` +
+          "The password is shown only this once — deliver it out of band; never post it back through the channel."
+        );
       }
-      return quoteWrap(JSON.stringify({ messages: messages.slice().reverse(), count: messages.length }));
-    }),
-  );
-
-  // ---- search_messages ----
-  server.registerTool(
-    "search_messages",
-    {
-      description: `Keyword search over the decrypted history your machine has cached for the channel. Query syntax: "a&b,c&d" means (a AND b) OR (c AND d) — e.g. "rotation&cookie, jwt" finds messages mentioning rotation AND cookie, or jwt. Matching is case-insensitive substring over statement+detail. Results can be narrowed with kind/topic.
-
-Use this instead of re-reading everything when looking for a specific decision, pitfall, or fact someone shared earlier. Results are capped (newest first).`,
-      inputSchema: {
-        query: z.string().min(1).describe('Keyword expression: "a&b,c&d" = (a AND b) OR (c AND d).'),
-        topic: z.string().optional().describe("Only messages with this exact topic."),
-        kind: z.enum(CLAIM_KINDS).optional().describe("Only messages of this kind."),
-        ...channelIdParam,
-      },
-    },
-    safe(async ({ query, topic, kind, channelId }) => {
+      if (action === "join") {
+        if (typeof channelId !== "string" || channelId.length === 0) {
+          throw new Error('channel(action:"join") requires channelId');
+        }
+        if (typeof password !== "string" || password.length === 0) {
+          throw new Error('channel(action:"join") requires password');
+        }
+        if (typeof memberName !== "string" || memberName.length === 0) {
+          throw new Error('channel(action:"join") requires memberName');
+        }
+        await bridge.join(channelId, password, memberName, { gitUrl, s3 });
+        store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
+        setActiveChannel(store, channelId);
+        onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
+        return await joinCard(channelId);
+      }
+      // leave
       const ch = resolveChannel(store, channelId);
-      const messages = filterClaims(store.searchCache(ch, query), { topic, kind }).slice(0, SEARCH_RESULT_CAP);
-      return quoteWrap(JSON.stringify({ channelId: ch, messages, count: messages.length }));
+      await bridge.leave(ch, transferTo ? { transferTo } : undefined);
+      onChannelLeft?.(ch); // detach from the broadcaster — plugin stops receiving
+      store.removeConsumerChannel(consumerIdFromExtra(extra), ch);
+      store.deleteKv(`subscription:${ch}`);
+      store.deleteKv(`channelName:${ch}`);
+      if (store.getKv(ACTIVE_CHANNEL_KEY) === ch) store.deleteKv(ACTIVE_CHANNEL_KEY);
+      return quoteWrap(JSON.stringify({ ok: true, channelId: ch, left: true }));
     }),
   );
 
-  // ---- set_subscription ----
+  // ---- list (channels | members) ----
   server.registerTool(
-    "set_subscription",
-    {
-      description: `Declare which kinds of messages matter to you right now, as a filter list (kind / topic / scopePrefix combinations). The filters are stored per channel and consumed by the push plugin in a later milestone; setting them now is harmless and future-proof.
-
-Adjust as your task changes: while doing auth work, subscribe to topic "auth"; while on call, subscribe to kind "question". A message matching any filter should reach you even when you are not actively polling.`,
-      inputSchema: {
-        filters: z
-          .array(
-            z.object({
-              kinds: z.array(z.enum(CLAIM_KINDS)).optional().describe("Match any of these kinds."),
-              scopePrefix: z.string().optional().describe("Match messages whose scope values start with this prefix."),
-              topic: z.string().optional().describe("Match this exact topic."),
-            }),
-          )
-          .min(1)
-          .describe("Filter list; a message matching ANY filter is pushed to you."),
-        ...channelIdParam,
-      },
-    },
-    safe(async ({ filters, channelId }) => {
-      const ch = resolveChannel(store, channelId);
-      store.setSubscription(ch, filters);
-      return JSON.stringify({ ok: true, filters, channelId: ch });
-    }),
-  );
-
-  // ---- list_members ----
-  server.registerTool(
-    "list_members",
+    "list",
     {
       description:
-        "List the members currently on the channel, with their join times. Check this before directing a message with the `to` parameter, and to see who you are collaborating with.",
+        'List what you are working with. scope="channels": every channel THIS session has joined (id, name, membership name, active flag) — use it after a context reset to rediscover your channels. scope="members": the members currently on a channel, with join times and activity buckets — check it before directing a message with the `to` parameter, and to see who you are collaborating with. `query` narrows the result (substring over channel id/name or member name).',
+      inputSchema: {
+        scope: z.enum(["channels", "members"]).describe("What to list: your joined channels, or a channel's members."),
+        query: z.string().optional().describe("Optional substring filter (channel id/name, or member name)."),
+        ...channelIdParam,
+      },
+    },
+    safe(async ({ scope, query, channelId }, extra) => {
+      if (scope === "channels") {
+        const consumerId = consumerIdFromExtra(extra);
+        const q = query?.toLowerCase();
+        const channels = store
+          .listConsumerChannels(consumerId)
+          .map(({ channelId: cid, joinedAt }) => {
+            const secret = store.getChannelSecret(cid);
+            const name = store.getKv(`channelName:${cid}`) ?? undefined;
+            return {
+              channelId: cid,
+              name,
+              memberName: secret?.memberName,
+              joinedAt,
+              active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
+            };
+          })
+          .filter(
+            (c) =>
+              q === undefined ||
+              c.channelId.toLowerCase().includes(q) ||
+              (c.name ?? "").toLowerCase().includes(q),
+          );
+        return quoteWrap(JSON.stringify({ consumerId, channels }));
+      }
+      const ch = resolveChannel(store, channelId);
+      const meta = await bridge.meta(ch);
+      const q = query?.toLowerCase();
+      const members = meta.members
+        .filter((m) => q === undefined || m.memberName.toLowerCase().includes(q))
+        .map((m) => {
+          const activity = activityBucket(m.lastActiveAt);
+          return activity === undefined
+            ? { memberName: m.memberName, joinedAt: m.joinedAt }
+            : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
+        });
+      return quoteWrap(JSON.stringify({ channelId: ch, members }));
+    }),
+  );
+
+  // ---- channel_info (rich briefing: card + roles + votes + compaction) ----
+  server.registerTool(
+    "channel_info",
+    {
+      description:
+        "Full briefing card for a channel: the structural index card (per-topic rollup, digests, unresolved questions) plus members with governance roles and activity, open votes, admission mode, and relay compaction state (minSeq). Call it to re-orient after a break or before any governance action.",
       inputSchema: { ...channelIdParam },
     },
     safe(async ({ channelId }) => {
       const ch = resolveChannel(store, channelId);
       const meta = await bridge.meta(ch);
-      const members = meta.members.map((m) => {
-        const activity = activityBucket(m.lastActiveAt);
-        return activity === undefined
-          ? { memberName: m.memberName, joinedAt: m.joinedAt }
-          : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
-      });
-      return quoteWrap(JSON.stringify({ channelId: ch, members }));
+      const all = store.searchCache(ch, "");
+      const pendingQuestions = all.filter((m) => m.kind === "question").length;
+      const gapRaw = store.getKv(`gap:${ch}`);
+      const historyGap = gapRaw === null ? undefined : Number(gapRaw);
+      const card = JSON.parse(
+        buildIndexCard({ channelId: ch, members: meta.members, msgs: all, pendingQuestions, historyGap }),
+      ) as Record<string, unknown>;
+      // Governance projection: role per member (relay-backed bridges only).
+      const roleOf = (memberName: string): string =>
+        memberName === meta.creatorMember ? "creator" : memberName === meta.managerMember ? "manager" : "member";
+      const members = (card.members as Array<Record<string, unknown>>).map((m) => ({
+        ...m,
+        role: roleOf(m.memberName as string),
+      }));
+      let governance: Record<string, unknown> = {};
+      if (bridge.governance) {
+        const votes = await bridge.votes(ch).catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes("401") || msg.includes("403")) {
+            console.error(`share-context-mcp: votes visibility failed: ${msg}`);
+          }
+          return { open: [], history: [] };
+        });
+        governance = {
+          openVotes: votes.open,
+          recentVotes: votes.history.slice(0, 10),
+        };
+      }
+      const info = {
+        channelId: ch,
+        channelName: store.getKv(`channelName:${ch}`) ?? undefined,
+        creatorMember: meta.creatorMember ?? undefined,
+        managerMember: meta.managerMember ?? undefined,
+        admissionMode: meta.admissionMode,
+        invitePolicy: meta.invitePolicy,
+        contactInfo: meta.contactInfo ?? undefined,
+        nextSeq: meta.nextSeq,
+        minSeq: meta.minSeq,
+        cachedMessages: all.length,
+        ...card,
+        members,
+        ...governance,
+      };
+      return quoteWrap(JSON.stringify(info));
     }),
   );
 
@@ -807,7 +987,7 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
       "cast_vote",
       {
         description:
-          "Cast your ballot on an open governance vote (e.g. a kick vote). Pass the voteId from an openVotes entry in fetch_updates. The vote target cannot vote; one ballot per member.",
+          "Cast your ballot on an open governance vote (e.g. a kick vote). Pass the voteId from an openVotes entry in fetch_messages. The vote target cannot vote; one ballot per member.",
         inputSchema: {
           voteId: z.string().min(1).describe("Vote id from an openVotes entry."),
           choice: z.enum(["yes", "no"]).describe("yes = vote for the proposal (e.g. kick); no = against."),
@@ -822,53 +1002,48 @@ Adjust as your task changes: while doing auth work, subscribe to topic "auth"; w
     );
   }
 
-  // ---- list_channels (local per-session ledger — every backend) ----
+  // ---- join_from_blob (spec §14: copy-paste onboarding) ----
   server.registerTool(
-    "list_channels",
+    "join_from_blob",
     {
       description:
-        "List the channels THIS session has joined, with per-channel meta (id, name, membership name, active flag). Use it after a context reset to rediscover your channels.",
-      inputSchema: {},
-    },
-    safe(async (_args, extra) => {
-      const consumerId = consumerIdFromExtra(extra);
-      const channels = store.listConsumerChannels(consumerId).map(({ channelId: cid, joinedAt }) => {
-        const secret = store.getChannelSecret(cid);
-        return {
-          channelId: cid,
-          name: store.getKv(`channelName:${cid}`) ?? undefined,
-          memberName: secret?.memberName,
-          joinedAt,
-          active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
-        };
-      });
-      return quoteWrap(JSON.stringify({ consumerId, channels }));
-    }),
-  );
-
-  // ---- leave_channel (§2: succession + dissolution live at the relay) ----
-  server.registerTool(
-    "leave_channel",
-    {
-      description:
-        "Leave a channel. Relay-side succession and dissolution rules apply: a leaving creator transfers roles (transferTo, or the default most-active rule); the last active member leaving dissolves the channel. You can re-join later with valid credentials.",
+        'Join a channel from a copy-paste invite blob (base64 JSON produced by the CLI invite flow: {relayUrl, channelId, credential?, inviteCode?, channelName, admissionMode}). Parses the blob and runs the full join flow — no need to juggle channel_id/password/memberName by hand. Pass memberName explicitly, or one is derived from the machine hostname.',
       inputSchema: {
-        transferTo: z
+        blob: z.string().min(1).describe("The blob string copied from the invite text."),
+        memberName: z
           .string()
+          .min(1)
+          .max(32)
           .optional()
-          .describe("Creator only: hand roles to this active member when leaving. Omit for the default rule."),
-        ...channelIdParam,
+          .describe("Your member name on the channel. Omit to derive one from the machine hostname."),
       },
     },
-    safe(async ({ transferTo, channelId }, extra) => {
-      const ch = resolveChannel(store, channelId);
-      await bridge.leave(ch, transferTo ? { transferTo } : undefined);
-      onChannelLeft?.(ch); // detach from the broadcaster — plugin stops receiving
-      store.removeConsumerChannel(consumerIdFromExtra(extra), ch);
-      store.deleteKv(`subscription:${ch}`);
-      store.deleteKv(`channelName:${ch}`);
-      if (store.getKv(ACTIVE_CHANNEL_KEY) === ch) store.deleteKv(ACTIVE_CHANNEL_KEY);
-      return quoteWrap(JSON.stringify({ ok: true, channelId: ch, left: true }));
+    safe(async ({ blob, memberName }, extra) => {
+      const parsed = parseJoinBlob(blob);
+      const name = memberName ?? defaultMemberName();
+      if (
+        bridge.relayUrl !== undefined &&
+        parsed.relayUrl !== undefined &&
+        parsed.relayUrl.replace(/\/+$/, "") !== bridge.relayUrl
+      ) {
+        throw new Error(
+          `blob is for relay ${parsed.relayUrl} but this server is connected to ${bridge.relayUrl} — connect to the right relay first`,
+        );
+      }
+      if (parsed.inviteCode !== undefined) {
+        const inviteBridge = bridge as ChannelBridge & { joinWithInvite?: (ch: string, code: string, name: string) => Promise<void> };
+        if (typeof inviteBridge.joinWithInvite !== "function") {
+          throw new Error("invite-code joins need a relay-backed bridge");
+        }
+        await inviteBridge.joinWithInvite(parsed.channelId, parsed.inviteCode, name);
+      } else {
+        await bridge.join(parsed.channelId, parsed.credential!, name);
+      }
+      store.recordConsumerChannel(consumerIdFromExtra(extra), parsed.channelId);
+      setActiveChannel(store, parsed.channelId);
+      onChannelJoined?.(parsed.channelId);
+      if (parsed.channelName) store.setKv(`channelName:${parsed.channelId}`, parsed.channelName);
+      return await joinCard(parsed.channelId);
     }),
   );
 

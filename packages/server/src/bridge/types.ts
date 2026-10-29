@@ -82,8 +82,7 @@ export interface ChannelBridge {
    * gitUrl (GitBridge only): the remote repo URL for this channel. */
   createChannel(opts: { name?: string; memberName: string; gitUrl?: string; s3?: S3ConnectionParams; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }>;
   /** Join an existing channel with a password. gitUrl (GitBridge only): the remote repo URL. */
-  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;
-  /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
+  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;  /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
   poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult>;
@@ -119,4 +118,11 @@ export interface ChannelBridge {
    * bridges run basic messaging and the MCP surface omits governance tools.
    */
   readonly governance: boolean;
+  /**
+   * Base URL of the backing relay (relay-backed bridges only; undefined for
+   * git/S3). join_from_blob compares it against a blob's relayUrl so a
+   * copy-paste invite for a DIFFERENT relay fails with a readable error
+   * instead of silently joining the wrong server.
+   */
+  readonly relayUrl?: string;
 }

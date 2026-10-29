@@ -78,23 +78,23 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     return { client, store };
   }
 
-  test("onChannelJoined fires for create_channel and join_channel (broadcaster wiring)", async () => {
+  test("onChannelJoined fires for channel create and channel join (broadcaster wiring)", async () => {
     const joined: string[] = [];
     const a = await makeAgent("a", { onChannelJoined: (id) => joined.push(id) });
     const b = await makeAgent("b", { onChannelJoined: (id) => joined.push(id) });
 
     const created = await a.client.callTool({
-      name: "create_channel",
-      arguments: { memberName: "a", name: "wire" },
+      name: "channel",
+      arguments: { action: "create", memberName: "a", name: "wire" },
     });
     const createdText = textOf(created);
     const channelId = createdText.match(/channel_id=([a-z0-9]+)/)![1];
     const password = createdText.match(/password=([a-z0-9-]+)/)![1];
-    expect(joined).toEqual([channelId]); // create_channel joins implicitly
+    expect(joined).toEqual([channelId]); // channel create joins implicitly
 
     await b.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password, memberName: "b" },
+      name: "channel",
+      arguments: { action: "join", channelId, password, memberName: "b" },
     });
     expect(joined).toEqual([channelId, channelId]); // once per joining agent
   });
@@ -103,8 +103,8 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     const a = await makeAgent("a");
     const b = await makeAgent("b");
     const created = await a.client.callTool({
-      name: "create_channel",
-      arguments: { memberName: "a", name: "demo" },
+      name: "channel",
+      arguments: { action: "create", memberName: "a", name: "demo" },
     });
     const createdText = textOf(created);
     expect(createdText).toContain("channel created");
@@ -114,8 +114,8 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(password).toMatch(/^[a-z0-9]{4}(-[a-z0-9]{4}){4}$/);
 
     const joined = await b.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password, memberName: "b" },
+      name: "channel",
+      arguments: { action: "join", channelId, password, memberName: "b" },
     });
     const card = textOf(joined);
     expect(card.startsWith(QUOTE_HEADER)).toBe(true);
@@ -127,7 +127,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(card).toContain("b");
 
     const shared = await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "decided: sqlite WAL mode for the local cache", kind: "decision", topic: "db" },
     });
     expect(isError(shared)).toBe(false);
@@ -135,7 +135,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(typeof sharedBody.seq).toBe("number");
     expect(sharedBody.deduped).toBe(false);
 
-    const fetched = await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    const fetched = await b.client.callTool({ name: "fetch_messages", arguments: {} });
     const body = JSON.parse(unwrapQuote(textOf(fetched))) as {
       messages: Array<{ seq: number; statement: string; kind: string }>;
       skipped: number;
@@ -149,29 +149,29 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(body.skipped).toBe(0);
 
     // incremental fetch from the new cursor is empty
-    const again = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: {} }))));
+    const again = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: {} }))));
     expect(again.messages).toHaveLength(0);
   });
 
   test("join card lists active topics with last statement truncated to 80 chars", async () => {
     const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const password = created.match(/password=([a-z0-9-]+)/)![1];
     const long =
       "negative-result: upgrading bun past 1.4.4 breaks the postinstall script in this repo — do not retry it, pin the version instead and run bun install --ignore-scripts once";
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: long, kind: "negative-result", topic: "build" },
     });
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "claiming src/export for the CSV endpoint", kind: "claim", topic: "export-api" },
     });
 
     const c = await makeAgent("c");
     const card = textOf(
-      await c.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "c" } }),
+      await c.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "c" } }),
     );
     // truncated to 80 chars: first 80 present, char 81+ absent
     expect(card).toContain(long.slice(0, 80));
@@ -184,11 +184,11 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(body.topics.find((t) => t.topic === "export-api")?.lastSeq).toBe(2);
   });
 
-  test("share_update with a 501-char statement → error mentions 500", async () => {
+  test("send_message with a 501-char statement → error mentions 500", async () => {
     const a = await makeAgent("a");
-    await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } });
+    await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } });
     const res = await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "x".repeat(501), kind: "progress", topic: "t" },
     });
     expect(isError(res)).toBe(true);
@@ -197,45 +197,45 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
 
   test("join with wrong password → auth failed error", async () => {
     const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const b = await makeAgent("b");
     const res = await b.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password: "aaaa-bbbb-cccc-dddd-eeee", memberName: "b" },
+      name: "channel",
+      arguments: { action: "join", channelId, password: "aaaa-bbbb-cccc-dddd-eeee", memberName: "b" },
     });
     expect(isError(res)).toBe(true);
     expect(textOf(res)).toContain("auth failed: wrong password");
   });
 
-  test("fetch_updates before any join → friendly no-channel error", async () => {
+  test("fetch_messages before any join → friendly no-channel error", async () => {
     const a = await makeAgent("a");
-    const res = await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    const res = await a.client.callTool({ name: "fetch_messages", arguments: {} });
     expect(isError(res)).toBe(true);
     expect(textOf(res)).toContain("no channel joined yet");
-    expect(textOf(res)).toContain("create_channel");
+    expect(textOf(res)).toContain('channel(action:"create")');
   });
 
-  test("fetch_updates with since beyond head → empty, no error", async () => {
+  test("fetch_messages with since beyond head → empty, no error", async () => {
     const a = await makeAgent("a");
-    await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } });
-    const res = await a.client.callTool({ name: "fetch_updates", arguments: { since: 1000 } });
+    await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } });
+    const res = await a.client.callTool({ name: "fetch_messages", arguments: { since: 1000 } });
     expect(isError(res)).toBe(false);
     const body = JSON.parse(unwrapQuote(textOf(res)));
     expect(body.messages).toHaveLength(0);
     expect(body.skipped).toBe(0);
   });
 
-  test("catch_up filters by topic and kind, pulls from relay when cache is short", async () => {
+  test("fetch_messages filters by topic/kind/scopePrefix, pulls from relay when cache is short", async () => {
     const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "auth: decided httpOnly cookie for tokens", kind: "decision", topic: "auth" },
     });
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: {
         statement: "db: index migration applied to users table",
         kind: "progress",
@@ -244,62 +244,64 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
       },
     });
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "auth: jwt refresh window shortened to 10m", kind: "contract", topic: "auth" },
     });
 
-    // B never fetched — catch_up must pull from the relay when its cache is short
+    // B never fetched — filtered fetch_messages must pull from the relay when its cache is short
     const b = await makeAgent("b");
     await b.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password: created.match(/password=([a-z0-9-]+)/)![1], memberName: "b" },
+      name: "channel",
+      arguments: { action: "join", channelId, password: created.match(/password=([a-z0-9-]+)/)![1], memberName: "b" },
     });
-    const byTopic = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "catch_up", arguments: { topic: "auth" } }))));
+    const byTopic = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { topic: "auth" } }))));
     expect(byTopic.messages).toHaveLength(2);
     expect(byTopic.messages[0].seq).toBeLessThan(byTopic.messages[1].seq); // oldest → newest
+    expect(byTopic.channelId).toBe(channelId);
+    expect(byTopic.remaining).toBe(0);
 
-    const byKind = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "catch_up", arguments: { kind: "decision" } }))));
+    const byKind = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { kind: "decision" } }))));
     expect(byKind.messages).toHaveLength(1);
     expect(byKind.messages[0].topic).toBe("auth");
 
-    const byScope = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "catch_up", arguments: { scopePrefix: "acme/repo-b" } }))));
+    const byScope = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { scopePrefix: "acme/repo-b" } }))));
     expect(byScope.messages).toHaveLength(1);
     expect(byScope.messages[0].topic).toBe("db");
 
-    const limited = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "catch_up", arguments: { topic: "auth", limit: 1 } }))));
+    const limited = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { topic: "auth", limit: 1 } }))));
     expect(limited.messages).toHaveLength(1);
     expect(limited.messages[0].statement).toContain("refresh window");
   });
 
-  test("search_messages supports AND/OR syntax and kind/topic post-filter", async () => {
+  test("fetch_messages query mode: AND/OR syntax and kind/topic post-filter", async () => {
     const a = await makeAgent("a");
-    await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } });
+    await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } });
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "use sqlite WAL mode for the cache", kind: "howto", topic: "db" },
     });
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "walrus site inspection scheduled", kind: "progress", topic: "zoo" },
     });
 
-    const hit = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "search_messages", arguments: { query: "sqlite&wal" } }))));
+    const hit = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "fetch_messages", arguments: { query: "sqlite&wal" } }))));
     expect(hit.messages).toHaveLength(1);
     expect(hit.messages[0].topic).toBe("db");
 
-    const none = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "search_messages", arguments: { query: "wal", topic: "zoo", kind: "decision" } }))));
+    const none = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "fetch_messages", arguments: { query: "wal", topic: "zoo", kind: "decision" } }))));
     expect(none.messages).toHaveLength(0);
   });
 
-  test("list_members returns the wrapped member list", async () => {    const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+  test("list(scope:members) returns the wrapped member list", async () => {    const a = await makeAgent("a");
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const b = await makeAgent("b");
     await b.client.callTool({
-      name: "join_channel",
-      arguments: { channelId, password: created.match(/password=([a-z0-9-]+)/)![1], memberName: "b" },
+      name: "channel",
+      arguments: { action: "join", channelId, password: created.match(/password=([a-z0-9-]+)/)![1], memberName: "b" },
     });
-    const res = await a.client.callTool({ name: "list_members", arguments: {} });
+    const res = await a.client.callTool({ name: "list", arguments: { scope: "members" } });
     const text = textOf(res);
     expect(text.startsWith(QUOTE_HEADER)).toBe(true);
     const body = JSON.parse(unwrapQuote(text));
@@ -307,9 +309,9 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(names).toEqual(["a", "b"]);
   });
 
-  test("list_members marks activity buckets from relay receipts", async () => {
+  test("list(scope:members) marks activity buckets from relay receipts", async () => {
     const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const password = created.match(/password=([a-z0-9-]+)/)![1];
     // join a second member via raw HTTP so we hold its token, then report
@@ -340,54 +342,137 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     const freshToken = await joinB("fresh-member");
     await postActivity(freshToken, new Date().toISOString());
 
-    const res = await a.client.callTool({ name: "list_members", arguments: {} });
+    const res = await a.client.callTool({ name: "list", arguments: { scope: "members" } });
     const body = JSON.parse(unwrapQuote(textOf(res))) as {
       members: Array<{ memberName: string; activity?: string }>;
     };
     const byName = new Map(body.members.map((m) => [m.memberName, m]));
     expect(byName.get("stale-member1")?.activity).toBe("idle");
     expect(byName.get("fresh-member")?.activity).toBe("recently-active");
-    // a's own list_members call IS activity (resolved the channel) → fresh bucket
+    // a's own list call IS activity (resolved the channel) → fresh bucket
     expect(byName.get("a")?.activity).toBe("recently-active");
   });
 
-  test("set_subscription persists filters per channel", async () => {
+  test("fetch_messages setFilters persists subscription filters per channel", async () => {
     const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const filters = [{ kinds: ["decision", "contract"] }, { topic: "auth" }];
-    const res = await a.client.callTool({ name: "set_subscription", arguments: { filters } });
+    const res = await a.client.callTool({ name: "fetch_messages", arguments: { setFilters: filters } });
     expect(JSON.parse(textOf(res))).toEqual({ ok: true, filters, channelId });
     expect(a.store.getKv(`subscription:${channelId}`)).toBe(JSON.stringify(filters));
   });
 
   test("channelId defaults to the most recently used channel", async () => {
     const a = await makeAgent("a");
-    const c1 = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const c1 = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const ch1 = c1.match(/channel_id=([a-z0-9]+)/)![1];
     const pw1 = c1.match(/password=([a-z0-9-]+)/)![1];
-    const c2 = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const c2 = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const ch2 = c2.match(/channel_id=([a-z0-9]+)/)![1];
     expect(ch2).not.toBe(ch1);
 
     // no channelId → lands in ch2 (most recent), NOT ch1
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "routed to the most recent channel", kind: "progress", topic: "t" },
     });
     const b = await makeAgent("b");
-    await b.client.callTool({ name: "join_channel", arguments: { channelId: ch1, password: pw1, memberName: "b" } });
-    const body = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: {} }))));
+    await b.client.callTool({ name: "channel", arguments: { action: "join", channelId: ch1, password: pw1, memberName: "b" } });
+    const body = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: {} }))));
     expect(body.messages).toHaveLength(0);
 
     // explicit channelId still reaches the older channel
     await a.client.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "explicitly routed to channel one", kind: "progress", topic: "t", channelId: ch1 },
     });
-    const body2 = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: {} }))));
+    const body2 = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: {} }))));
     expect(body2.messages).toHaveLength(1);
     expect(body2.messages[0].statement).toBe("explicitly routed to channel one");
+  });
+
+  test("list(scope:channels) lists the session ledger with query filtering", async () => {
+    const a = await makeAgent("a");
+    const c1 = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a", name: "alpha" } }));
+    const ch1 = c1.match(/channel_id=([a-z0-9]+)/)![1];
+    const c2 = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a", name: "beta" } }));
+    const ch2 = c2.match(/channel_id=([a-z0-9]+)/)![1];
+    const res = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "list", arguments: { scope: "channels" } }))));
+    expect(res.channels.map((c: { channelId: string }) => c.channelId).sort()).toEqual([ch1, ch2].sort());
+    expect(res.channels.every((c: { active: boolean }) => typeof c.active === "boolean")).toBe(true);
+    // query narrows by id or display-name substring
+    const filtered = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "list", arguments: { scope: "channels", query: "alpha" } }))));
+    expect(filtered.channels).toHaveLength(1);
+    expect(filtered.channels[0].channelId).toBe(ch1);
+    expect(filtered.channels[0].name).toBe("alpha");
+  });
+
+  test("channel leave: membership removed from the ledger, re-join works", async () => {
+    const a = await makeAgent("a");
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a", name: "bye" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    const b = await makeAgent("b");
+    await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "b" } });
+    // b leaves (channel survives — a is still active)
+    const left = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "channel", arguments: { action: "leave" } }))));
+    expect(left).toEqual({ ok: true, channelId, left: true });
+    const after = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "list", arguments: { scope: "channels" } }))));
+    expect(after.channels).toHaveLength(0);
+    // re-join with valid credentials works
+    const rejoined = await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "b" } });
+    expect(isError(rejoined)).toBe(false);
+  });
+
+  test("channel_info returns members with roles, topics and governance fields", async () => {
+    const a = await makeAgent("a");
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a", name: "briefed" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    await a.client.callTool({ name: "send_message", arguments: { statement: "decided: brief everyone", kind: "decision", topic: "meta" } });
+    const b = await makeAgent("b");
+    await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "b" } });
+
+    // creator A holds the display name locally (the blind relay stores no title)
+    const info = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "channel_info", arguments: {} }))));
+    expect(info.channelId).toBe(channelId);
+    expect(info.channelName).toBe("briefed");
+    expect(info.creatorMember).toBe("a");
+    expect(info.managerMember).toBe("a");
+    expect(info.admissionMode).toBe("password");
+    expect(info.topics.find((t: { topic: string }) => t.topic === "meta")?.count).toBe(1);
+    const names = (info.members as Array<{ memberName: string }>).map((m) => m.memberName).sort();
+    expect(names).toEqual(["a", "b"]);
+    const byName = new Map<string, { memberName: string; role?: string }>(
+      (info.members as Array<{ memberName: string; role?: string }>).map((m) => [m.memberName, m]),
+    );
+    expect(byName.get("a")?.role).toBe("creator");
+    expect(byName.get("b")?.role).toBe("member");
+    expect(Array.isArray(info.openVotes)).toBe(true);
+  });
+
+  test("join_from_blob parses the invite blob and joins the channel", async () => {
+    const a = await makeAgent("a");
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a", name: "blobby" } }));
+    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    const blob = Buffer.from(JSON.stringify({
+      relayUrl: baseUrl,
+      channelId,
+      credential: password,
+      channelName: "blobby",
+      admissionMode: "password",
+    }), "utf8").toString("base64");
+    const c = await makeAgent("c");
+    const card = textOf(await c.client.callTool({ name: "join_from_blob", arguments: { blob, memberName: "c" } }));
+    expect(card).toContain(channelId);
+    expect(card).toContain("blobby");
+    const list = JSON.parse(unwrapQuote(textOf(await c.client.callTool({ name: "list", arguments: { scope: "channels" } }))));
+    expect(list.channels).toHaveLength(1);
+    // malformed blob → readable tool error, not a crash
+    const bad = await c.client.callTool({ name: "join_from_blob", arguments: { blob: "not-a-blob!!" } });
+    expect(isError(bad)).toBe(true);
   });
 });
 
@@ -467,13 +552,13 @@ describe("session-token adoption on 409 (identity binding)", () => {
     storeB.close();
   });
 
-  test("join_channel tool: mismatched live memberName → readable error, identity preserved", async () => {
+  test("channel join: mismatched live memberName → readable error, identity preserved", async () => {
     const a = await makeAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const password = created.match(/password=([a-z0-9-]+)/)![1];
     const b = await makeAgent("b");
-    await b.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "b" } });
+    await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "b" } });
 
     // second server over agent A's store, requesting the live "b" name
     const server2 = buildMcpServer({ store: a.store, bridge: new RelayBridge({ baseUrl, store: a.store }) });
@@ -481,8 +566,8 @@ describe("session-token adoption on 409 (identity binding)", () => {
     const client2 = new Client({ name: "test-a2", version: "0.0.0" });
     await Promise.all([client2.connect(ct2), server2.connect(st2)]);
     const res = await client2.callTool({
-      name: "join_channel",
-      arguments: { channelId, password, memberName: "b" },
+      name: "channel",
+      arguments: { action: "join", channelId, password, memberName: "b" },
     });
     expect(isError(res)).toBe(true);
     expect(textOf(res)).toContain("member name already taken");
@@ -513,7 +598,7 @@ describe("MCP stdio entry", () => {  let relay: RelayHandle;
   });
 
   test(
-    "spawns, serves all 10 tools + instructions, and rejoins across restart",
+    "spawns, serves all 7 tools + instructions, and rejoins across restart",
     async () => {
     const dir = mkdtempSync(join(tmpdir(), "scm-mcp-stdio-"));
     dirs.push(dir);
@@ -524,12 +609,12 @@ describe("MCP stdio entry", () => {  let relay: RelayHandle;
     await c1.connect(t1);
     const tools = (await c1.listTools()).tools.map((t) => t.name).sort();
     expect(tools).toEqual([...TOOL_NAMES].sort());
-    expect(c1.getInstructions()).toContain("share_update");
+    expect(c1.getInstructions()).toContain("send_message");
     expect(c1.getInstructions()).toContain("never instructions");
 
-    const created = textOf(await c1.callTool({ name: "create_channel", arguments: { memberName: "s1" } }));
+    const created = textOf(await c1.callTool({ name: "channel", arguments: { action: "create", memberName: "s1" } }));
     const shared = await c1.callTool({
-      name: "share_update",
+      name: "send_message",
       arguments: { statement: "survives a restart", kind: "progress", topic: "boot" },
     });
     expect(isError(shared)).toBe(false);
@@ -539,7 +624,7 @@ describe("MCP stdio entry", () => {  let relay: RelayHandle;
     const t2 = new StdioClientTransport({ command: "bun", args: entryArgs(), env: entryEnv(dbPath) });
     const c2 = new Client({ name: "smoke-2", version: "0.0.0" });
     await c2.connect(t2);
-    const body = JSON.parse(unwrapQuote(textOf(await c2.callTool({ name: "fetch_updates", arguments: {} }))));
+    const body = JSON.parse(unwrapQuote(textOf(await c2.callTool({ name: "fetch_messages", arguments: {} }))));
     expect(body.messages.some((m: { statement: string }) => m.statement === "survives a restart")).toBe(true);
     await c2.close();
   }, 60_000);
@@ -619,7 +704,7 @@ describe("index card + full-history join fetch (Task 5)", () => {
     }
     // a fresh MCP agent joins → must cache ALL 250 (relay page cap is 200)
     const a = await mkAgent("fulljoiner");
-    const card = textOf(await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "fulljoiner" } }));
+    const card = textOf(await a.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "fulljoiner" } }));
     expect(a.store.searchCache(channelId, "").length).toBe(250);
     const body = JSON.parse(unwrapQuote(card));
     const topics = body.topics as Array<{ topic: string; count: number }>;
@@ -632,11 +717,11 @@ describe("index card + full-history join fetch (Task 5)", () => {
     const { channelId, password } = await seeder.createChannel({ memberName: "seed2" });
     await seeder.send({ statement: "only message", kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "seed2", source: "agent" } }, channelId);
     const a = await mkAgent("rejoiner");
-    await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "rejoiner" } });
+    await a.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "rejoiner" } });
     const cursorAfterFirst = a.store.getCursor(channelId);
     // re-join with fresh messages posted between joins
     await seeder.send({ statement: "second message", kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member: "seed2", source: "agent" } }, channelId);
-    await a.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "rejoiner" } });
+    await a.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "rejoiner" } });
     expect(a.store.getCursor(channelId)).toBeGreaterThanOrEqual(cursorAfterFirst);
     expect(a.store.searchCache(channelId, "").length).toBe(2); // no duplicates
   }, 60_000);
@@ -677,70 +762,70 @@ describe("structural digest posting (Task 7)", () => {
 
   test("evicted range with decisions → one digest posted, no duplicate on refetch", async () => {
     const a = await mkAgent("a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     // 6 messages: 1 decision + 5 progress; relay retains only the last 3 →
     // minSeq advances to 4, so the evicted-but-cached pending range (0,3]
     // holds 3 messages = the env-tuned watermark. The member caches as it
     // goes (fetch between sends) — a digest can only cover what this server
     // has actually seen.
-    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: WAL mode for cache", kind: "decision", topic: "db" } });
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "decided: WAL mode for cache", kind: "decision", topic: "db" } });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     for (let i = 1; i <= 5; i++) {
-      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "db" } });
-      if (i <= 2) await a.client.callTool({ name: "fetch_updates", arguments: {} });
+      await a.client.callTool({ name: "send_message", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "db" } });
+      if (i <= 2) await a.client.callTool({ name: "fetch_messages", arguments: {} });
     }
     // fetch → gap kv advances → watermark (3 evicted-but-cached ≥ 3) → digest
     // posted; the digest lands on the relay AFTER this poll, so the NEXT
     // fetch is what caches it locally.
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     const digests = a.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest");
     expect(digests.length).toBe(1);
     expect(digests[0].statement).toContain("decided: WAL mode for cache");
     expect((digests[0].scope as Record<string, string>).covers).toBe("1-3");
     // refetch → no duplicate (digested watermark + covers dedupe)
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     expect(a.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest").length).toBe(1);
   }, 60_000);
 
   test("evicted range with zero high-value messages → no digest posted", async () => {
     const a = await mkAgent("b");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "b" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "b" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     for (let i = 1; i <= 4; i++) {
-      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+      await a.client.callTool({ name: "send_message", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
     }
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     expect(a.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest").length).toBe(0);
   }, 60_000);
 
   test("second member does not re-post a digest covering the same range (covers dedupe)", async () => {
     const a = await mkAgent("dd-a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "dd-a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "dd-a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const password = created.match(/password=([a-z0-9-]+)/)![1];
     // both members cache the range that will be evicted
-    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: dedupe probe", kind: "decision", topic: "t" } });
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "decided: dedupe probe", kind: "decision", topic: "t" } });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     const b = await mkAgent("dd-b");
-    await b.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "dd-b" } });
-    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "dd-b" } });
+    await b.client.callTool({ name: "fetch_messages", arguments: {} });
     // seqs 2-3 sent and fetched by BOTH (before eviction)
     for (let i = 1; i <= 2; i++) {
-      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+      await a.client.callTool({ name: "send_message", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
     }
-    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    await b.client.callTool({ name: "fetch_messages", arguments: {} });
     // eviction pushes minSeq to 4; both hold seqs 1-3 cached
     for (let i = 3; i <= 5; i++) {
-      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+      await a.client.callTool({ name: "send_message", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
     }
     // A crosses the watermark first → posts the digest
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     // B's next fetch sees A's digest (poll caches it) → must NOT re-post;
     // one more fetch pulls back anything B itself posted, so the count is honest
-    await b.client.callTool({ name: "fetch_updates", arguments: {} });
-    await b.client.callTool({ name: "fetch_updates", arguments: {} });
+    await b.client.callTool({ name: "fetch_messages", arguments: {} });
+    await b.client.callTool({ name: "fetch_messages", arguments: {} });
     const bDigests = b.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest");
     expect(bDigests.length).toBe(1);
     expect(bDigests[0].statement).toContain("decided: dedupe probe");
@@ -748,25 +833,25 @@ describe("structural digest posting (Task 7)", () => {
 
   test("digest covers only the span its author actually cached (no overstatement)", async () => {
     const a = await mkAgent("cv-a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "cv-a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "cv-a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     const password = created.match(/password=([a-z0-9-]+)/)![1];
     // a sends 5 with the decision at seq 3, fetches → relay evicts 1-2, retains 3-5
-    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 1", kind: "progress", topic: "t" } });
-    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 2", kind: "progress", topic: "t" } });
-    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: covers probe", kind: "decision", topic: "t" } });
-    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 4", kind: "progress", topic: "t" } });
-    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 5", kind: "progress", topic: "t" } });
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "chatter 1", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "chatter 2", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "decided: covers probe", kind: "decision", topic: "t" } });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "chatter 4", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "chatter 5", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     // late joiner caches ONLY 3-5 (1-2 already evicted relay-side)
     const late = await mkAgent("cv-late");
-    await late.client.callTool({ name: "join_channel", arguments: { channelId, password, memberName: "cv-late" } });
+    await late.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "cv-late" } });
     // eviction advances to minSeq 6 → late's pending evicted-but-cached = 3-5
     for (let i = 6; i <= 8; i++) {
-      await a.client.callTool({ name: "share_update", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
+      await a.client.callTool({ name: "send_message", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "t" } });
     }
-    await late.client.callTool({ name: "fetch_updates", arguments: {} });
-    await late.client.callTool({ name: "fetch_updates", arguments: {} });
+    await late.client.callTool({ name: "fetch_messages", arguments: {} });
+    await late.client.callTool({ name: "fetch_messages", arguments: {} });
     const digests = late.store.searchCache(channelId, "digest").filter((m) => m.kind === "digest");
     expect(digests.length).toBe(1);
     // covers 3-5 (what the author saw), NOT 1-5 (what the range implies)
@@ -775,14 +860,14 @@ describe("structural digest posting (Task 7)", () => {
 
   test("partial coverage: only the un-digested subrange is posted (per-range dirty set)", async () => {
     const a = await mkAgent("pc-a");
-    const created = textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "pc-a" } }));
+    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "pc-a" } }));
     const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
     // decision at seq 3; digested ledger says 0-2 was already covered →
     // only seq 3 (the decision) may be digested
-    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 1", kind: "progress", topic: "t" } });
-    await a.client.callTool({ name: "share_update", arguments: { statement: "chatter 2", kind: "progress", topic: "t" } });
-    await a.client.callTool({ name: "share_update", arguments: { statement: "decided: late decision", kind: "decision", topic: "t" } });
-    await a.client.callTool({ name: "fetch_updates", arguments: {} });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "chatter 1", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "chatter 2", kind: "progress", topic: "t" } });
+    await a.client.callTool({ name: "send_message", arguments: { statement: "decided: late decision", kind: "decision", topic: "t" } });
+    await a.client.callTool({ name: "fetch_messages", arguments: {} });
     process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "1";
     a.store.setKv(`digested:${channelId}`, JSON.stringify([[0, 2]]));
     a.store.setKv(`gap:${channelId}`, "4");
@@ -796,7 +881,7 @@ describe("structural digest posting (Task 7)", () => {
       return original(msg, channelId);
     };
     try {
-      await a.client.callTool({ name: "fetch_updates", arguments: {} });
+      await a.client.callTool({ name: "fetch_messages", arguments: {} });
       // ledger now covers 0-3 (old 0-2 + new 3-3), merged
       expect(a.store.getKv(`digested:${channelId}`)).toBe(JSON.stringify([[0, 3]]));
     } finally {
