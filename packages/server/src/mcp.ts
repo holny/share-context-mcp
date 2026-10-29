@@ -472,10 +472,12 @@ Use this to start a collaboration space: one channel per project or workstream (
           .record(z.unknown())
           .optional()
           .describe("S3Bridge only: S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
+        admissionMode: z.enum(["public", "invite", "password"]).optional().describe("Admission mode. Default: password."),
+        contactInfo: z.string().max(256).optional().describe("Contact info for directory listing (invite/password tiers, opt-in)."),
       },
     },
-    safe(async ({ name, memberName, gitUrl, s3 }, extra) => {
-      const { channelId, password } = await bridge.createChannel({ name, memberName, gitUrl, s3 });
+    safe(async ({ name, memberName, gitUrl, s3, admissionMode, contactInfo }, extra) => {
+      const { channelId, password } = await bridge.createChannel({ name, memberName, gitUrl, s3, admissionMode, contactInfo });
       store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
       setActiveChannel(store, channelId);
       onChannelJoined?.(channelId); // create joins implicitly — start broadcasting

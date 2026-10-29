@@ -80,7 +80,7 @@ export interface PollResult {
 export interface ChannelBridge {
   /** Create a channel and join it as `memberName`. Returns the human-shareable secret.
    * gitUrl (GitBridge only): the remote repo URL for this channel. */
-  createChannel(opts: { name?: string; memberName: string; gitUrl?: string; s3?: S3ConnectionParams }): Promise<{ channelId: string; password: string }>;
+  createChannel(opts: { name?: string; memberName: string; gitUrl?: string; s3?: S3ConnectionParams; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }>;
   /** Join an existing channel with a password. gitUrl (GitBridge only): the remote repo URL. */
   join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;
   /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */

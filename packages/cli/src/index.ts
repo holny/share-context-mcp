@@ -60,7 +60,11 @@ async function cmdCreateChannel() {
   const { RelayBridge } = await import("@share-context-mcp/server");
   const store = new Store(dbPath());
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
-  const created = await bridge.createChannel({ memberName: arg("member") ?? "me" });
+  const created = await bridge.createChannel({
+    memberName: arg("member") ?? "me",
+    admissionMode: arg("mode"),
+    contactInfo: arg("contact"),
+  });
   console.log(`\n✅ Channel created!\n  channel_id: ${created.channelId}\n  password:   ${created.password}\n`);
 }
 
@@ -289,6 +293,7 @@ async function cmdChannelSetAdmission() {
   if (contact) body.contactInfo = contact;
   const out = await relayPostJson(id, "/set-admission", body);
   console.log(`✅ admission mode = ${out.mode} (future admissions only — existing members unaffected)`);
+  if (typeof out.warning === "string") console.log(`⚠️  ${out.warning}`);
 }
 
 async function cmdRotate() {
