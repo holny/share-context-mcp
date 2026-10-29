@@ -261,8 +261,8 @@ async function cmdChannelUnban() {
   const name = arg("name");
   if (!name) { console.error("Error: --name required"); process.exit(1); }
   const out = await relayPostJson(id, "/unban", { name });
-  if (out.ok === false) console.log(`⚠️  ${name} had no active ban — nothing changed.`);
-  else console.log(`✅ ${name} unbanned${out.reminder ? ` — ${out.reminder}` : ""} (readmission still needs valid credentials)`);
+  if (out.ok) console.log(`✅ ${name} unbanned${out.reminder ? ` — ${out.reminder}` : ""}`);
+  else console.log(`⚠️  ${name} had no active ban — nothing changed.`);
 }
 
 async function cmdChannelRevokeInvite() {

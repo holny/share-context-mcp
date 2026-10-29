@@ -637,20 +637,27 @@ export class RelayBridge implements ChannelBridge {
 
   /**
    * Invite-tier join: the code is self-contained (code id + wrapped channel
-   * key). Parses it, presents the code id to the relay, stores the code as
-   * the channel secret (channelKey() unwraps it later).
+   * key). Parses it, presents the code id to the relay, captures the issued
+   * token from the join response, and stores the code as the channel secret
+   * (channelKey() unwraps it later).
    */
   async joinWithInvite(channelId: string, code: string, memberName: string): Promise<void> {
     const { parseInviteCode } = await import("@share-context-mcp/protocol");
     const parsed = parseInviteCode(code);
-    await this.request(`/channels/${channelId}/join`, {
+    const joined = (await this.request(`/channels/${channelId}/join`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ memberName, consumerId: this.consumerId, inviteCodeId: parsed.codeId }),
+    })) as { token?: string; epoch?: number };
+    if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
+    this.tokens.set(channelId, joined.token);
+    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: joined.token, memberName }));
+    this.store.upsertChannel({
+      channelId,
+      password: code,
+      memberName,
+      epoch: typeof joined.epoch === "number" ? joined.epoch : 1,
     });
-    this.tokens.set(channelId, (this.loadStoredSession(channelId)?.token ?? ""));
-    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: this.loadStoredSession(channelId)?.token ?? "", memberName }));
-    this.store.upsertChannel({ channelId, password: code, memberName, epoch: 1 });
     this.defaultChannelId = channelId;
   }
 }

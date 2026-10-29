@@ -12,10 +12,10 @@ opencode v2 伴生插件（spec §5.4）—— share-context-mcp 的真·实时�
    \n\n---
    📋 协作通道：N 条新消息（M 条 @你）
    - [#seq·kind·topic] from: statement
-   用 fetch_updates 展开详情
+   用 fetch_messages 展开详情
    ```
 
-4. **防遗忘**：跟踪每会话工具动作（edit/write/patch/bash/shell 记为动作；`share_update` 记为已分享）。在**下一轮开始**（`session.execution.started` 事件）判定上一轮：有写动作且未分享 → 注入一句温和提示（含"忽略"出口）。锚定在下一轮开始而非 idle 边界，是因为 idle 事件异步到达可能与下一轮的 hook 交错（测试中实际复现过误报）；而 `started` 触发时上一轮的所有 hook 必然已完成。
+4. **防遗忘**：跟踪每会话工具动作（edit/write/patch/bash/shell 记为动作；`send_message` 记为已分享）。在**下一轮开始**（`session.execution.started` 事件）判定上一轮：有写动作且未分享 → 注入一句温和提示（含"忽略"出口）。锚定在下一轮开始而非 idle 边界，是因为 idle 事件异步到达可能与下一轮的 hook 交错（测试中实际复现过误报）；而 `started` 触发时上一轮的所有 hook 必然已完成。
 
 ## 配置（环境变量）
 
