@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deriveChannelKey, seal, open, hmacProof, mintAdmissionCredential, parseAdmissionCredential, mintInviteCode, parseInviteCode } from "../src/crypto";
+import { deriveChannelKey, seal, open, hmacProof, mintAdmissionCredential, parseAdmissionCredential, mintInviteCode, parseInviteCode, encodeJoinBlob, parseJoinBlob } from "../src/crypto";
 import { validateClaim, type ClaimMessage } from "../src/schema";
 
 function validInput() {
@@ -132,5 +132,46 @@ describe("self-contained credentials", () => {
   test("parse rejects tampered/truncated credentials", () => {
     expect(() => parseAdmissionCredential("scmc1-garbage")).toThrow();
     expect(() => parseInviteCode("scmc1-garbage")).toThrow();
+  });
+});
+
+describe("join blob (spec §14: copy-paste onboarding)", () => {
+  test("encode → parse round trip preserves every field", () => {
+    const params = {
+      relayUrl: "https://relay.corp.internal:8931",
+      channelId: "abc123def456",
+      credential: "scmc1-aaaa-bbbb",
+      channelName: "auth-refactor",
+      admissionMode: "password",
+    };
+    const blob = encodeJoinBlob(params);
+    expect(typeof blob).toBe("string");
+    // base64(JSON), no whitespace surprises when pasted with surrounding text
+    expect(blob).not.toMatch(/\s/);
+    expect(parseJoinBlob(blob)).toEqual(params);
+  });
+
+  test("invite-code blobs round trip; credential optional per mode", () => {
+    const params = {
+      relayUrl: "http://127.0.0.1:8931",
+      channelId: "ch-invite001",
+      inviteCode: "scmc1-xxxx-yyyy",
+      admissionMode: "invite",
+    };
+    expect(parseJoinBlob(encodeJoinBlob(params))).toEqual(params);
+  });
+
+  test("parse tolerates surrounding whitespace (copy-paste margin)", () => {
+    const blob = encodeJoinBlob({ channelId: "abc123def456", credential: "scmc1-zzz" });
+    expect(parseJoinBlob(`  ${blob}\n`)).toEqual({ channelId: "abc123def456", credential: "scmc1-zzz" });
+  });
+
+  test("malformed blobs fail with readable errors", () => {
+    expect(() => parseJoinBlob("not-a-blob!!")).toThrow(/JSON/);
+    expect(() => parseJoinBlob(Buffer.from("[1,2]", "utf8").toString("base64"))).toThrow(/JSON object/);
+    expect(() => parseJoinBlob(Buffer.from(JSON.stringify({ channelName: "no id" }), "utf8").toString("base64"))).toThrow(/channelId/);
+    expect(() =>
+      parseJoinBlob(Buffer.from(JSON.stringify({ channelId: "abc" }), "utf8").toString("base64")),
+    ).toThrow(/credential or inviteCode/);
   });
 });

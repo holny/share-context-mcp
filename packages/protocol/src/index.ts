@@ -11,6 +11,9 @@ export {
   parseAdmissionCredential,
   mintInviteCode,
   parseInviteCode,
+  encodeJoinBlob,
+  parseJoinBlob,
+  type JoinBlob,
   type SealedEnvelope,
 } from "./crypto";
 export {

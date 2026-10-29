@@ -255,5 +255,69 @@ export function parseInviteCode(code: string): { codeId: string; channelKey: Uin
   return { codeId, channelKey, expiresAt };
 }
 
+// ---- join blob (spec §14: copy-paste onboarding) ----
+//
+// A join blob carries everything an agent needs to join in one pasteable
+// string: base64(JSON) — compact, no line breaks, safe to wrap in quotes.
+// The credential/inviteCode travel INSIDE the blob exactly as the human
+// received them; the blob adds no secrecy of its own.
+
+export interface JoinBlob {
+  /** Relay base URL the blob was minted for. */
+  relayUrl?: string;
+  channelId: string;
+  /** Password-tier admission credential (password / scmc1- credential). */
+  credential?: string;
+  /** Invite-tier single-use code. */
+  inviteCode?: string;
+  /** Display name, local-only (the blind relay stores no title). */
+  channelName?: string;
+  /** Admission mode at mint time — informational. */
+  admissionMode?: string;
+}
+
+/** Encode join parameters into a copy-pasteable base64(JSON) blob. */
+export function encodeJoinBlob(params: JoinBlob): string {
+  return Buffer.from(JSON.stringify(params), "utf8").toString("base64");
+}
+
+/**
+ * Decode a join blob. Tolerates surrounding whitespace (terminal/chat
+ * copy-paste margin). Throws readable errors — the caller (MCP tool / CLI)
+ * surfaces them verbatim.
+ */
+export function parseJoinBlob(blob: string): JoinBlob {
+  let json: string;
+  try {
+    json = Buffer.from(blob.trim(), "base64").toString("utf8");
+  } catch {
+    throw new Error("invalid join blob: not valid base64");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error("invalid join blob: payload is not JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("invalid join blob: payload must be a JSON object");
+  }
+  const b = parsed as Record<string, unknown>;
+  if (typeof b.channelId !== "string" || b.channelId.length === 0) {
+    throw new Error("invalid join blob: channelId missing");
+  }
+  if (typeof b.credential !== "string" && typeof b.inviteCode !== "string") {
+    throw new Error("invalid join blob: needs credential or inviteCode");
+  }
+  return {
+    ...(typeof b.relayUrl === "string" && b.relayUrl.length > 0 ? { relayUrl: b.relayUrl } : {}),
+    channelId: b.channelId,
+    ...(typeof b.credential === "string" ? { credential: b.credential } : {}),
+    ...(typeof b.inviteCode === "string" ? { inviteCode: b.inviteCode } : {}),
+    ...(typeof b.channelName === "string" ? { channelName: b.channelName } : {}),
+    ...(typeof b.admissionMode === "string" ? { admissionMode: b.admissionMode } : {}),
+  };
+}
+
 export { idempotencyKey } from "./schema";
 export type { ClaimKind, ClaimMessage, ClaimProvenance, ClaimSource } from "./schema";

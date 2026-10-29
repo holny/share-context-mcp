@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -58,19 +58,47 @@ async function cmdServer() {
 async function cmdCreateChannel() {
   const { Store } = await import("@share-context-mcp/server");
   const { RelayBridge } = await import("@share-context-mcp/server");
+  const { encodeJoinBlob } = await import("@share-context-mcp/protocol");
   const store = new Store(dbPath());
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
+  const mode = arg("mode");
   const created = await bridge.createChannel({
     memberName: arg("member") ?? "me",
-    admissionMode: arg("mode"),
+    admissionMode: mode,
     contactInfo: arg("contact"),
   });
-  console.log(`\n✅ Channel created!\n  channel_id: ${created.channelId}\n  password:   ${created.password}\n`);
+  console.log(`\n✅ Channel created!\n  channel_id: ${created.channelId}\n  password:   ${created.password}`);
+  // Copy-paste onboarding (spec §14): the join blob carries everything a
+  // teammate's agent needs — no juggling channel_id + password by hand.
+  const blob = encodeJoinBlob({
+    relayUrl: relayUrl(),
+    channelId: created.channelId,
+    credential: created.password,
+    admissionMode: mode ?? "password",
+  });
+  console.log(`\n  join blob (paste to an agent, or: share-context join --blob "<blob>"):\n  ${blob}\n`);
 }
 
 async function cmdJoin() {
   const { Store, RelayBridge } = await import("@share-context-mcp/server");
   const store = new Store(dbPath());
+  const blobStr = arg("blob");
+  if (blobStr) {
+    // Copy-paste onboarding (spec §14): one string carries relay, channel,
+    // credential/invite code. Join against the blob's own relay when given.
+    const { parseJoinBlob } = await import("@share-context-mcp/protocol");
+    const blob = parseJoinBlob(blobStr);
+    const bridge = new RelayBridge({ baseUrl: blob.relayUrl ?? relayUrl(), store });
+    const member = arg("member") ?? (hostname().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "me");
+    if (blob.inviteCode) {
+      await bridge.joinWithInvite(blob.channelId, blob.inviteCode, member);
+    } else {
+      await bridge.join(blob.channelId, blob.credential!, member);
+    }
+    if (blob.channelName) store.setKv(`channelName:${blob.channelId}`, blob.channelName);
+    console.log(`\n✅ Joined ${blob.channelName ?? blob.channelId} as ${member} (via join blob)\n`);
+    return;
+  }
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
   const inviteCode = arg("invite-code");
   if (inviteCode) {
@@ -145,7 +173,7 @@ Commands:
   relay                        Start blind relay server
   server                       Start local MCP server (stdio)
   create-channel               Create a channel (--member <name> [--mode public|invite|password] [--contact "..."])
-  join                         Join a channel (--channel-id <id> --password <pw> | --invite-code <code> --member <name>)
+  join                         Join a channel (--channel-id <id> --password <pw> | --invite-code <code> | --blob "<blob>") [--member <name>]
   status                       Show channel status (roles, admission mode, contact)
   fetch                        Fetch recent messages
   leave                        Leave channels (--channel-id <id> [--transfer-to <name>])
@@ -341,6 +369,14 @@ async function cmdInvite() {
   const reg = await relayPostJson(id, "/invite-codes", { codeId, expiresAt: Date.now() + ttlHours * 3_600_000 });
   void reg;
   console.log(`✅ invite code (expires in ${ttlHours}h, single-use):\n${code}`);
+  const { encodeJoinBlob } = await import("@share-context-mcp/protocol");
+  const blob = encodeJoinBlob({
+    relayUrl: relayUrl(),
+    channelId: id,
+    inviteCode: code,
+    admissionMode: "invite",
+  });
+  console.log(`\n  join blob (paste to an agent, or: share-context join --blob "<blob>"):\n${blob}`);
 }
 
 async function cmdTokenRefresh() {

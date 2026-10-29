@@ -10,7 +10,7 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { CLAIM_KINDS, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
+import { CLAIM_KINDS, parseJoinBlob, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { hostname } from "node:os";
 import { INSTRUCTIONS } from "./instructions";
 import { buildDigestMessages } from "./digest";
@@ -407,53 +407,6 @@ const channelIdParam = {
 };
 
 // ---- join blob (spec §14: copy-paste onboarding) ----
-
-export interface JoinBlob {
-  relayUrl?: string;
-  channelId: string;
-  credential?: string;
-  inviteCode?: string;
-  channelName?: string;
-  admissionMode?: string;
-}
-
-/**
- * Parse a join blob: base64(JSON). The CLI produces it with encodeJoinBlob
- * (protocol); here we only need the decode side. Throws readable errors on
- * malformed input — surfaced as a tool error, never a crash.
- */
-export function parseJoinBlob(blob: string): JoinBlob {
-  let json: string;
-  try {
-    json = Buffer.from(blob.trim(), "base64").toString("utf8");
-  } catch {
-    throw new Error("invalid join blob: not valid base64");
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(json);
-  } catch {
-    throw new Error("invalid join blob: payload is not JSON");
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    throw new Error("invalid join blob: payload must be a JSON object");
-  }
-  const b = parsed as Record<string, unknown>;
-  if (typeof b.channelId !== "string" || b.channelId.length === 0) {
-    throw new Error("invalid join blob: channelId missing");
-  }
-  if (typeof b.credential !== "string" && typeof b.inviteCode !== "string") {
-    throw new Error("invalid join blob: needs credential or inviteCode");
-  }
-  return {
-    relayUrl: typeof b.relayUrl === "string" ? b.relayUrl : undefined,
-    channelId: b.channelId,
-    credential: typeof b.credential === "string" ? b.credential : undefined,
-    inviteCode: typeof b.inviteCode === "string" ? b.inviteCode : undefined,
-    channelName: typeof b.channelName === "string" ? b.channelName : undefined,
-    admissionMode: typeof b.admissionMode === "string" ? b.admissionMode : undefined,
-  };
-}
 
 /** Default member name when a blob join does not carry one: machine hostname. */
 function defaultMemberName(): string {
