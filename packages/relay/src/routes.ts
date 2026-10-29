@@ -329,6 +329,17 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     const now = Date.now();
     stmtSetCooldown.run(now + VOTE_GLOBAL_COOLDOWN_MS, channelId);
     if (!vote) return;
+    if (vote.type === "kick") {
+      // Target departed mid-vote (status left/removed) → the vote is VOID:
+      // no kick applies (there is no one to kick); the 4h global cooldown
+      // still applies.
+      const targetRow = stmtMemberByName.get(channelId, vote.target) as MemberRow | undefined;
+      if (!targetRow || targetRow.status !== "active") {
+        db.prepare("UPDATE votes SET status = 'expired' WHERE channel_id = ? AND id = ?").run(channelId, voteId);
+        wsHub?.notifyGovernance(channelId, { type: "vote-settled", voteId, target: vote.target, outcome: "expired" });
+        return;
+      }
+    }
     if (passed && vote.type === "kick") {
       const params = vote.params_json ? (JSON.parse(vote.params_json) as { banIp?: boolean; revokeInvitees?: boolean }) : {};
       const ip = (
@@ -338,10 +349,32 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       )?.ip ?? undefined;
       applyKick(db, channelId, vote.target, vote.initiator, { ip, banIp: params.banIp === true });
       if (params.revokeInvitees === true) {
+        // Strip invite rights from everyone the target invited — EXCLUDING
+        // the manager/creator (governance continuity, spec §4).
+        const chRow = db.prepare("SELECT creator_member, manager_member FROM channels WHERE id = ?").get(channelId) as
+          | { creator_member: string | null; manager_member: string | null }
+          | undefined;
         db.prepare(
-          "UPDATE members SET can_invite = 0 WHERE channel_id = ? AND name IN (SELECT used_by FROM invite_codes WHERE channel_id = ? AND owner = ?) AND name != ? AND name != ?",
-        ).run(channelId, channelId, vote.target, vote.target, vote.initiator);
+          "UPDATE members SET can_invite = 0 WHERE channel_id = ? AND name IN (SELECT used_by FROM invite_codes WHERE channel_id = ? AND owner = ?) AND name != ? AND name != ? AND name != ? AND name != ?",
+        ).run(channelId, channelId, vote.target, vote.target, vote.initiator, chRow?.creator_member ?? "", chRow?.manager_member ?? "");
       }
+      // Surgical invite-code disposition (invite tier, §4): the code the
+      // target USED is revoked permanently; its owner is notified to mint a
+      // fresh one (self-contained codes are owner-minted — the relay cannot
+      // mint them).
+      const usedCode = db.prepare("SELECT code_id, owner, status FROM invite_codes WHERE channel_id = ? AND used_by = ?").get(channelId, vote.target) as
+        | { code_id: string; owner: string; status: string }
+        | undefined;
+      const notifiedOwners: string[] = [];
+      if (usedCode && usedCode.status !== "revoked") {
+        db.prepare("UPDATE invite_codes SET status = 'revoked' WHERE channel_id = ? AND code_id = ?").run(channelId, usedCode.code_id);
+        if (!notifiedOwners.includes(usedCode.owner)) notifiedOwners.push(usedCode.owner);
+      }
+      // F-12: pass-path frozen codes (target's network) get the 7-day ban
+      // expiry instead of staying frozen forever.
+      db.prepare(
+        "UPDATE invite_codes SET status = 'revoked', expires_at = ? WHERE channel_id = ? AND status = 'frozen'",
+      ).run(now + 7 * 86_400_000, channelId);
       // Successor stat profile (§4 notice): when the target held a role, the
       // notice names the successor — roles already moved by applyKick.
       const ch2 = db.prepare("SELECT creator_member, manager_member FROM channels WHERE id = ?").get(channelId) as
@@ -365,13 +398,18 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           totalShare: totalAll > 0 ? Math.round((total / totalAll) * 100) : 0,
         };
       };
+      // Successor attribution: only meaningful when the CREATOR role moved
+      // (manager succession alone doesn't produce a "successor").
       const settleFrame: Record<string, unknown> = {
         type: "vote-settled",
         voteId,
         target: vote.target,
         outcome: "passed",
         profile: prof(vote.target),
-        ...(successor ? { successor, successorProfile: prof(successor) } : {}),
+        ...(successor && vote.target === (db.prepare("SELECT creator_member FROM channels WHERE id = ?").get(channelId) as { creator_member: string }).creator_member
+          ? { successor, successorProfile: prof(successor) }
+          : {}),
+        ...(notifiedOwners.length > 0 ? { notifyCodeOwners: notifiedOwners } : {}),
       };
       wsHub?.notifyGovernance(channelId, settleFrame);
     }
@@ -679,10 +717,17 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       const choice = parsed.body.choice;
       if (choice !== "yes" && choice !== "no") return jsonError(400, "invalid request: choice must be yes|no");
       const vote = stmtVoteById.get(channelId, voteId) as
-        | { status: string; initiator: string; target: string }
+        | { status: string; initiator: string; target: string; ends_at: number }
         | undefined;
       if (!vote) return jsonError(404, "vote not found");
       if (vote.status !== "open") return jsonError(409, "vote settled");
+      // Expired-but-unswept (the sweep runs on an interval): settle now, then
+      // reject the late ballot.
+      if (vote.ends_at <= Date.now()) {
+        checkSettle(channelId, voteId);
+        settleExpiredVotes();
+        return jsonError(409, "vote settled");
+      }
       if (vote.target === voter) return jsonError(403, "target cannot vote");
       // checkSettle may settle early; ballot insert first, then settle check
       try {
@@ -877,7 +922,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           return jsonError(403, "invite right revoked or managers-only policy");
         }
         const exp = typeof expiresAt === "number" && expiresAt > now ? expiresAt : null;
-        stmtInsertInviteCode.run(channelId, codeId, auth.member.name, new Date().toISOString(), exp);
+        try {
+          stmtInsertInviteCode.run(channelId, codeId, auth.member.name, new Date().toISOString(), exp);
+        } catch {
+          return jsonError(409, "invite code id already registered");
+        }
         audit(channelId, auth.member.name, "invite.minted", codeId, "ok");
         return json({ ok: true, codeId });
       }
@@ -912,7 +961,13 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           channelId,
         );
         audit(channelId, name, "admission.changed", mode, `policy=${auth.channel.invite_policy}`);
-        return json({ ok: true, mode });
+        return json({
+          ok: true,
+          mode,
+          ...(mode === "password" && auth.channel.admission_credential_revoked === 1
+            ? { warning: "admission credential was revoked by a kick — run `rotate --mode access` to mint a fresh credential before accepting new members" }
+            : {}),
+        });
       }
 
       case "transfer": {
@@ -957,9 +1012,14 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         // Mark left + revoke tokens.
         stmtLeave.run(channelId, name);
+        // An open kick vote targeting the leaver is VOID (F-15): no kick
+        // applies to a departed member.
+        const openVote = stmtOpenVote.get(channelId) as { id: string; target: string } | undefined;
+        if (openVote && openVote.target === name) {
+          settleVote(channelId, openVote.id, false);
+        }
         // Succession.
-        if (isCreator) {
-          const successor =
+        if (isCreator) {          const successor =
             transferTo !== null && transferTo !== name
               ? transferTo
               : defaultSuccessor(channelId, name);
@@ -1104,7 +1164,12 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           db.prepare("UPDATE members SET status = 'active', token_hash = NULL, token_expires_at = NULL WHERE channel_id = ? AND name = ?").run(channelId, name);
         }
         audit(channelId, auth.member.name, res.changes > 0 ? "member.unbanned" : "unban.noop", name, res.changes > 0 ? "ok" : "no ban row");
-        return json({ ok: res.changes > 0 });
+        return json({
+          ok: res.changes > 0,
+          ...(res.changes > 0 && (auth.channel.admission_mode ?? "password") === "password"
+            ? { reminder: "readmission requires the CURRENT admission credential — fetch it from the manager/creator" }
+            : {}),
+        });
       }
 
       case "invite-rights": {

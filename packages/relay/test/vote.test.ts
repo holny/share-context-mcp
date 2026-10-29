@@ -154,7 +154,56 @@ describe("vote module", () => {
     expect(votes2.open.find((v) => v.id === voteId)).toBeUndefined();
     expect(votes2.history.find((v) => v.id === voteId)?.status).toBe("passed");
     // bob (manager) banned + succession: creator alice re-takes manager
-    const meta = (await (await get(`/channels/${channelId}/meta`, tokens.alice)).json()) as { managerMember: string };
-    expect(meta.managerMember).toBe("alice");
+    const metaAfter = (await (await get(`/channels/${channelId}/meta`, tokens.alice)).json()) as { managerMember: string };
+    expect(metaAfter.managerMember).toBe("alice");
+  });
+
+  test("edge behaviors: expired-vote ballot 409, --revoke-invitees exempt leadership, target-left voids", async () => {
+    const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol", "dave"]);
+    // late ballot on an expired-but-unswept vote: backdate ends_at via db, then ballot → 409
+    const opened = await startVote(channelId, tokens.alice, { target: "dave" });
+    const { voteId } = (await opened.json()) as { voteId: string };
+    relay.db.prepare("UPDATE votes SET ends_at = ? WHERE channel_id = ? AND id = ?").run(Date.now() - 1000, channelId, voteId);
+    const late = await castBallot(channelId, voteId, tokens.alice, "yes");
+    expect(late.status).toBe(409);
+    const votesAfter = await getVotes(channelId, tokens.alice);
+    expect(votesAfter.open.find((v) => v.id === voteId)).toBeUndefined(); // settled by the late ballot
+
+    // --revoke-invitees: manager/creator invitees are EXEMPT from can_invite=0
+    const { channelId: cid2, tokens: t2 } = await makeChannel("password", ["alice", "bob", "carol", "dave"]);
+    // carol (creator alice's invitee — recorded by making her use alice's code) — simulate:
+    // register a code owned by alice, used_by carol
+    const reg = await post(`/channels/${cid2}/invite-codes`, { codeId: "code-alice-c1", expiresAt: Date.now() + 86_400_000 }, t2.alice);
+    expect(reg.status).toBe(200);
+    relay.db.prepare("UPDATE invite_codes SET used_by = 'carol' WHERE channel_id = ? AND code_id = 'code-alice-c1'").run(cid2);
+    // also a code owned by alice used by dave
+    const reg2 = await post(`/channels/${cid2}/invite-codes`, { codeId: "code-alice-d1", expiresAt: Date.now() + 86_400_000 }, t2.alice);
+    expect(reg2.status).toBe(200);
+    relay.db.prepare("UPDATE invite_codes SET used_by = 'dave' WHERE channel_id = ? AND code_id = 'code-alice-d1'").run(cid2);
+    // kick target bob with --revoke-invitees: bob invited nobody → no-op for others,
+    // but the vote settles and dave (invitee of creator) keeps his right
+    const opened2 = await startVote(cid2, tokens.alice, { target: "bob", revokeInvitees: true });
+    const { voteId: vid2 } = (await opened2.json()) as { voteId: string };
+    await castBallot(cid2, vid2, t2.alice, "yes");
+    await castBallot(cid2, vid2, t2.carol, "yes");
+    await castBallot(cid2, vid2, t2.dave, "yes");
+    // dave is an invitee of the creator (not the target) → right intact
+    const daveRow = relay.db.prepare("SELECT can_invite FROM members WHERE channel_id = ? AND name = 'dave'").get(cid2) as { can_invite: number };
+    expect(daveRow.can_invite).toBe(1);
+  });
+
+  test("target leaving mid-vote voids the vote (expired), no kick applies", async () => {
+    const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol"]);
+    const opened = await startVote(channelId, tokens.alice, { target: "carol" });
+    const { voteId } = (await opened.json()) as { voteId: string };
+    await castBallot(channelId, voteId, tokens.alice, "yes");
+    await castBallot(channelId, voteId, "bob", "yes");
+    // target carol leaves mid-vote
+    await post(`/channels/${channelId}/leave`, {}, tokens.carol);
+    // settlement: voided — carol NOT banned (she's gone; row status left, no ban row)
+    const votes = await getVotes(channelId, tokens.alice);
+    expect(votes.history.find((v) => v.id === voteId)?.status).toBe("expired");
+    const banRow = relay.db.prepare("SELECT name FROM member_bans WHERE channel_id = ? AND name = 'carol'").get(channelId);
+    expect(banRow).toBeNull();
   });
 });

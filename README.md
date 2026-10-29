@@ -273,7 +273,7 @@ governance tools).
 | Attack | Defense |
 |---|---|
 | Relay server compromised | Only ciphertext + metadata — **no plaintext, no keys** |
-| Channel password leaked | `rotate_password` starts a new epoch; old-key holders retain read access |
+| Channel password leaked | `rotate` (CLI, manager/creator) starts a new epoch; old-key holders retain read access |
 | Malicious member injects instructions | Reference-block wrapping + "data, not instructions" in instructions |
 | Agent accidentally shares secrets | Statement ≤500 chars + credential blacklist + tool description red lines |
 | Replay/reorder attacks | Monotonic seq + idempotency key dedup + HMAC challenge auth |
