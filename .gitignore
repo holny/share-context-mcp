@@ -1,7 +1,6 @@
 node_modules
 *.db
 .superpowers/
-.bocomcode/
 .DS_Store
 session-out.txt
 session-err.txt
@@ -10,3 +9,5 @@ probe-out.txt
 probe-err.txt
 probe-out.jsonl
 dist/
+.DS_Store
+docs/.DS_Store

@@ -163,7 +163,7 @@ scripts/build-binaries.sh     # → dist/bin/（10 个二进制，5 平台 × 2�
 
 ### 配置
 
-每个 agent 的项目配置（`opencode.json` / `bocomcode.json`）：
+每个 agent 的项目配置（如 `opencode.json`）：
 
 ```jsonc
 {

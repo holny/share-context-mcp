@@ -191,7 +191,7 @@ scripts/build-binaries.sh     # → dist/bin/ (10 binaries, 5 platforms × 2)
 
 ### Configure
 
-Each agent's project config (`opencode.json` / `bocomcode.json`):
+Each agent's project config (e.g. `opencode.json`):
 
 ```jsonc
 {

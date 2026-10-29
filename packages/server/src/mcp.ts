@@ -365,7 +365,7 @@ function activityBucket(lastActiveAt: string | null | undefined): string | undef
 
 /**
  * Consumer identity for one MCP server process serving many agent sessions.
- * opencode-family clients (upstream opencode, bocomcode_v2 — verified at
+ * opencode-family clients (verified against the opencode client source at
  * packages/core/src/mcp/client.ts) send `_meta: {"ai.opencode/sessionID": id}`
  * on every tools/call; the SDK passes request `_meta` through to the handler
  * via `extra._meta`. Sessions sharing one process get distinct consumer ids;

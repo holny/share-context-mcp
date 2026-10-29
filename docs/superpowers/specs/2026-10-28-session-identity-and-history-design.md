@@ -34,7 +34,7 @@ M1–M3 shipped a working E2E-encrypted shared context channel (relay/git/s3 bri
 
 ### Consumer identity
 - **A. `_meta` sessionID from the client (chosen)** — verified evidence:
-  opencode upstream `packages/core/src/mcp/client.ts:375` and bocomcode_v2
+  opencode upstream `packages/core/src/mcp/client.ts:375` and the deployed
   `client.ts:394` send `_meta: {"ai.opencode/sessionID": <id>}` on every
   `tools/call`. MCP SDK 1.32.2 (latest, already in use) passes request `_meta`
   to every tool handler via `extra._meta` (`protocol.js:345`,
@@ -63,7 +63,7 @@ process restart replays, nothing is lost).
 - **A. Structural channel index (chosen, zero LLM)** — see below.
 - B. Server-configured LLM summaries — new config burden, rejected.
 - C. MCP sampling (server asks client's LLM) — verified unsupported by all target
-  hosts (opencode upstream, bocomcode_v2, codex: no `sampling/createMessage`
+  hosts (opencode upstream, the deployed fork, codex: no `sampling/createMessage`
   implementation). Rejected.
 - D. Tool-mediated LLM enhancement (agent writes digest via share_update) —
   viable but deferred: marginal value over structural digests is small because
@@ -147,7 +147,7 @@ SHARE_CONTEXT_DIGEST_MAX_AGE_DAYS=7      # digest watermark (time bound)
 - `kind="digest"` added to protocol CLAIM_KINDS + supersede handling in card/catch_up.
 - Session isolation tests extended: two sessions sharing one server process, distinct
   consumer ids, independent delivered cursors.
-- Fork-plugin loader note unchanged (explicit `.ts` extensions, `bocomcode.json`).
+- Fork-plugin loader note unchanged (explicit `.ts` extensions, platform config file).
 
 ## Future Extensions (explicitly out of v1)
 

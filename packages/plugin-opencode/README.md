@@ -26,7 +26,7 @@ opencode v2 伴生插件（spec §5.4）—— share-context-mcp 的真·实时�
 
 ## 安装（本地路径插件）
 
-bocomcode_v2 的插件加载器（`packages/core/src/plugin/module.ts`）支持本地目录：目录根必须能解析出 `index` 入口（本包根部的 `index.ts` 即为此准备）。在 opencode 配置（如 `~/.config/opencode/opencode.json` 或项目 `.opencode/opencode.json`）中加入：
+opencode 兼容加载器（v2+ 的插件加载器）支持本地目录：目录根必须能解析出 `index` 入口（本包根部的 `index.ts` 即为此准备）。在 opencode 配置（如 `~/.config/opencode/opencode.json` 或项目 `.opencode/opencode.json`）中加入：
 
 ```json
 {

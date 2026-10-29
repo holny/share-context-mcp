@@ -36,17 +36,14 @@ SQLite store on the participant's machine (`SHARE_CONTEXT_DB_PATH`, default
 `~/.share-context-mcp/state.db`) and persists across sessions; the server
 auto-rejoins held channels on startup.
 
-### Configuring an opencode / bocomcode client
+### Configuring an opencode client
 
-Save the snippet as **`bocomcode.json` in the project root** — this is the
+Save the snippet as **`opencode.json` in the project root** — this is the
 primary, spike-validated setup (each project points at the same relay but keeps
-its own entry). A global config also works, at the platform data root:
-`<data home>/<platform>/config/bocomcode.json` (or `.jsonc`), i.e.
-`~/.bocomcode/code/config/bocomcode.jsonc` by default; `BOCOMCODE_DATA_HOME`
-relocates the root (a dev checkout might use
-`~/.bocomcode-dev/code/config/bocomcode.jsonc`). If a global config is not
-picked up, check your platform's actual data root
-(`BOCOMCODE_DATA_HOME` / bocomcode channel) rather than assuming `~/.config`.
+its own entry). A global config also works: place the same JSON at your platform's data
+root (e.g. `~/.config/opencode/config.json` or the equivalent for your
+client). If a project-level config is not picked up, check your platform's
+actual data-root convention rather than assuming `~/.config`.
 
 ```jsonc
 {
