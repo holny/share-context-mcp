@@ -278,8 +278,17 @@ export interface JoinBlob {
 
 /** Encode join parameters into a copy-pasteable base64(JSON) blob. */
 export function encodeJoinBlob(params: JoinBlob): string {
+  if (typeof params.channelId !== "string" || params.channelId.length === 0) {
+    throw new Error("join blob: channelId is required");
+  }
+  if (!params.credential && !params.inviteCode) {
+    throw new Error("join blob: needs a non-empty credential or inviteCode");
+  }
   return Buffer.from(JSON.stringify(params), "utf8").toString("base64");
 }
+
+/** Max join blob size — guards against arbitrary pasted payloads. */
+const JOIN_BLOB_MAX_CHARS = 4096;
 
 /**
  * Decode a join blob. Tolerates surrounding whitespace (terminal/chat
@@ -287,17 +296,14 @@ export function encodeJoinBlob(params: JoinBlob): string {
  * surfaces them verbatim.
  */
 export function parseJoinBlob(blob: string): JoinBlob {
-  let json: string;
-  try {
-    json = Buffer.from(blob.trim(), "base64").toString("utf8");
-  } catch {
-    throw new Error("invalid join blob: not valid base64");
+  if (typeof blob !== "string" || blob.length === 0 || blob.length > JOIN_BLOB_MAX_CHARS) {
+    throw new Error(`invalid join blob: expected 1..${JOIN_BLOB_MAX_CHARS} chars`);
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(json);
+    parsed = JSON.parse(Buffer.from(blob.trim(), "base64").toString("utf8"));
   } catch {
-    throw new Error("invalid join blob: payload is not JSON");
+    throw new Error("invalid join blob: payload is not valid base64(JSON)");
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("invalid join blob: payload must be a JSON object");
@@ -306,14 +312,16 @@ export function parseJoinBlob(blob: string): JoinBlob {
   if (typeof b.channelId !== "string" || b.channelId.length === 0) {
     throw new Error("invalid join blob: channelId missing");
   }
-  if (typeof b.credential !== "string" && typeof b.inviteCode !== "string") {
-    throw new Error("invalid join blob: needs credential or inviteCode");
+  const hasCredential = typeof b.credential === "string" && b.credential.length > 0;
+  const hasInviteCode = typeof b.inviteCode === "string" && b.inviteCode.length > 0;
+  if (!hasCredential && !hasInviteCode) {
+    throw new Error("invalid join blob: needs a non-empty credential or inviteCode");
   }
   return {
     ...(typeof b.relayUrl === "string" && b.relayUrl.length > 0 ? { relayUrl: b.relayUrl } : {}),
     channelId: b.channelId,
-    ...(typeof b.credential === "string" ? { credential: b.credential } : {}),
-    ...(typeof b.inviteCode === "string" ? { inviteCode: b.inviteCode } : {}),
+    ...(hasCredential ? { credential: b.credential as string } : {}),
+    ...(hasInviteCode ? { inviteCode: b.inviteCode as string } : {}),
     ...(typeof b.channelName === "string" ? { channelName: b.channelName } : {}),
     ...(typeof b.admissionMode === "string" ? { admissionMode: b.admissionMode } : {}),
   };
