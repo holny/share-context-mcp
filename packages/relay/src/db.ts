@@ -17,6 +17,14 @@ export interface ChannelRow {
   creator_member: string | null;
   manager_member: string | null;
   admission_mode: string;
+  /** v3 visibility axis: public (listed) | private (hidden). */
+  visibility: string;
+  /** v3 probation (spec §6): 1 = new members land in trial tier. */
+  probation_enabled: number;
+  /** v3 probation (spec §6): 1 = invite-tier joins skip probation. */
+  invite_skips_probation: number;
+  /** v3 key governance: relay-held sealed key copy — public tier only. */
+  sealed_key: string | null;
   invite_policy: string;
   contact_info: string | null;
   vote_cooldown_until: number | null;
@@ -119,6 +127,17 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE channels ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE messages ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE messages ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
+    // v3 channel model: visibility axis + probation flags (spec §2/§6).
+    try { db.exec("ALTER TABLE channels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"); } catch {}
+    try { db.exec("ALTER TABLE channels ADD COLUMN probation_enabled INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { db.exec("ALTER TABLE channels ADD COLUMN invite_skips_probation INTEGER NOT NULL DEFAULT 1"); } catch {}
+    try { db.exec("ALTER TABLE members ADD COLUMN probation_until TEXT"); } catch {}
+    // v3 key governance: relay-held sealed key copy (public tier only).
+    try { db.exec("ALTER TABLE channels ADD COLUMN sealed_key TEXT"); } catch {}
+    // One-time migration (spec §2.2): the admission axis renamed its open
+    // mode — legacy 'public' rows map to 'no_limit'. Visibility defaults to
+    // 'public' for all pre-existing rows (spec §9).
+    try { db.exec("UPDATE channels SET admission_mode = 'no_limit' WHERE admission_mode = 'public'"); } catch {}
     db.exec(`
       CREATE TABLE IF NOT EXISTS users(
         user_id TEXT PRIMARY KEY,
@@ -218,6 +237,10 @@ export function openDb(dbPath: string): Database {
       creator_member TEXT,
       manager_member TEXT,
       admission_mode TEXT NOT NULL DEFAULT 'password',
+      visibility TEXT NOT NULL DEFAULT 'public',
+      probation_enabled INTEGER NOT NULL DEFAULT 0,
+      invite_skips_probation INTEGER NOT NULL DEFAULT 1,
+      sealed_key TEXT,
       invite_policy TEXT NOT NULL DEFAULT 'everyone',
       contact_info TEXT,
       vote_cooldown_until INTEGER,
@@ -242,6 +265,7 @@ export function openDb(dbPath: string): Database {
       can_invite INTEGER NOT NULL DEFAULT 1,
       user_id TEXT,
       permission_role TEXT NOT NULL DEFAULT 'regular',
+      probation_until TEXT,
       activity_role TEXT,
       activity_expires_at INTEGER,
       PRIMARY KEY(channel_id, name)

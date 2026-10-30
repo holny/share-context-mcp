@@ -131,6 +131,29 @@ function validMemberName(v: unknown): v is string {
   return typeof v === "string" && v.trim().length >= 1 && v.trim().length <= MEMBER_NAME_MAX;
 }
 
+/**
+ * v3 channel-shape validator (spec §2.1): visibility (public|private) ×
+ * admission mode (no_limit|password|invite) with the one forbidden pair —
+ * private + no_limit (an open-admission channel cannot be hidden; anyone who
+ * can find it can join it, so "private" would be a false promise).
+ * Shared by create and set-admission.
+ */
+export function validateChannelShape(
+  visibility: string,
+  admissionMode: string,
+): { ok: true } | { ok: false; error: string } {
+  if (visibility !== "public" && visibility !== "private") {
+    return { ok: false, error: "invalid request: visibility must be public|private" };
+  }
+  if (admissionMode !== "no_limit" && admissionMode !== "password" && admissionMode !== "invite") {
+    return { ok: false, error: "invalid request: admissionMode must be no_limit|password|invite" };
+  }
+  if (visibility === "private" && admissionMode === "no_limit") {
+    return { ok: false, error: "private channels cannot use no_limit admission" };
+  }
+  return { ok: true };
+}
+
 function isLiveToken(m: MemberRow, channel: { epoch: number }, now: number): boolean {
   return (
     m.token_hash !== null &&
@@ -186,7 +209,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     timer.unref();
   }
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, visibility, probation_enabled, invite_skips_probation, sealed_key, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at, permission_role, activity_role, activity_expires_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
@@ -225,16 +248,16 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     "INSERT INTO invite_codes(channel_id, code_id, owner, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 'active')",
   );
   const stmtSetAdmission = db.prepare(
-    "UPDATE channels SET admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+    "UPDATE channels SET admission_mode = ?, visibility = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
   );
   const stmtSetCredential = db.prepare(
     "UPDATE channels SET verify_key = ?, admission_credential_revoked = ? WHERE id = ?",
   );
   const stmtDirectory = db.prepare(`
-    SELECT c.id, c.admission_mode, c.contact_info,
+    SELECT c.id, c.admission_mode, c.contact_info, c.visibility,
            (SELECT COUNT(*) FROM members m WHERE m.channel_id = c.id AND m.status = 'active') AS members
     FROM channels c
-    WHERE c.admission_mode = 'public' OR c.contact_info IS NOT NULL
+    WHERE c.visibility = 'public'
     ORDER BY c.created_at ASC
   `);
   const stmtLeave = db.prepare(
@@ -767,21 +790,27 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       } else {
         channelId = randomBytes(16).toString("hex");
       }
+      // v3 (spec §2.2): visibility defaults 'public'; admissionMode defaults
+      // 'password'; the pair is strictly validated (private+no_limit → 400)
+      // BEFORE anything is written.
+      const visibility = typeof parsed.body.visibility === "string" ? parsed.body.visibility : "public";
+      const admissionModeRaw = parsed.body.admissionMode;
+      const mode = typeof admissionModeRaw === "string" ? admissionModeRaw : "password";
+      const shape = validateChannelShape(visibility, mode);
+      if (!shape.ok) return jsonError(400, shape.error);
       stmtInsertChannel.run(channelId, verifyKeyB64, new Date().toISOString());
       // reserve the creator's member name (no token yet → not "live",
       // so the creator can still join under it)
       stmtUpsertMember.run(channelId, (memberName as string).trim(), null, null, 1, new Date().toISOString());
       // Governance: the creating member is creator AND manager (§2). Optional
-      // admission mode/policy/contact come from the create payload.
-      const admissionMode = parsed.body.admissionMode;
-      const mode =
-        admissionMode === "public" || admissionMode === "invite" ? admissionMode : "password";
+      // admission mode/policy/contact/visibility come from the create payload.
       const invitePolicy = parsed.body.invitePolicy === "managers-only" ? "managers-only" : "everyone";
       const contactInfo = typeof parsed.body.contactInfo === "string" ? (parsed.body.contactInfo as string) : null;
+      const probationEnabled = parsed.body.probationEnabled === true ? 1 : 0;
       const stmtSetRolesAndAdmission = db.prepare(
-        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, visibility = ?, probation_enabled = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
       );
-      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, invitePolicy, contactInfo, channelId);
+      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, visibility, probationEnabled, invitePolicy, contactInfo, channelId);
       audit(channelId, (memberName as string).trim(), "channel.created", channelId, `mode=${mode}`);
       return json({ channelId, epoch: 1, nextSeq: 1 });
     }
@@ -918,7 +947,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           pendingInviteCodeId = codeId;
         }
         const proof = parsed.body.proof;
-        const needsProof = mode === "password" || (isCreator && mode !== "public");
+        const needsProof = mode === "password" || (isCreator && mode !== "no_limit");
         if (
           needsProof &&
           (typeof proof !== "string" || proof.length === 0 || proof.length > 128)
@@ -1121,9 +1150,23 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const parsed = await readJson(req);
         if (!parsed.ok) return parsed.resp;
         const mode = parsed.body.mode;
-        if (mode !== "public" && mode !== "invite" && mode !== "password") {
-          return jsonError(400, "invalid request: mode must be public|invite|password");
+        const visibility = parsed.body.visibility;
+        if (mode === undefined && visibility === undefined && parsed.body.invitePolicy === undefined && parsed.body.contactInfo === undefined) {
+          return jsonError(400, "invalid request: mode, visibility, invitePolicy or contactInfo required");
         }
+        if (visibility !== undefined && visibility !== "public" && visibility !== "private") {
+          return jsonError(400, "invalid request: visibility must be public|private");
+        }
+        if (mode !== undefined && mode !== "no_limit" && mode !== "invite" && mode !== "password") {
+          return jsonError(400, "invalid request: mode must be no_limit|invite|password");
+        }
+        // v3 (spec §2.2): the (visibility, admission) PAIR is validated against
+        // the effective post-change values — flipping visibility to private on
+        // a no_limit channel is rejected instead of silently coerced.
+        const nextMode = typeof mode === "string" ? mode : (auth.channel.admission_mode ?? "password");
+        const nextVisibility = typeof visibility === "string" ? visibility : (auth.channel.visibility ?? "public");
+        const shape = validateChannelShape(nextVisibility, nextMode);
+        if (!shape.ok) return jsonError(400, shape.error);
         const invitePolicy = parsed.body.invitePolicy;
         if (invitePolicy !== undefined && invitePolicy !== "everyone" && invitePolicy !== "managers-only") {
           return jsonError(400, "invalid request: invitePolicy must be everyone|managers-only");
@@ -1133,16 +1176,18 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           return jsonError(400, "invalid request: contactInfo must be a string");
         }
         stmtSetAdmission.run(
-          mode,
+          nextMode,
+          nextVisibility,
           typeof invitePolicy === "string" ? invitePolicy : auth.channel.invite_policy,
           typeof contactInfo === "string" ? contactInfo : auth.channel.contact_info,
           channelId,
         );
-        audit(channelId, name, "admission.changed", mode, `policy=${auth.channel.invite_policy}`);
+        audit(channelId, name, "admission.changed", nextMode, `visibility=${nextVisibility}`);
         return json({
           ok: true,
-          mode,
-          ...(mode === "password" && auth.channel.admission_credential_revoked === 1
+          mode: nextMode,
+          visibility: nextVisibility,
+          ...(nextMode === "password" && auth.channel.admission_credential_revoked === 1
             ? { warning: "admission credential was revoked by a kick — run `rotate --mode access` to mint a fresh credential before accepting new members" }
             : {}),
         });
@@ -1598,6 +1643,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           creatorMember: auth.channel.creator_member,
           managerMember: auth.channel.manager_member,
           admissionMode: auth.channel.admission_mode ?? "password",
+          visibility: auth.channel.visibility ?? "public",
+          probationEnabled: (auth.channel.probation_enabled ?? 0) === 1,
           invitePolicy: auth.channel.invite_policy ?? "everyone",
           contactInfo: auth.channel.contact_info,
           encrypted: (auth.channel.encrypted ?? 0) === 1,
