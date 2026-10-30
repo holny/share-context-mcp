@@ -11,10 +11,12 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { CLAIM_KINDS, parseBlobEnvelope, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
+import { CLAIM_KINDS, encodeBlobEnvelope, mintInviteCode, parseBlobEnvelope, BLOB_TYPES, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { hostname } from "node:os";
+import { randomBytes } from "node:crypto";
 import { INSTRUCTIONS } from "./instructions";
 import { buildDigestMessages } from "./digest";
+import { RelayBridge } from "./bridge/relay";
 import type { ChannelBridge, Store } from "./index";
 
 /**
@@ -1128,8 +1130,89 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
     },
     safe(async ({ channel_id }) => {
       const ch = resolveChannel(store, channel_id);
-      void ch;
-      throw new Error("generate_share_blob: not implemented yet (v3 task 6)");
+      if (!(bridge instanceof RelayBridge)) {
+        throw new Error("generate_share_blob requires a relay-backed channel (git/S3 bridges have no admission credentials)");
+      }
+      const meta = await bridge.meta(ch);
+      const secret = store.getChannelSecret(ch);
+      if (!secret) throw new Error(`not joined: ${ch}`);
+      const name = store.getKv(`channelName:${ch}`) ?? undefined;
+
+      // Message key embedding (only when the channel is encrypted; read-only —
+      // nothing on the MCP surface can create or rotate key material).
+      let messageKey: string | undefined;
+      let keyVersion = 0;
+      if (meta.encrypted) {
+        keyVersion = meta.keyVersion ?? 0;
+        const key = store.messageKey(ch, keyVersion);
+        if (!key) {
+          throw new Error(
+            `message key not available locally — ask the owner for a fresh blob (channel ${ch}, key v${keyVersion})`,
+          );
+        }
+        messageKey = Buffer.from(key).toString("base64");
+      }
+      const keyFields = messageKey ? { messageKey, keyVersion } : {};
+      const relayUrl = bridge.baseUrl;
+
+      // Type inference (spec §4.3): invite → invite code; password admission →
+      // password blob, EXCEPT public+encrypted where the password is not the
+      // interesting part (discovery is open) → key-only share; no_limit → key
+      // share when encrypted, nothing otherwise.
+      let type: (typeof BLOB_TYPES)[number];
+      let payload: Record<string, unknown>;
+      let expiresAt: number | undefined;
+      let maxUses: number | undefined;
+      if (meta.admissionMode === "invite") {
+        type = "join_invite";
+        const ttlMs = 7 * 24 * 3600 * 1000;
+        expiresAt = Date.now() + ttlMs;
+        maxUses = 1;
+        const codeId = randomBytes(8).toString("hex");
+        const { code } = mintInviteCode(bridge.channelKey(ch), codeId, ttlMs);
+        await bridge.registerInviteCode(ch, codeId, expiresAt);
+        payload = { relayUrl, channelId: ch, inviteCode: code, channelName: name, visibility: meta.visibility, ...keyFields };
+      } else if (meta.admissionMode === "no_limit") {
+        if (!meta.encrypted) {
+          throw new Error(`nothing to share — channel ${ch} is no_limit and unencrypted (anyone with the id can join)`);
+        }
+        type = "join_key";
+        payload = { relayUrl, channelId: ch, channelName: name, visibility: meta.visibility, ...keyFields };
+      } else {
+        type = meta.encrypted && meta.visibility === "public" ? "join_key" : "join_password";
+        payload = {
+          relayUrl,
+          channelId: ch,
+          ...(type === "join_password" ? { password: secret.password } : {}),
+          channelName: name,
+          visibility: meta.visibility,
+          ...keyFields,
+        };
+      }
+      const blob = encodeBlobEnvelope({ type, payload, expiresAt, maxUses });
+
+      const typeLine =
+        type === "join_invite"
+          ? `INVITE (one-time use, expires ${new Date(expiresAt ?? 0).toISOString().slice(0, 10)})`
+          : type === "join_password"
+            ? "PASSWORD"
+            : "MESSAGE KEY (for decrypting channel messages)";
+      const me = meta.members.find((m) => m.memberName === secret.memberName);
+      const role = meta.creatorMember === secret.memberName ? "creator/owner" : meta.managerMember === secret.memberName ? "manager" : "member";
+      const text = [
+        "📢 share-context-mcp channel share",
+        "",
+        `Type:     ${typeLine}`,
+        `Channel:  ${name ?? ch} (${ch}, ${meta.visibility}, ${meta.admissionMode}${meta.encrypted ? ", encrypted" : ""})`,
+        `Inviter:  ${secret.memberName} — role: ${role}${me?.lastActiveAt ? `, last active: ${me.lastActiveAt.slice(0, 10)}` : ""}`,
+        `Shared at: ${new Date().toISOString().slice(0, 16)}Z`,
+        "",
+        "Key string (paste this line to your agent):",
+        blob,
+        "",
+        "Your agent will use it to join the channel (and decrypt history if encrypted).",
+      ].join("\n");
+      return JSON.stringify({ blob, text });
     }),
   );
 

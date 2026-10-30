@@ -357,6 +357,12 @@ export class Store {
       .run(channelId, keyVersion, encryptSecret(this.machineKey, Buffer.from(key).toString("base64")));
   }
 
+  /** Drop one locally-held message key (tests / owner re-mint scenarios). */
+  forgetMessageKey(channelId: string, keyVersion: number): void {
+    this.keyring.get(channelId)?.delete(keyVersion);
+    this.db.prepare("DELETE FROM message_keys WHERE channel_id = ? AND key_version = ?").run(channelId, keyVersion);
+  }
+
   /** The key for a version, or null when this member does not hold it. */
   messageKey(channelId: string, keyVersion: number): Uint8Array | null {
     const cached = this.keyring.get(channelId)?.get(keyVersion);

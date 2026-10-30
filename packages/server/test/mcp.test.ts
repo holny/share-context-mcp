@@ -15,7 +15,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
-import { validateClaim, type ClaimMessage } from "@share-context-mcp/protocol";
+import { validateClaim, parseBlobEnvelope, type ClaimMessage } from "@share-context-mcp/protocol";
 import { buildMcpServer, buildIndexCard, TOOL_NAMES } from "../src/mcp";
 import { RelayBridge } from "../src/bridge/relay";
 import { Store } from "../src/store";
@@ -596,6 +596,82 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     // malformed blob → readable tool error, not a crash
     const bad = await c.client.callTool({ name: "join_channel", arguments: { blob: "not-a-blob!!" } });
     expect(isError(bad)).toBe(true);
+  });
+
+  test("generate_share_blob: inference matrix (spec §4.3)", async () => {
+    const a = await makeAgent("gsb-a");
+    const mk = async (name: string, args: Record<string, unknown>) =>
+      JSON.parse(textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a", name, ...args } })));
+    const DAY = 24 * 3600 * 1000;
+
+    // invite → join_invite: freshly minted single-use code, 7d TTL, relay-registered
+    const inv = await mk("gsb-inv", { admissionMode: "invite" });
+    const r1 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: inv.channel_id } })));
+    const e1 = parseBlobEnvelope(r1.blob);
+    expect(e1.type).toBe("join_invite");
+    expect(String(e1.payload.inviteCode)).toMatch(/^scmc1-/);
+    expect(e1.payload.channelId).toBe(inv.channel_id);
+    expect(e1.expiresAt!).toBeGreaterThan(Date.now() + 6.5 * DAY);
+    expect(e1.maxUses).toBe(1);
+    expect(r1.text).toContain("INVITE");
+    expect(r1.text).toContain(inv.channel_id);
+    expect(r1.text.match(/scmc2-/g)).toHaveLength(1);
+
+    // private + password → join_password
+    const pwPriv = await mk("gsb-pwp", { visibility: "private" });
+    const r2 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: pwPriv.channel_id } })));
+    const e2 = parseBlobEnvelope(r2.blob);
+    expect(e2.type).toBe("join_password");
+    expect(e2.payload.password).toBe(pwPriv.password);
+    expect(r2.text).toContain("PASSWORD");
+
+    // public + password + unencrypted → join_password (the password is the gate)
+    const pwPub = await mk("gsb-pwu", { visibility: "public" });
+    const r3 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: pwPub.channel_id } })));
+    expect(parseBlobEnvelope(r3.blob).type).toBe("join_password");
+
+    // public + password + encrypted → join_key (key-only share; admission is open discovery)
+    const pwEnc = await mk("gsb-pwe", { visibility: "public", encrypted: true });
+    const r4 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: pwEnc.channel_id } })));
+    const e4 = parseBlobEnvelope(r4.blob);
+    expect(e4.type).toBe("join_key");
+    expect(e4.payload.keyVersion).toBe(1);
+    expect(Buffer.from(String(e4.payload.messageKey), "base64").equals(a.store.messageKey(pwEnc.channel_id, 1)!)).toBe(true);
+    expect(r4.text).toContain("MESSAGE KEY");
+
+    // no_limit + encrypted → join_key
+    const nlEnc = await mk("gsb-nle", { admissionMode: "no_limit", encrypted: true });
+    const r5 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: nlEnc.channel_id } })));
+    expect(parseBlobEnvelope(r5.blob).type).toBe("join_key");
+
+    // no_limit + unencrypted → nothing to share
+    const nlPlain = await mk("gsb-nlp", { admissionMode: "no_limit" });
+    const r6 = await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: nlPlain.channel_id } });
+    expect(isError(r6)).toBe(true);
+    expect(textOf(r6)).toContain("nothing to share");
+  });
+
+  test("generate_share_blob: invite blob joins end-to-end via join_channel(blob)", async () => {
+    const a = await makeAgent("gsb-e2e-a");
+    const created = JSON.parse(textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a", name: "gsb-e2e", admissionMode: "invite" } })));
+    const r = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: created.channel_id } })));
+    const b = await makeAgent("gsb-e2e-b");
+    const card = textOf(await b.client.callTool({ name: "join_channel", arguments: { blob: r.blob, member_name: "b" } }));
+    expect(isError({ isError: false, content: [{ type: "text", text: card }] } as unknown)).toBeFalsy();
+    expect(card).toContain(created.channel_id);
+    const sent = await a.client.callTool({ name: "send_message", arguments: { channel_id: created.channel_id, statement: "hello from inviter", kind: "progress", topic: "t" } });
+    expect(isError(sent)).toBe(false);
+    const fetched = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: created.channel_id } }))));
+    expect(fetched.messages.some((m: { statement: string }) => m.statement === "hello from inviter")).toBe(true);
+  });
+
+  test("generate_share_blob: missing local message key → clean error, no keyless blob", async () => {
+    const a = await makeAgent("gsb-mk-a");
+    const created = JSON.parse(textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a", encrypted: true } })));
+    a.store.forgetMessageKey(created.channel_id, 1);
+    const res = await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: created.channel_id } });
+    expect(isError(res)).toBe(true);
+    expect(textOf(res)).toContain("message key not available locally");
   });
 });
 

@@ -72,7 +72,8 @@ interface EnvelopeRow {
 }
 
 export class RelayBridge implements ChannelBridge {
-  private readonly baseUrl: string;
+  /** Relay origin, e.g. https://relay.corp:8931 (blob payloads embed it). */
+  readonly baseUrl: string;
   private readonly store: Store;
   /** Session tokens per channel — memory first, encrypted fallback in the store. */
   private readonly tokens = new Map<string, string>();
@@ -314,6 +315,15 @@ export class RelayBridge implements ChannelBridge {
    * endpoint (with a sealed copy on the public tier), store it in the local
    * keyring. Members on the old key get 409 on send and need a fresh blob.
    */
+  /** Register a freshly minted invite code with the relay (single-use ledger entry). */
+  async registerInviteCode(channelId: string, codeId: string, expiresAt: number): Promise<void> {
+    await this.request(`/channels/${channelId}/invite-codes`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders(channelId) },
+      body: JSON.stringify({ codeId, expiresAt }),
+    });
+  }
+
   async rotateKey(channelId: string): Promise<number> {
     const ch = await this.request(`/channels/${channelId}/meta`, {
       method: "GET",
