@@ -11,15 +11,12 @@ export {
   parseAdmissionCredential,
   mintInviteCode,
   parseInviteCode,
-  encodeJoinBlob,
-  parseJoinBlob,
   encodeBlobEnvelope,
   parseBlobEnvelope,
   isBlobExpired,
   BLOB_TYPES,
   BLOB_MAX_CHARS,
   type BlobTypes,
-  type JoinBlob,
   type SealedEnvelope,
 } from "./crypto";
 export {

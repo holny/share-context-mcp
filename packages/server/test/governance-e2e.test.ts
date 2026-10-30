@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { encodeBlobEnvelope, mintAdmissionCredential } from "@share-context-mcp/protocol";
+import { encodeBlobEnvelope, parseBlobEnvelope, mintAdmissionCredential } from "@share-context-mcp/protocol";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
 import { buildMcpServer } from "../src/mcp";
 import { RelayBridge } from "../src/bridge/relay";
@@ -183,6 +183,13 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     expect(erinFetch.encryptedNote).toContain("alice"); // manager holds the keys
     expect(erinFetch.messages).toHaveLength(0);
 
+    // owner shares the v1 key blob → erin tops up and can read
+    const v1Blob = JSON.parse(textOf(await alice.client.callTool({ name: "generate_share_blob", arguments: { channel_id: channelId } })));
+    expect(parseBlobEnvelope(v1Blob.blob).type).toBe("join_key");
+    const v1TopUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: v1Blob.blob } });
+    expect(isError(v1TopUp)).toBe(false);
+    expect(erin.store.messageKey(channelId, 1)).not.toBeNull();
+
     // ---- 9. join_from_blob: a new agent joins from one pasted string ----
     const blob = encodeBlobEnvelope({
       type: "join_password",
@@ -201,6 +208,24 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     expect(listing.channels).toHaveLength(1);
     expect(listing.channels[0].memberName).toBe("frank");
 
+    // ---- 10. key rotation loop (spec §3.3): rotate → stale 409 → blob top-up → resume ----
+    const before = alice.store.messageKey(channelId, 1)!;
+    const newVersion = await alice.bridge.rotateKey(channelId);
+    expect(newVersion).toBe(2);
+    // erin still holds only v1 → the relay rejects her send with an actionable notice
+    const stale = await erin.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "stale key send", kind: "progress", topic: "secret" } });
+    expect(isError(stale)).toBe(true);
+    expect(textOf(stale)).toContain("rotated");
+    // fresh key-only blob from the owner → erin tops up without re-joining
+    const keyBlob = JSON.parse(textOf(await alice.client.callTool({ name: "generate_share_blob", arguments: { channel_id: channelId } })));
+    expect(parseBlobEnvelope(keyBlob.blob).type).toBe("join_key");
+    const topUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: keyBlob.blob } });
+    expect(isError(topUp)).toBe(false);
+    expect(Buffer.from(erin.store.messageKey(channelId, 2)!).equals(alice.store.messageKey(channelId, 2)!)).toBe(true);
+    expect(Buffer.from(alice.store.messageKey(channelId, 2)!).equals(before)).toBe(false); // genuinely a NEW key
+    const resumed = await erin.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "resumed after rotation", kind: "progress", topic: "secret" } });
+    expect(isError(resumed)).toBe(false);
+
     // everyone leaves — the LAST leave dissolves the channel
     for (const agent of [alice, bob, carol, erin, frank]) {
       const res = await agent.client.callTool({ name: "leave_channel", arguments: { channel_id: channelId } });
@@ -210,5 +235,40 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
       headers: { authorization: `Bearer ${aliceToken.token}` },
     });
     expect(gone.status).toBe(404); // channel fully deleted at the relay
+  }, 60_000);
+
+  test("probation: non-invite joins land in the trial tier, invite joins skip it (spec §6)", async () => {
+    const a = await mkAgent("prob-a");
+    const created = JSON.parse(textOf(await a.client.callTool({
+      name: "create_channel", arguments: { memberName: "a", name: "probationed", probationEnabled: true },
+    })));
+    const { channel_id, password } = created;
+    const b = await mkAgent("prob-b");
+    await b.client.callTool({ name: "join_channel", arguments: { channel_id, password, member_name: "b" } });
+    const info = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "channel_info", arguments: { channel_id } })))) as {
+      members: Array<{ memberName: string; role: string }>;
+    };
+    expect(info.members.find((m) => m.memberName === "b")?.role).toBe("trial");
+    expect(info.members.find((m) => m.memberName === "a")?.role).toBe("creator");
+  });
+
+  test("vote survives target departure: pass bans the departed member at the gate (spec §7)", async () => {
+    const a = await mkAgent("tv-a");
+    const created = JSON.parse(textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a", name: "targetleaves" } })));
+    const { channel_id, password } = created;
+    const b = await mkAgent("tv-b");
+    await b.client.callTool({ name: "join_channel", arguments: { channel_id, password, member_name: "b" } });
+    const c = await mkAgent("tv-c");
+    await c.client.callTool({ name: "join_channel", arguments: { channel_id, password, member_name: "c" } });
+    // open the vote while b is still active, then b slips away mid-vote
+    const opened = JSON.parse(unwrapQuote(textOf(await a.client.callTool({ name: "start_vote", arguments: { channel_id, type: "kick", target: "b", reason: "gone" } })))) as { voteId: string };
+    await b.client.callTool({ name: "leave_channel", arguments: { channel_id } });
+    await a.client.callTool({ name: "cast_vote", arguments: { channel_id, vote_id: opened.voteId, choice: "yes" } });
+    await c.client.callTool({ name: "cast_vote", arguments: { channel_id, vote_id: opened.voteId, choice: "yes" } });
+    // settled passed → ban row exists → b cannot re-join
+    const rejoin = await b.client.callTool({ name: "join_channel", arguments: { channel_id, password, member_name: "b" } });
+    expect(isError(rejoin)).toBe(true);
+    const rejoinText = textOf(rejoin);
+    expect(rejoinText).toMatch(/banned|403/);
   }, 60_000);
 });

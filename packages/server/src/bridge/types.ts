@@ -45,6 +45,8 @@ export interface ChannelMember {
   joinedAt: string;
   /** ISO timestamp of the member's last reported activity; null when never reported. Relay-backed bridges only. */
   lastActiveAt?: string | null;
+  /** Permission tier from the relay (creator | manager | representative | vip | regular | trial). Relay-backed bridges only. */
+  permissionRole?: string;
 }
 
 export interface ChannelMeta {

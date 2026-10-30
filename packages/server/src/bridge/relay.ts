@@ -596,7 +596,12 @@ export class RelayBridge implements ChannelBridge {
       headers: this.authHeaders(channelId),
     });
     return {
-      members: (data.members as ChannelMember[]) ?? [],
+      members: ((data.members as Array<Record<string, unknown>>) ?? []).map((m) => ({
+        memberName: m.memberName as string,
+        joinedAt: m.joinedAt as string,
+        lastActiveAt: (m.lastActiveAt as string | null) ?? null,
+        permissionRole: m.permissionRole as string | undefined,
+      })),
       nextSeq: data.nextSeq as number,
       minSeq: typeof data.minSeq === "number" ? data.minSeq : undefined,
       creatorMember: (data.creatorMember as string | null | undefined) ?? null,

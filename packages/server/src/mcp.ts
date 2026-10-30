@@ -1040,7 +1040,11 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
       ) as Record<string, unknown>;
       // Governance projection: role per member (relay-backed bridges only).
       const roleOf = (memberName: string): string =>
-        memberName === meta.creatorMember ? "creator" : memberName === meta.managerMember ? "manager" : "member";
+        memberName === meta.creatorMember
+          ? "creator"
+          : memberName === meta.managerMember
+            ? "manager"
+            : (meta.members.find((m) => m.memberName === memberName)?.permissionRole ?? "member");
       const members = (card.members as Array<Record<string, unknown>>).map((m) => ({
         ...m,
         role: roleOf(m.memberName as string),
