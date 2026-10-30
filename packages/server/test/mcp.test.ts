@@ -673,6 +673,40 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     expect(isError(res)).toBe(true);
     expect(textOf(res)).toContain("message key not available locally");
   });
+
+  test("create_channel: private + encrypted works (C-1 — sealed key never sent for private)", async () => {
+    const a = await makeAgent("pv-a");
+    const res = await a.client.callTool({ name: "create_channel", arguments: { memberName: "a", name: "priv-enc", visibility: "private", encrypted: true } });
+    expect(isError(res)).toBe(false); // must NOT error
+    const created = JSON.parse(textOf(res));
+    expect(typeof created.channel_id).toBe("string");
+    expect(a.store.messageKey(created.channel_id, 1)).not.toBeNull();
+    // relay never holds the sealed copy for a private channel
+    const st = a.store.encryptionState(created.channel_id);
+    expect(st.encrypted).toBe(true);
+    expect(st.keyVersion).toBe(1);
+    const sent = await a.client.callTool({ name: "send_message", arguments: { channel_id: created.channel_id, statement: "private sealed", kind: "progress", topic: "t" } });
+    expect(isError(sent)).toBe(false);
+  });
+
+  test("stale-key send error is agent-actionable: currentVersion + contact surfaced verbatim (I-1)", async () => {
+    const a = await makeAgent("i1-a");
+    const created = JSON.parse(textOf(await a.client.callTool({ name: "create_channel", arguments: { memberName: "a", name: "i1", encrypted: true } })));
+    const { channel_id } = created;
+    const b = await makeAgent("i1-b");
+    // b joins with the password, then tops up the key from the owner's blob
+    await b.client.callTool({ name: "join_channel", arguments: { channel_id, password: created.password, member_name: "b" } });
+    const v1 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id } })));
+    await b.client.callTool({ name: "join_channel", arguments: { blob: v1.blob } });
+    expect(b.store.messageKey(channel_id, 1)).not.toBeNull();
+    // owner rotates to v2
+    await a.bridge.rotateKey(channel_id);
+    const stale = await b.client.callTool({ name: "send_message", arguments: { channel_id, statement: "stale", kind: "progress", topic: "t" } });
+    expect(isError(stale)).toBe(true);
+    const msg = textOf(stale);
+    expect(msg).toContain("rotated");
+    expect(msg).toContain("currentVersion=2");
+  });
 });
 
 describe("session-token adoption on 409 (identity binding)", () => {

@@ -100,18 +100,27 @@ async function cmdJoin() {
     };
     const bridge = new RelayBridge({ baseUrl: p.relayUrl ?? relayUrl(), store });
     const member = arg("member") ?? (hostname().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "me");
+    const alreadyJoined = store.getChannelSecret(p.channelId) !== null;
     if (p.inviteCode) {
       await bridge.joinWithInvite(p.channelId, p.inviteCode, member);
-    } else {
-      await bridge.join(p.channelId, p.password!, member);
+    } else if (p.password) {
+      if (alreadyJoined) {
+        // already a member: bridge.join would 409 on the taken name — the only
+        // interesting payload is the key top-up below
+      } else {
+        await bridge.join(p.channelId, p.password, member);
+      }
+    } else if (!alreadyJoined) {
+      console.error("Error: this blob carries a message key, not an admission credential — join with a password/invite blob (or share-context join --channel-id/--password) first");
+      process.exit(1);
     }
-    // key top-up (spec §4.5): an already-joined member can resume after rotation
+    // key top-up (spec §4.5): an already-joined member resumes after rotation
     if (p.messageKey) {
       store.setMessageKey(p.channelId, p.keyVersion ?? 1, new Uint8Array(Buffer.from(p.messageKey, "base64")));
       console.log(`  message key v${p.keyVersion ?? 1} installed from blob.`);
     }
     if (p.channelName) store.setKv(`channelName:${p.channelId}`, p.channelName);
-    console.log(`\n✅ Joined ${p.channelName ?? p.channelId} as ${member} (via share blob)\n`);
+    console.log(`\n✅ ${alreadyJoined ? `Key updated for ${p.channelName ?? p.channelId}` : `Joined ${p.channelName ?? p.channelId} as ${member}`} (via share blob)\n`);
     return;
   }
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });

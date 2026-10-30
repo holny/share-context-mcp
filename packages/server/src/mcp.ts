@@ -1039,12 +1039,14 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
         buildIndexCard({ channelId: ch, members: meta.members, msgs: all, pendingQuestions, historyGap }),
       ) as Record<string, unknown>;
       // Governance projection: role per member (relay-backed bridges only).
-      const roleOf = (memberName: string): string =>
-        memberName === meta.creatorMember
-          ? "creator"
-          : memberName === meta.managerMember
-            ? "manager"
-            : (meta.members.find((m) => m.memberName === memberName)?.permissionRole ?? "member");
+      const roleOf = (memberName: string): string => {
+        if (memberName === meta.creatorMember) return "creator";
+        if (memberName === meta.managerMember) return "manager";
+        // Regular members display as plain "member"; other relay tiers
+        // (trial during probation, representative, vip) surface verbatim.
+        const tier = meta.members.find((m) => m.memberName === memberName)?.permissionRole;
+        return tier && tier !== "regular" ? tier : "member";
+      };
       const members = (card.members as Array<Record<string, unknown>>).map((m) => ({
         ...m,
         role: roleOf(m.memberName as string),

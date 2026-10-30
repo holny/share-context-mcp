@@ -1161,8 +1161,12 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (!parsed.ok) return parsed.resp;
         const mode = parsed.body.mode;
         const visibility = parsed.body.visibility;
-        if (mode === undefined && visibility === undefined && parsed.body.invitePolicy === undefined && parsed.body.contactInfo === undefined) {
-          return jsonError(400, "invalid request: mode, visibility, invitePolicy or contactInfo required");
+        if (
+          mode === undefined && visibility === undefined && parsed.body.invitePolicy === undefined &&
+          parsed.body.contactInfo === undefined && parsed.body.probationEnabled === undefined &&
+          parsed.body.inviteSkipsProbation === undefined
+        ) {
+          return jsonError(400, "invalid request: mode, visibility, invitePolicy, contactInfo, probationEnabled or inviteSkipsProbation required");
         }
         if (visibility !== undefined && visibility !== "public" && visibility !== "private") {
           return jsonError(400, "invalid request: visibility must be public|private");
@@ -1185,6 +1189,25 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (contactInfo !== undefined && typeof contactInfo !== "string") {
           return jsonError(400, "invalid request: contactInfo must be a string");
         }
+        // v3 (spec §6): probation flags are persisted here (not create-only) —
+        // the CLI `channel set-admission --probation/--invite-skips` path.
+        const probationEnabled = parsed.body.probationEnabled;
+        if (probationEnabled !== undefined && typeof probationEnabled !== "boolean") {
+          return jsonError(400, "invalid request: probationEnabled must be a boolean");
+        }
+        const inviteSkipsProbation = parsed.body.inviteSkipsProbation;
+        if (inviteSkipsProbation !== undefined && typeof inviteSkipsProbation !== "boolean") {
+          return jsonError(400, "invalid request: inviteSkipsProbation must be a boolean");
+        }
+        if (probationEnabled !== undefined || inviteSkipsProbation !== undefined) {
+          db.prepare(
+            "UPDATE channels SET probation_enabled = COALESCE(?, probation_enabled), invite_skips_probation = COALESCE(?, invite_skips_probation) WHERE id = ?",
+          ).run(
+            probationEnabled === true ? 1 : probationEnabled === false ? 0 : null,
+            inviteSkipsProbation === true ? 1 : inviteSkipsProbation === false ? 0 : null,
+            channelId,
+          );
+        }
         stmtSetAdmission.run(
           nextMode,
           nextVisibility,
@@ -1198,7 +1221,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (nextVisibility === "private") {
           db.prepare("UPDATE channels SET sealed_key = NULL WHERE id = ?").run(channelId);
         }
-        audit(channelId, name, "admission.changed", nextMode, `visibility=${nextVisibility}`);
+        audit(channelId, name, "admission.changed", nextMode, `visibility=${nextVisibility}${probationEnabled !== undefined ? ` probation=${probationEnabled}` : ""}${inviteSkipsProbation !== undefined ? ` inviteSkips=${inviteSkipsProbation}` : ""}`);
         return json({
           ok: true,
           mode: nextMode,
@@ -1715,6 +1738,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           admissionMode: auth.channel.admission_mode ?? "password",
           visibility: auth.channel.visibility ?? "public",
           probationEnabled: (auth.channel.probation_enabled ?? 0) === 1,
+          inviteSkipsProbation: (auth.channel.invite_skips_probation ?? 1) === 1,
           invitePolicy: auth.channel.invite_policy ?? "everyone",
           contactInfo: auth.channel.contact_info,
           encrypted: (auth.channel.encrypted ?? 0) === 1,

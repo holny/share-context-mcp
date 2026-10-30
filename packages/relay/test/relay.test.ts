@@ -170,6 +170,16 @@ describe("visibility × admission model (v3)", () => {
     expect(bad.status).toBe(400);
     expect(((await bad.json()) as { error: string }).error).toContain("private channels cannot use no_limit admission");
     // switching BOTH at once to a valid pair is fine
+    // I-2: probation flags persist via set-admission (not create-only)
+    const prob = await postJson(`/channels/${channelId}/set-admission`, { probationEnabled: true, inviteSkipsProbation: false }, alice.token);
+    expect(prob.status).toBe(200);
+    const meta2 = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as { probationEnabled: boolean; inviteSkipsProbation: boolean };
+    expect(meta2.probationEnabled).toBe(true);
+    expect(meta2.inviteSkipsProbation).toBe(false);
+    const probOff = await postJson(`/channels/${channelId}/set-admission`, { probationEnabled: false }, alice.token);
+    expect(probOff.status).toBe(200);
+    const meta3 = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as { probationEnabled: boolean };
+    expect(meta3.probationEnabled).toBe(false);
     const ok = await postJson(`/channels/${channelId}/set-admission`, { visibility: "private", mode: "password" }, alice.token);
     expect(ok.status).toBe(200);
     const meta = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as {

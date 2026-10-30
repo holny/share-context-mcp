@@ -103,6 +103,14 @@ export class RelayBridge implements ChannelBridge {
     const res = await fetch(`${this.baseUrl}${path}`, init);
     const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
     if (!res.ok) {
+      // Key-rotation mismatches (spec §3.2) surface verbatim: the relay
+      // returns currentVersion + contact so the agent can act on the error.
+      if (res.status === 409 && (body?.currentVersion !== undefined || body?.contact !== undefined)) {
+        const parts = [typeof body.error === "string" ? body.error : "request failed"];
+        if (body.currentVersion !== undefined) parts.push(`currentVersion=${body.currentVersion}`);
+        if (body.contact !== undefined) parts.push(`contact=${body.contact}`);
+        throw new Error(parts.join(" "));
+      }
       // The relay's fixed error strings are the contract ("auth failed: wrong
       // password", "member name already taken", "unauthorized") — pass through.
       throw new Error(typeof body?.error === "string" ? body.error : `relay request failed: ${res.status}`);
@@ -631,11 +639,14 @@ export class RelayBridge implements ChannelBridge {
     });
     const currentVersion = typeof res.keyVersion === "number" ? res.keyVersion : 0;
     if (encrypted && currentVersion < 1) {
+      const meta = await this.meta(channelId);
       const key = new Uint8Array(randomBytes(32));
+      const rotateBody: Record<string, unknown> = { keyVersion: 1 };
+      if (meta.visibility === "public") rotateBody.sealedKey = Buffer.from(key).toString("base64");
       await this.request(`/channels/${channelId}/rotate-key`, {
         method: "POST",
         headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
-        body: JSON.stringify({ keyVersion: 1, sealedKey: Buffer.from(key).toString("base64") }),
+        body: JSON.stringify(rotateBody),
       });
       this.store.setMessageKey(channelId, 1, key);
       this.store.setEncryptionState(channelId, true, 1);
