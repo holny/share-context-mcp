@@ -352,18 +352,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     const now = Date.now();
     stmtSetCooldown.run(now + VOTE_GLOBAL_COOLDOWN_MS, channelId);
     if (!vote) return;
-    if (vote.type === "kick") {
-      // Target departed mid-vote (status left/removed) → the vote is VOID:
-      // no kick applies (there is no one to kick); the 4h global cooldown
-      // still applies.
-      const targetRow = stmtMemberByName.get(channelId, vote.target) as MemberRow | undefined;
-      if (!targetRow || targetRow.status !== "active") {
-        db.prepare("UPDATE votes SET status = 'expired' WHERE channel_id = ? AND id = ?").run(channelId, voteId);
-        wsHub?.notifyGovernance(channelId, { type: "vote-settled", voteId, target: vote.target, outcome: "expired" });
-        return;
-      }
-    }
     if (passed && vote.type === "kick") {
+      // v3 (spec §7): a vote whose target left mid-vote CONTINUES. The ban
+      // applies on pass even to the departed member — it blocks re-entry at
+      // the admission gate. applyKick tolerates a departed target (the member
+      // row may be status 'left'; the ban row is what matters).
       const params = vote.params_json ? (JSON.parse(vote.params_json) as { banIp?: boolean; revokeInvitees?: boolean }) : {};
       const ip = (
         db.prepare("SELECT ip FROM member_bans WHERE channel_id = ? AND name = ?").get(channelId, vote.target) as
@@ -459,7 +452,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     const ch = stmtChannel.get(channelId) as ChannelRow;
     const leadership = vote.target === ch.manager_member || vote.target === ch.creator_member;
     const active = activeMemberNames(channelId);
-    const eligible = active.length - 1; // the target cannot vote
+    // The target cannot vote — but only subtract them when they are actually
+    // among the active members (a departed target no longer suppresses anyone
+    // else's ballot; v3 §7 ballot math counts the REMAINING eligible voters).
+    const eligible = active.includes(vote.target) ? active.length - 1 : active.length;
     const remaining = eligible - cast;
     // EARLY PASS — even a unanimous remaining "no" cannot flip the outcome.
     if (leadership) {
@@ -807,10 +803,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       const invitePolicy = parsed.body.invitePolicy === "managers-only" ? "managers-only" : "everyone";
       const contactInfo = typeof parsed.body.contactInfo === "string" ? (parsed.body.contactInfo as string) : null;
       const probationEnabled = parsed.body.probationEnabled === true ? 1 : 0;
+      const inviteSkipsProbation = parsed.body.inviteSkipsProbation === false ? 0 : 1;
       const stmtSetRolesAndAdmission = db.prepare(
-        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, visibility = ?, probation_enabled = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, visibility = ?, probation_enabled = ?, invite_skips_probation = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
       );
-      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, visibility, probationEnabled, invitePolicy, contactInfo, channelId);
+      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, visibility, probationEnabled, inviteSkipsProbation, invitePolicy, contactInfo, channelId);
       audit(channelId, (memberName as string).trim(), "channel.created", channelId, `mode=${mode}`);
       return json({ channelId, epoch: 1, nextSeq: 1 });
     }
@@ -1003,6 +1000,19 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (pendingInviteCodeId !== null) {
           // Admission succeeded — consume the code (F-4).
           stmtUseInviteCode.run(memberName, channelId, pendingInviteCodeId);
+        }
+        // v3 probation (spec §6): probated joins land in the trial tier with a
+        // 7-day probation_until. Skipped by invite joins while
+        // invite_skips_probation is set (default), and always for the creator.
+        const probationEnabled = (channel.probation_enabled ?? 0) === 1;
+        const inviteJoinSkips = pendingInviteCodeId !== null && (channel.invite_skips_probation ?? 1) === 1;
+        if (probationEnabled && !inviteJoinSkips && !isCreator) {
+          db.prepare("UPDATE members SET probation_until = ?, permission_role = 'trial' WHERE channel_id = ? AND name = ?").run(
+            new Date(now + 7 * 86_400_000).toISOString(),
+            channelId,
+            memberName,
+          );
+          audit(channelId, memberName, "member.probation", memberName, "until=" + new Date(now + 7 * 86_400_000).toISOString());
         }
         challenges.delete(key); // one-time use
         audit(channelId, memberName, "member.joined", memberName, "ok");
@@ -1241,12 +1251,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         // Mark left + revoke tokens.
         stmtLeave.run(channelId, name);
-        // An open kick vote targeting the leaver is VOID (F-15): no kick
-        // applies to a departed member.
-        const openVote = stmtOpenVote.get(channelId) as { id: string; target: string } | undefined;
-        if (openVote && openVote.target === name) {
-          settleVote(channelId, openVote.id, false);
-        }
+        // v3 (spec §7): an open kick vote targeting the leaver is NOT voided —
+        // the vote continues over the remaining eligible voters and a pass
+        // bans the departed member (blocking re-entry).
         // Succession.
         if (isCreator) {          const successor =
             transferTo !== null && transferTo !== name

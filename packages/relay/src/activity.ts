@@ -66,9 +66,17 @@ export function scanActivityRoles(db: Database, opts: ActivityScanOptions = {}):
   const stmtCurrent = db.prepare(
     "SELECT activity_role, activity_expires_at FROM members WHERE channel_id = ? AND name = ?",
   );
+  // v3 probation promotion (spec §6): trial members whose probation_until has
+  // passed become regular. Runs in the same daily scan; permission-role
+  // promotion is one-way (trial → regular) and never touches other tiers.
+  const stmtPromoteProbation = db.prepare(
+    "UPDATE members SET permission_role = 'regular', probation_until = NULL " +
+      "WHERE channel_id = ? AND permission_role = 'trial' AND probation_until IS NOT NULL AND probation_until < ?",
+  );
 
   for (const { id: channelId } of channels) {
     const tx = db.transaction((): boolean => {
+      stmtPromoteProbation.run(channelId, new Date(now).toISOString());
       const members = stmtCounts.all(channelId) as MemberCounts[];
       const n = members.length;
       // tier assignment under the same N for everyone in this scan

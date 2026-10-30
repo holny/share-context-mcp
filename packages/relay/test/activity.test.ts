@@ -53,8 +53,7 @@ function seedMessage(channelId: string, seq: number, sender: string | null, _to:
 }
 
 /** N active members joined at T0; one member per name. */
-function seedChannelWithMembers(memberCount: number): string {
-  const channelId = randomBytes(8).toString("hex");
+function seedChannelWithMembers(memberCount: number): string {  const channelId = randomBytes(8).toString("hex");
   seedChannel(channelId);
   const t0 = "2026-10-01T00:00:00Z";
   for (let i = 0; i < memberCount; i++) seedMember(channelId, `m${i}`, t0);
@@ -210,5 +209,24 @@ describe("activity role scan (§5)", () => {
     // m9's sends are invisible to the tiering: active members with zero
     // sends land on deep_focus (receiver volume) or observer
     expect(roleOf(ch, "m0").activity_role).toBe("deep_focus");
+  });
+
+  test("v3 probation promotion: trial members past probation_until are promoted to regular; unexpired ones stay", () => {
+    const channelId = randomBytes(8).toString("hex");
+    seedChannel(channelId);
+    seedMember(channelId, "expired", "2026-10-01T00:00:00Z");
+    seedMember(channelId, "stillIn", "2026-10-01T00:00:00Z");
+    seedMember(channelId, "regular1", "2026-10-01T00:00:00Z");
+    db.prepare("UPDATE members SET permission_role = 'trial', probation_until = ? WHERE channel_id = ? AND name = 'expired'").run("2026-10-20T00:00:00Z", channelId);
+    db.prepare("UPDATE members SET permission_role = 'trial', probation_until = ? WHERE channel_id = ? AND name = 'stillIn'").run("2099-01-01T00:00:00Z", channelId);
+    const now = Date.parse("2026-10-30T12:00:00Z");
+    scanActivityRoles(db, { now });
+    const row = (name: string) =>
+      db.prepare("SELECT permission_role, probation_until FROM members WHERE channel_id = ? AND name = ?").get(channelId, name) as { permission_role: string; probation_until: string | null };
+    expect(row("expired").permission_role).toBe("regular");
+    expect(row("expired").probation_until).toBeNull();
+    expect(row("stillIn").permission_role).toBe("trial");
+    expect(row("stillIn").probation_until).not.toBeNull();
+    expect(row("regular1").permission_role).toBe("regular");
   });
 });

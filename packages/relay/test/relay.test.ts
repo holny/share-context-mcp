@@ -216,6 +216,81 @@ describe("visibility × admission model (v3)", () => {
   });
 });
 
+describe("probation (v3 §6)", () => {
+  async function mkChannel(extra: Record<string, unknown> = {}): Promise<string> {
+    const channelId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+      ...extra,
+    });
+    expect(created.status).toBe(200);
+    const joined = await joinChannel(channelId, "alice", PASSWORD, "s/prob0001");
+    expect(joined.status).toBe(200);
+    return channelId;
+  }
+
+  const memberRole = (channelId: string, name: string) =>
+    relay.db.prepare("SELECT permission_role, probation_until FROM members WHERE channel_id = ? AND name = ?").get(channelId, name) as
+      | { permission_role: string; probation_until: string | null }
+      | undefined;
+
+  test("password join to a probation channel lands in trial with probation_until ≈ now+7d; creator exempt", async () => {
+    const channelId = await mkChannel({ probationEnabled: true });
+    expect(memberRole(channelId, "alice")).toMatchObject({ permission_role: "regular", probation_until: null });
+    const bob = await joinChannel(channelId, "bob", PASSWORD, "s/prob0002");
+    expect(bob.status).toBe(200);
+    const row = memberRole(channelId, "bob");
+    expect(row?.permission_role).toBe("trial");
+    expect(row?.probation_until).not.toBeNull();
+    const until = Date.parse(row!.probation_until!);
+    expect(until).toBeGreaterThan(Date.now() + 6.9 * 86_400_000);
+    expect(until).toBeLessThan(Date.now() + 7.1 * 86_400_000);
+  });
+
+  test("no probation without the channel flag; invite joins skip probation by default", async () => {
+    // flag off: password join → regular
+    const plain = await mkChannel();
+    await joinChannel(plain, "bob", PASSWORD, "s/prob0003");
+    expect(memberRole(plain, "bob")?.permission_role).toBe("regular");
+    expect(memberRole(plain, "bob")?.probation_until).toBeNull();
+
+    // invite tier + probation + default invite_skips_probation=1 → no probation
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      admissionMode: "invite",
+      probationEnabled: true,
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/prob0004")).body as { token: string };
+    await postJson(`/channels/${channelId}/invite-codes`, { codeId: "code-prob01", expiresAt: Date.now() + 86_400_000 }, alice.token);
+    const dave = await postJson(`/channels/${channelId}/join`, { memberName: "dave", consumerId: "s/prob0005", inviteCodeId: "code-prob01" });
+    expect(dave.status).toBe(200);
+    expect(memberRole(channelId, "dave")).toMatchObject({ permission_role: "regular", probation_until: null });
+  });
+
+  test("invite joins are probated when invite_skips_probation is disabled", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      admissionMode: "invite",
+      probationEnabled: true,
+      inviteSkipsProbation: false,
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/prob0006")).body as { token: string };
+    await postJson(`/channels/${channelId}/invite-codes`, { codeId: "code-prob02", expiresAt: Date.now() + 86_400_000 }, alice.token);
+    const eve = await postJson(`/channels/${channelId}/join`, { memberName: "eve", consumerId: "s/prob0007", inviteCodeId: "code-prob02" });
+    expect(eve.status).toBe(200);
+    expect(memberRole(channelId, "eve")?.permission_role).toBe("trial");
+    expect(memberRole(channelId, "eve")?.probation_until).not.toBeNull();
+  });
+});
+
 describe("blind relay", () => {
   test("challenge → wrong password 401 → correct join token", async () => {
     const channelId = randomBytes(8).toString("hex");
