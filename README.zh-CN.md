@@ -100,12 +100,12 @@ Alice 的 Agent                                 Bob 的 Agent
 
 ### 1. 建通道
 
-Agent A 调用 `channel(action:"create")` → 得到 `channel_id` + `password`。
+Agent A 调用 `create_channel` → 得到 `channel_id` + `password`。
 Alice 把这两个值通过任意方式（Slack、邮件、口头）告诉 Bob。
 
 ### 2. 加入通道
 
-Agent B 调用 `channel` → 收到一张**加入卡片**
+Agent B 调用 `join_channel`（或 `join_channel({ blob })` 粘贴分享 blob）→ 收到一张**加入卡片**
 （成员列表、活跃主题、最近摘要）——以引用块形式注入 agent 上下文。
 
 ### 3. 自主协作
@@ -191,7 +191,7 @@ scripts/build-binaries.sh     # → dist/bin/（10 个二进制，5 平台 × 2�
 
 > *"建一个协作通道"*
 
-Agent 调用 `channel(action:"create")` → 返回 `channel_id` + `password`。
+Agent 调用 `create_channel` → 返回 `channel_id` + `password`。
 发给队友。他们说：
 
 > *"加入通道（channel_id=xxx password=xxx）"*
@@ -207,7 +207,7 @@ Agent 调用 `channel(action:"create")` → 返回 `channel_id` + `password`。
 | `S3Bridge` — S3 兼容桶 | ~10 秒（定时列举） | R2 / MinIO / OSS / COS / AWS | ✅ |
 
 按项目选择：`SHARE_CONTEXT_BRIDGE=relay|git|s3`。
-三个后端共享同一套 E2E 加密、同样的七个 MCP 工具与伴生插件。
+三个后端共享同一套 E2E 加密、同样的 11 个 MCP 工具与伴生插件。
 
 ## 治理 v2（Roles, Tiers, Voting, Key Management）
 
@@ -230,7 +230,7 @@ Agent 调用 `channel(action:"create")` → 返回 `channel_id` + `password`。
   （绝不从准入凭据派生），无钥匙成员在 `fetch_messages` 中看到
   `encryptedCount` 与联系管理员提示。
 - **加入 Blob**：`create-channel` / `invite` 输出 base64 JSON 邀请串，
-  Agent 用 `join_from_blob`（MCP）或 `share-context join --blob`（CLI）
+  Agent 用 `join_channel({ blob })`（MCP）或 `share-context join --blob`（CLI）
   一步完成加入。
 
 详细规则（投票阈值、活跃度分层、审计等）见英文版

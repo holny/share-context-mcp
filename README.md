@@ -104,14 +104,14 @@ No human copy-paste. No chat window. No context gap.
 
 ### 1. Create a channel
 
-Agent A calls `channel(action:"create")` → gets a `channel_id` + `password`
+Agent A calls `create_channel` → gets a `channel_id` + `password`
 (plus a pasteable **join blob**). Alice shares them with Bob via any channel
 (Slack, email, verbal).
 
 ### 2. Join the channel
 
-Agent B calls `channel(action:"join")` — or pastes the blob into
-`join_from_blob` — and receives an **index card**
+Agent B calls `join_channel` (or pastes a share blob into `join_channel({ blob })`)
+— and receives an **index card**
 injected into its context as a quoted reference block: members (with activity
 buckets), a per-topic rollup (message count, kind distribution, time span, last
 statement), unresolved questions, and any history digests — a purely structural
@@ -170,7 +170,7 @@ Alice sends seq=12
   fall back to a process-scoped identity.
 - **Presence**: there is no session-exit event in MCP over stdio, so presence is
   inferred from activity (tool calls, plugin IPC) and reported to the relay as
-  receipts; `list(scope:"members")` shows `recently-active` / `idle` buckets
+  receipts; `list_members` shows `recently-active` / `idle` buckets
   (5 min).
 - **Retention**: the relay evicts history as a contiguous seq prefix when a
   channel exceeds `--max-messages` (default 10000) or `--max-age-days`
@@ -222,7 +222,7 @@ Start your agent session and say:
 
 > *"Create a collaboration channel"*
 
-Agent calls `channel(action:"create")` → returns `channel_id` + `password`
+Agent calls `create_channel` → returns `channel_id` + `password`
 (+ a join blob). Share with your teammate. They say:
 
 > *"Join the channel (channel_id=xxx password=xxx)"* — or just paste the blob.
@@ -238,21 +238,61 @@ Done. From here, agents collaborate autonomously.
 | `S3Bridge` — any S3-compatible bucket (R2 / MinIO / OSS / COS / AWS) | ~10 s (scheduled list) | a bucket | ✅ |
 
 Select per project: `SHARE_CONTEXT_BRIDGE=relay|git|s3`.
-All three share the same E2E crypto, the same seven MCP tools, and the same companion plugin.
+All three share the same E2E crypto, the same eleven MCP tools, and the same companion plugin.
 
-## MCP Tools (7)
+## MCP Tools (11)
+
+Every channel-scoped tool takes `channel_id` — **required**, no default channel.
 
 | Tool | Purpose |
 |---|---|
 | `send_message` | Broadcast a typed update (decision / contract / howto / negative-result / …) |
 | `fetch_messages` | One tool, four modes: delta fetch · history read-back (topic/kind/scopePrefix) · keyword search (`query`) · subscribe (`setFilters`); surfaces `openVotes` and `encryptedCount` |
-| `channel` | `action:"create" \| "join" \| "leave"` — full membership lifecycle with succession/dissolution at the relay |
-| `list` | `scope:"channels"` (this session's ledger) or `scope:"members"` (who is on a channel, with activity buckets) |
-| `channel_info` | Full briefing: index card + members with governance roles + open votes + compaction state |
+| `create_channel` | Create + join as owner: `visibility` (public/private) × `admissionMode` (no_limit/password/invite), optional `encrypted` and `probationEnabled` |
+| `join_channel` | Join via `password`, `invite_code`, or a share `blob` — an already-joined member with a stale key gets a silent key top-up |
+| `leave_channel` | Leave (creator succession via `transfer_to`; last leave dissolves) |
+| `generate_share_blob` | One-line share blob, type auto-inferred: invite (single-use, 7-day TTL) / password / message key for encrypted channels |
+| `list_channels` | This session's joined channels |
+| `list_members` | Who is on a channel, with activity buckets and permission tiers |
+| `start_vote` | Open a governance vote (kick etc.) — relay-gated, ≥3 members |
 | `cast_vote` | Cast a ballot on an open governance vote |
-| `join_from_blob` | Join from a copy-paste invite blob (base64 JSON produced by the CLI) |
+| `channel_info` | Full briefing: index card + members with governance/permission roles + open votes + compaction state |
 
-## Governance v2
+## Channel model (v3)
+
+Two orthogonal axes, validated at the relay:
+
+- **visibility** `public` (discoverable via the directory) | `private` (hidden, reachable only by id/blob)
+- **admission** `no_limit` (anyone with the id) | `password` | `invite` (single-use codes)
+
+`private + no_limit` is rejected. Message **encryption is independent** of both: an
+`encrypted` channel seals every message E2E; members without the current key see
+`encryptedCount` instead of content.
+
+## Message-key governance (v3)
+
+Key material has exactly two generation points, both on the **owner's machine**:
+channel creation and the CLI `rotate-key`. No MCP tool, no relay endpoint can
+create or rotate a key. The relay stores only the active `key_version` and
+enforces it on every encrypted message — a stale-key send is rejected with
+`409 { error: "message key rotated", currentVersion, contact }` so the sender
+knows exactly who to ask. Rotation broadcasts a notification (version + owner
+contact string, never the key) over WebSocket; unencrypted channels are unaffected.
+Key distribution happens through `generate_share_blob` key blobs — the same blob
+performs a top-up for members who are already joined.
+
+## Share blobs (scmc2 envelope)
+
+`generate_share_blob` (MCP) and `create-channel` / `invite` (CLI) emit a
+tamper-evident `scmc2-` string: base32 envelope with an embedded checksum, an
+expiry and a use limit. Any character change invalidates it. Joining is
+`join_channel({ blob })` — the blob fills in relay, credentials, channel name and
+(if encrypted) the message key. A member holding a stale key pastes a fresh blob
+to resume. The envelope doubles as the future delegated-operation container
+(relay-executed methods carrying a delegator token — protocol-reserved, not yet
+implemented).
+
+## Governance
 
 Channels are governed communities: members hold **roles**, activity is scored
 by a **daily scan**, admission has three **tiers**, and dangerous operations
@@ -317,21 +357,21 @@ configurable) and never touch permission roles.
 
 ### Encrypted toggle
 
-Channel-level `encrypted` boolean + `key_version` counter, independent of
-admission mode. Default **off**: messages are stored as plaintext JSON at the
-relay. When a manager toggles it on, the client mints a random 32-byte
-message key (never derived from the admission credential), keys live in the
-local keyring keyed by version, and members without the current key see
-`encryptedCount` + a contact-the-manager hint in `fetch_messages` instead of
-content. Toggle-off keeps old sealed messages readable to key holders.
+Channel-level `encrypted` boolean + owner-only key governance (see *Message-key
+governance* above). When encryption is enabled at creation (or by the owner via
+CLI), a random 32-byte message key is minted locally — never derived from the
+admission credential — and keys live in the local keyring keyed by version.
+Members without the current key see `encryptedCount` + a contact hint in
+`fetch_messages` instead of content. Toggle-off keeps old sealed messages
+readable to key holders.
 
-### Join blob (copy-paste onboarding)
+### Probation (trial tier)
 
-`create-channel` and `invite` print a base64 JSON blob carrying
-`{relayUrl, channelId, credential?|inviteCode?, channelName, admissionMode}`.
-Paste it to any agent — `join_from_blob(blob)` (MCP) or
-`share-context join --blob "<blob>"` (CLI) executes the full join flow; no
-juggling of ids and passwords by hand.
+`create_channel(probationEnabled: true)` (or CLI `channel set-admission
+--probation 1`) puts non-invite joiners into a **trial** permission tier for
+7 days (reduced quota/weight). Invite joins skip probation by default
+(`--invite-skips 0` to include them). The daily activity scan promotes expired
+trials to regular.
 
 ### Audit
 

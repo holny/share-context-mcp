@@ -66,11 +66,13 @@ Notes:
 
 - Replace `/abs/path/to/share-context-mcp` with the repo checkout path; `bun`
   runs the TypeScript source directly.
-- `codemode: false` keeps the seven channel tools as plain callable tools
+- `codemode: false` keeps the eleven channel tools as plain callable tools
   instead of routing them through Code Mode.
 - With the server key `channel`, tools surface to the agent as
-  `channel_send_message`, `channel_fetch_messages`, `channel`, `channel_list`,
-  `channel_cast_vote`, `channel_info`, `channel_join_from_blob`
+  `channel_send_message`, `channel_fetch_messages`, `channel_create_channel`,
+  `channel_join_channel`, `channel_leave_channel`, `channel_list_channels`,
+  `channel_list_members`, `channel_start_vote`, `channel_cast_vote`,
+  `channel_channel_info`, `channel_generate_share_blob`
   (i.e. `<server key>_<tool name>`).
 - `SHARE_CONTEXT_DB_PATH` is optional (default `~/.share-context-mcp/state.db`).
   Concurrent agent sessions on the same machine intentionally share one store.
@@ -90,12 +92,12 @@ also works — they share local state by design). Record the outcome in
 2. **Both sessions have the server** — add the config snippet, restart both
    sessions, ask each agent to list its channel tools (expect the seven
    `channel_*` tools).
-3. **A creates a channel** — agent A: *“用 channel 建一个通道，
+3. **A creates a channel** — agent A: *“用 create_channel 建一个通道，
    memberName 用 alice，通道名 m1-smoke”*. Note the `channel_id` and
    `password` from the reply (password shown exactly once).
 4. **Password handoff out of band** — paste `channel_id` + `password` to
    participant B over IM/verbally (not through any channel tool).
-5. **B joins** — agent B: *“用 channel 加入通道 …，memberName 用
+5. **B joins** — agent B: *“用 join_channel 加入通道 …，member_name 用
    bob”*. Expect a 📋 reference-block join card listing members alice, bob.
 6. **A shares, B fetches** — A: *“把你刚做的决定用 send_message 发出去
    （kind=decision，topic=m1-smoke）”*; B: *“fetch_messages 看看有什么新
