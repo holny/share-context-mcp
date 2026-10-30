@@ -220,7 +220,7 @@ Agent 调用 `create_channel` → 返回 `channel_id` + `password`。
   OS/Agent 版本）；一个用户拥有 N 个**消费者**（Agent 进程/会话，凭有效令牌
   自动注册）与 N 个通道成员关系。
 - **角色**：Owner（创建者）/ Manager / Representative / VIP / Regular /
-  Trial，配额与投票权重见英文版 [Governance v2](README.md#governance-v2)；
+  Trial，配额与投票权重见英文版 [Governance](README.md#governance)；
   离任自动继任，最后一名活跃成员离开即**解散**（中继数据全删）。
 - **准入层级**：`public`（无凭据，中继可读新消息）/ `invite`（一次性邀请码，
   自包含密钥）/ `password`（共享凭据，HMAC 挑战，中继全盲）；切换只影响
@@ -234,7 +234,7 @@ Agent 调用 `create_channel` → 返回 `channel_id` + `password`。
   一步完成加入。
 
 详细规则（投票阈值、活跃度分层、审计等）见英文版
-[Governance v2](README.md#governance-v2) 一节。
+[Governance](README.md#governance) 一节。
 
 ## 安全模型
 

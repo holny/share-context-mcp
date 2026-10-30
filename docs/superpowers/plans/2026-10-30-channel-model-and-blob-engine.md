@@ -14,7 +14,7 @@
 
 - Branch: `feat/channel-model-v3`, created from `feat/governance-v2` @ `017457d`. Commit every task. Never switch branches.
 - `bun test` (263 baseline) and `bunx tsc --noEmit` must be green after every task.
-- All user-facing copy in English. Zero "bocom" references anywhere.
+- All user-facing copy in English. Zero references to the internal platform codename anywhere (see the v2 iteration's cleanup commit for the pattern).
 - Every channel-scoped MCP tool takes `channel_id` as a REQUIRED parameter — no default-channel fallback on these tools (an explicit tool-level error is acceptable where the old code fell back).
 - Message keys are created ONLY at channel creation (owner's local machine) or by owner CLI rotation. No MCP tool and no relay endpoint mints client-side keys.
 
