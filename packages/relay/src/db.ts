@@ -25,6 +25,8 @@ export interface ChannelRow {
   invite_skips_probation: number;
   /** v3 key governance: relay-held sealed key copy — public tier only. */
   sealed_key: string | null;
+  /** v3 key governance: ISO ts of the last rotate-key (409 error payload). */
+  key_rotated_at: string | null;
   invite_policy: string;
   contact_info: string | null;
   vote_cooldown_until: number | null;
@@ -132,8 +134,10 @@ export function openDb(dbPath: string): Database {
     try { db.exec("ALTER TABLE channels ADD COLUMN probation_enabled INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { db.exec("ALTER TABLE channels ADD COLUMN invite_skips_probation INTEGER NOT NULL DEFAULT 1"); } catch {}
     try { db.exec("ALTER TABLE members ADD COLUMN probation_until TEXT"); } catch {}
-    // v3 key governance: relay-held sealed key copy (public tier only).
+    // v3 key governance: relay-held sealed key copy (public tier only) +
+    // rotation timestamp surfaced in key-mismatch errors.
     try { db.exec("ALTER TABLE channels ADD COLUMN sealed_key TEXT"); } catch {}
+    try { db.exec("ALTER TABLE channels ADD COLUMN key_rotated_at TEXT"); } catch {}
     // One-time migration (spec §2.2): the admission axis renamed its open
     // mode — legacy 'public' rows map to 'no_limit'. Visibility defaults to
     // 'public' for all pre-existing rows (spec §9).
@@ -241,6 +245,7 @@ export function openDb(dbPath: string): Database {
       probation_enabled INTEGER NOT NULL DEFAULT 0,
       invite_skips_probation INTEGER NOT NULL DEFAULT 1,
       sealed_key TEXT,
+      key_rotated_at TEXT,
       invite_policy TEXT NOT NULL DEFAULT 'everyone',
       contact_info TEXT,
       vote_cooldown_until INTEGER,

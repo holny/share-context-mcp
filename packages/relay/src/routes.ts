@@ -209,7 +209,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     timer.unref();
   }
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, visibility, probation_enabled, invite_skips_probation, sealed_key, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, visibility, probation_enabled, invite_skips_probation, sealed_key, key_rotated_at, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at, permission_role, activity_role, activity_expires_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
@@ -871,7 +871,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|set-encryption|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit|me))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|rotate-key|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|set-encryption|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit|me))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -1182,6 +1182,12 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           typeof contactInfo === "string" ? contactInfo : auth.channel.contact_info,
           channelId,
         );
+        // Spec §2.3: switching visibility to private DELETES the relay-held
+        // sealed key copy. (Blind-ness is only fully restored by an owner key
+        // rotation — the relay has seen the old key — but no copy may remain.)
+        if (nextVisibility === "private") {
+          db.prepare("UPDATE channels SET sealed_key = NULL WHERE id = ?").run(channelId);
+        }
         audit(channelId, name, "admission.changed", nextMode, `visibility=${nextVisibility}`);
         return json({
           ok: true,
@@ -1476,10 +1482,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
 
       case "set-encryption": {
         // Encrypted toggle (§11): manager/creator flips the channel-level
-        // boolean. Toggle-ON bumps key_version (the client generates and
-        // holds the actual key — the relay stays blind, counting versions).
-        // Toggle-OFF leaves the counter intact: old encrypted rows remain
-        // readable to key holders; new messages go out plaintext.
+        // boolean ONLY. v3 (spec §3.5): the endpoint no longer mints or bumps
+        // key material in any form — key_version starts at 0 and is bumped
+        // exclusively by the owner's rotate-key. Toggle-OFF leaves the counter
+        // and any sealed copy intact: old encrypted rows remain readable to
+        // key holders; new messages go out plaintext.
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
         if (auth === "banned") return jsonError(403, "banned");
@@ -1493,16 +1500,53 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (typeof wanted !== "boolean") {
           return jsonError(400, "invalid request: encrypted must be a boolean");
         }
-        let keyVersion = auth.channel.key_version ?? 0;
-        if (wanted) {
-          keyVersion += 1;
-          db.prepare("UPDATE channels SET encrypted = 1, key_version = ? WHERE id = ?").run(keyVersion, channelId);
-        } else {
-          db.prepare("UPDATE channels SET encrypted = 0 WHERE id = ?").run(channelId);
-        }
+        const keyVersion = auth.channel.key_version ?? 0;
+        db.prepare("UPDATE channels SET encrypted = ? WHERE id = ?").run(wanted ? 1 : 0, channelId);
         audit(channelId, auth.member.name, "encryption.changed", channelId, wanted ? `on keyVersion=${keyVersion}` : `off keyVersion=${keyVersion}`);
         wsHub?.notifyGovernance(channelId, { type: "encryption-changed", encrypted: wanted, keyVersion });
         return json({ ok: true, encrypted: wanted, keyVersion });
+      }
+
+      case "rotate-key": {
+        // v3 key governance (spec §3): CREATOR-ONLY. The owner's CLI mints
+        // the new key locally and submits only the version counter (plus an
+        // optional sealed copy on the PUBLIC tier — the relay must never hold
+        // key material for private channels). WS broadcast carries the
+        // version + contact, NEVER key material.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.creator_member) {
+          audit(channelId, auth.member.name, "rotate-key.denied", auth.member.name, "not creator");
+          return jsonError(403, "creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const kv = parsed.body.keyVersion;
+        if (typeof kv !== "number" || !Number.isInteger(kv) || kv < 1) {
+          return jsonError(400, "invalid request: keyVersion must be an integer >= 1");
+        }
+        if (kv <= (auth.channel.key_version ?? 0)) {
+          return jsonError(409, "invalid request: keyVersion must be greater than the current version");
+        }
+        let sealedKey: string | null = null;
+        if (typeof parsed.body.sealedKey === "string" && (parsed.body.sealedKey as string).length > 0) {
+          if ((auth.channel.visibility ?? "public") !== "public") {
+            return jsonError(400, "invalid request: sealedKey is only accepted on public channels");
+          }
+          sealedKey = parsed.body.sealedKey as string;
+        }
+        const rotatedAt = new Date().toISOString();
+        db.prepare("UPDATE channels SET key_version = ?, sealed_key = ?, key_rotated_at = ? WHERE id = ?").run(kv, sealedKey, rotatedAt, channelId);
+        audit(channelId, auth.member.name, "rotate-key", auth.member.name, `keyVersion=${kv}`);
+        wsHub?.notifyGovernance(channelId, {
+          type: "key_rotated",
+          keyVersion: kv,
+          contact: auth.channel.contact_info ?? "",
+          rotatedAt,
+        });
+        return json({ ok: true, keyVersion: kv });
       }
 
       case "dissolve": {
@@ -1557,14 +1601,33 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           const channelEncrypted = (liveChannel?.encrypted ?? 0) === 1;
           let encrypted = 0;
           let keyVersion = 0;
-          if (channelEncrypted) {
+          if (channelEncrypted && parsed.body.keyVersion !== undefined) {
             const kv = parsed.body.keyVersion;
             if (typeof kv !== "number" || !Number.isInteger(kv) || kv < 1) {
-              return jsonError(400, "invalid request: keyVersion (integer >= 1) required on an encrypted channel");
+              return jsonError(400, "invalid request: keyVersion must be an integer >= 1");
+            }
+            const current = liveChannel?.key_version ?? 0;
+            if (kv !== current) {
+              // v3 (spec §3.2): the sender holds a stale key. The error must be
+              // agent-actionable: the CURRENT version + the owner contact
+              // string, verbatim, so the member knows who to ask for a blob.
+              return new Response(
+                JSON.stringify({
+                  error: "message key rotated",
+                  currentVersion: current,
+                  contact: liveChannel?.contact_info ?? "",
+                  rotatedAt: liveChannel?.key_rotated_at ?? null,
+                }),
+                { status: 409, headers: { "content-type": "application/json" } },
+              );
             }
             encrypted = 1;
             keyVersion = kv;
           }
+          // A send WITHOUT keyVersion on an encrypted channel is a plaintext
+          // send — allowed (spec §3.2: unencrypted messages are unaffected;
+          // the E2E/plain mismatch is a client concern). The row is stamped
+          // with what the sender actually sent.
           const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey, encrypted, keyVersion);
           if (!stored.deduped) {
             // Push-wake only (spec §5.7): notifications carry seq+epoch, never

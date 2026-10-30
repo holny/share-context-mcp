@@ -541,11 +541,12 @@ export class RelayBridge implements ChannelBridge {
   }
 
   /**
-   * Encrypted toggle (§11, manager/creator CLI op): flips the channel
-   * boolean at the relay. Toggle-ON mints the next key version CLIENT-SIDE
-   * (random 32 bytes, independent of the admission credential) and stores it
-   * in the local keyring; the relay only counts versions. Toggle-OFF leaves
-   * the keyring intact so old encrypted rows stay readable.
+   * Encrypted toggle (§11 + v3 §3.5 — OWNER/CLI path, never an MCP tool):
+   * the relay endpoint only flips the channel flag. Enabling encryption on a
+   * channel with no key yet mints v1 CLIENT-SIDE (random 32 bytes, independent
+   * of the admission credential) and registers the new version through the
+   * creator-only rotate-key endpoint — the ONLY relay-side key-version writer.
+   * Toggle-OFF leaves the keyring intact so old encrypted rows stay readable.
    */
   async setEncryption(channelId: string, encrypted: boolean): Promise<void> {
     const res = await this.request(`/channels/${channelId}/set-encryption`, {
@@ -553,12 +554,19 @@ export class RelayBridge implements ChannelBridge {
       headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
       body: JSON.stringify({ encrypted }),
     });
-    const keyVersion = typeof res.keyVersion === "number" ? res.keyVersion : 0;
-    if (encrypted) {
-      if (keyVersion < 1) throw new Error("relay did not mint a key version for the encrypted channel");
-      this.store.setMessageKey(channelId, keyVersion, new Uint8Array(randomBytes(32)));
+    const currentVersion = typeof res.keyVersion === "number" ? res.keyVersion : 0;
+    if (encrypted && currentVersion < 1) {
+      const key = new Uint8Array(randomBytes(32));
+      await this.request(`/channels/${channelId}/rotate-key`, {
+        method: "POST",
+        headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+        body: JSON.stringify({ keyVersion: 1, sealedKey: Buffer.from(key).toString("base64") }),
+      });
+      this.store.setMessageKey(channelId, 1, key);
+      this.store.setEncryptionState(channelId, true, 1);
+      return;
     }
-    this.store.setEncryptionState(channelId, encrypted, keyVersion);
+    this.store.setEncryptionState(channelId, encrypted, currentVersion);
   }
 
   /** Presence receipts: POST the member's last-activity timestamp to the relay,
