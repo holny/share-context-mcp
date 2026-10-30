@@ -105,19 +105,20 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
 
       // ---- A creates the channel; the password leaves via the test (out of band) ----
       const created = textOf(
-        await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "alice", name: "e2e" } }),
+        await a.client.callTool({ name: "create_channel",
+      arguments: { memberName: "alice", name: "e2e" } }),
       );
-      expect(created).toContain("channel created");
-      const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-      const password = created.match(/password=([a-z0-9-]+)/)![1];
+      expect(JSON.parse(created).ok).toBe(true);
+      const channelId = JSON.parse(created).channel_id;
+      const password = JSON.parse(created).password;
       expect(channelId).toMatch(/^[a-z0-9]{12}$/);
       expect(password).toMatch(/^[a-z0-9]{4}(-[a-z0-9]{4}){4}$/);
 
       // ---- B joins with its own member name and sees the join card ----
       const joined = textOf(
         await b.client.callTool({
-          name: "channel",
-          arguments: { action: "join", channelId, password, memberName: "bob" },
+          name: "join_channel",
+      arguments: { channel_id: channelId, password, member_name: "bob" },
         }),
       );
       expect(joined.startsWith(QUOTE_HEADER)).toBe(true);
@@ -146,14 +147,14 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       ];
       const seqs: number[] = [];
       for (const s of shared) {
-        const res = await a.client.callTool({ name: "send_message", arguments: { ...s } });
+        const res = await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, ...s} });
         expect(isError(res)).toBe(false);
         seqs.push((JSON.parse(textOf(res)) as { seq: number }).seq);
       }
 
       // ---- B fetches and gets all three, wrapped in the reference block ----
       const fetched = JSON.parse(
-        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: {} }))),
+        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } }))),
       ) as {
         messages: Array<{ seq: number; statement: string; kind: string; topic: string }>;
         skipped: number;
@@ -166,7 +167,7 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
 
       // ---- B fetch_messages filtered by topic ----
       const byTopic = JSON.parse(
-        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { topic: "db" } }))),
+        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId, topic: "db"} }))),
       ) as { messages: Array<{ topic: string; statement: string }> };
       expect(byTopic.messages).toHaveLength(1);
       expect(byTopic.messages[0].topic).toBe("db");
@@ -175,7 +176,7 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       // ---- B search: `a&b,c` = (a AND b) OR c ----
       const hits = JSON.parse(
         unwrapQuote(
-          textOf(await b.client.callTool({ name: "fetch_messages", arguments: { query: "cookies&httpOnly, wal" } })),
+          textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId, query: "cookies&httpOnly, wal"} })),
         ),
       ) as { messages: Array<{ topic: string }> };
       expect(hits.messages).toHaveLength(2);
@@ -184,7 +185,7 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       // ---- rotate moved to CLI (breaking, governance iteration) — covered
       // by relay-level tests + CLI tests; here we verify B's session survives
       // a plain fetch round trip instead ----
-      const still = await b.client.callTool({ name: "fetch_messages", arguments: {} });
+      const still = await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } });
       expect(isError(still)).toBe(false);
 
       // ---- security: no plaintext password in either server's stderr ----
@@ -281,18 +282,20 @@ describe("e2e: retention + digest + consumer identity (Task 8)", () => {
       const b = await spawnAgent("b");
 
       const created = textOf(
-        await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "alice" } }),
+        await a.client.callTool({ name: "create_channel",
+      arguments: { memberName: "alice" } }),
       );
-      const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-      const password = created.match(/password=([a-z0-9-]+)/)![1];
+      const channelId = JSON.parse(created).channel_id;
+      const password = JSON.parse(created).password;
 
-      await a.client.callTool({ name: "send_message", arguments: { statement: "decided: e2e digest flow", kind: "decision", topic: "digest" } });
-      await a.client.callTool({ name: "send_message", arguments: { statement: "progress on topic one", kind: "progress", topic: "topic-one" } });
-      await a.client.callTool({ name: "send_message", arguments: { statement: "progress on topic two", kind: "progress", topic: "topic-two" } });
+      await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "decided: e2e digest flow", kind: "decision", topic: "digest"} });
+      await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "progress on topic one", kind: "progress", topic: "topic-one"} });
+      await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "progress on topic two", kind: "progress", topic: "topic-two"} });
 
       // B joins → full history cached + index card rollup
       const joined = textOf(
-        await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "bob" } }),
+        await b.client.callTool({ name: "join_channel",
+      arguments: { channel_id: channelId, password, member_name: "bob" } }),
       );
       const card = JSON.parse(unwrapQuote(joined)) as {
         topics: Array<{ topic: string; count: number }>;
@@ -307,22 +310,22 @@ describe("e2e: retention + digest + consumer identity (Task 8)", () => {
           arguments: args,
           ...(sid === undefined ? {} : { _meta: { "ai.opencode/sessionID": sid } }),
         });
-      const f1 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", {}, "ses_aaaa1111")))) as { messages: unknown[] };
+      const f1 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111")))) as { messages: unknown[] };
       expect(f1.messages.length).toBe(3);
-      const f2 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", {}, "ses_bbbb2222")))) as { messages: unknown[] };
+      const f2 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId }, "ses_bbbb2222")))) as { messages: unknown[] };
       expect(f2.messages.length).toBe(3);
-      const f1b = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", {}, "ses_aaaa1111")))) as { messages: unknown[] };
+      const f1b = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111")))) as { messages: unknown[] };
       expect(f1b.messages.length).toBe(0);
 
       // A sends 3 more → relay evicts seq 1 (minSeq 2..4 across sends); B's
       // evicted-but-cached range reaches the env-tuned watermark (3)
       for (let i = 1; i <= 3; i++) {
-        await a.client.callTool({ name: "send_message", arguments: { statement: `chatter ${i}`, kind: "progress", topic: "chatter" } });
+        await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: `chatter ${i}`, kind: "progress", topic: "chatter" } });
       }
-      await call("fetch_messages", {}, "ses_aaaa1111"); // gap advances; digest posted
-      await call("fetch_messages", {}, "ses_aaaa1111"); // digest lands in B's cache
+      await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111"); // gap advances; digest posted
+      await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111"); // digest lands in B's cache
       const store = b.client; // digest assertion via B's own search through a third session
-      const f3 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { query: "digest", kind: "digest" }, "ses_aaaa1111")))) as {
+      const f3 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId, query: "digest", kind: "digest" }, "ses_aaaa1111")))) as {
         messages: Array<{ statement: string; scope?: Record<string, string> }>;
       };
       expect(f3.messages.length).toBeGreaterThanOrEqual(1);

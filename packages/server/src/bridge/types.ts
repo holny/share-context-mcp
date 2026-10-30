@@ -54,6 +54,7 @@ export interface ChannelMeta {
   creatorMember?: string | null;
   managerMember?: string | null;
   admissionMode?: string;
+  visibility?: string;
   invitePolicy?: string;
   contactInfo?: string | null;
   minSeq?: number;
@@ -89,8 +90,24 @@ export interface PollResult {
 
 export interface ChannelBridge {
   /** Create a channel and join it as `memberName`. Returns the human-shareable secret.
-   * gitUrl (GitBridge only): the remote repo URL for this channel. */
-  createChannel(opts: { name?: string; memberName: string; gitUrl?: string; s3?: S3ConnectionParams; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }>;
+   * gitUrl (GitBridge only): the remote repo URL for this channel.
+   * v3 (spec §2.2): visibility/admissionMode shape validated at the relay;
+   * password may be caller-supplied (owner-chosen) or generated;
+   * encrypted:true mints the message key v1 on THIS machine (owner-only
+   * key governance — creation is one of the two generation points);
+   * probationEnabled toggles the 7-day trial tier for new members. */
+  createChannel(opts: {
+    name?: string;
+    memberName: string;
+    gitUrl?: string;
+    s3?: S3ConnectionParams;
+    visibility?: string;
+    admissionMode?: string;
+    password?: string;
+    encrypted?: boolean;
+    probationEnabled?: boolean;
+    contactInfo?: string;
+  }): Promise<{ channelId: string; password: string }>;
   /** Join an existing channel with a password. gitUrl (GitBridge only): the remote repo URL. */
   join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;  /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
@@ -122,6 +139,11 @@ export interface ChannelBridge {
     history: Array<{ id: string; type: string; target: string; status: string; yes: number; no: number }>;
   }>;
   castVote(channelId: string, voteId: string, choice: "yes" | "no"): Promise<void>;
+  /**
+   * Open a governance vote (v3 spec §5: start_vote on the MCP surface —
+   * same relay checks as the CLI path). Relay-backed bridges only.
+   */
+  startVote?(channelId: string, target: string, opts?: { banIp?: boolean; revokeInvitees?: boolean }): Promise<{ voteId: string; endsAt: number }>;
   /**
    * Governance capability (§governance): true only for the relay-backed
    * bridge — roles/votes/bans/directory are relay-tier features. git/S3

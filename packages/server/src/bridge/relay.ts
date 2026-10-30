@@ -249,11 +249,24 @@ export class RelayBridge implements ChannelBridge {
 
   // ---- ChannelBridge ----
 
-  async createChannel(opts: { name?: string; memberName: string; gitUrl?: string; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }> {
+  async createChannel(opts: {
+    name?: string;
+    memberName: string;
+    gitUrl?: string;
+    s3?: import("./types").S3ConnectionParams;
+    visibility?: string;
+    admissionMode?: string;
+    password?: string;
+    encrypted?: boolean;
+    probationEnabled?: boolean;
+    contactInfo?: string;
+  }): Promise<{ channelId: string; password: string }> {
     // `name` is a local display label in v1; the blind relay stores no title.
     void opts.name;
+    void opts.gitUrl;
+    void opts.s3;
     const channelId = generateChannelId();
-    const password = generateGroupedPassword();
+    const password = opts.password ?? generateGroupedPassword();
     const key = deriveChannelKey(password, channelId);
     const created = await this.request("/channels", {
       method: "POST",
@@ -262,6 +275,8 @@ export class RelayBridge implements ChannelBridge {
         channelId,
         memberName: opts.memberName,
         admissionMode: opts.admissionMode,
+        visibility: opts.visibility,
+        probationEnabled: opts.probationEnabled === true ? true : undefined,
         contactInfo: opts.contactInfo,
         verifyKeyB64: deriveVerifyKeyB64(key),
       }),
@@ -274,7 +289,51 @@ export class RelayBridge implements ChannelBridge {
       epoch: typeof created.epoch === "number" ? created.epoch : 1,
     });
     this.defaultChannelId = channelId;
+    // Owner-only key governance (spec §3.1): channel creation is one of the
+    // two key-generation points. Enabling encryption here mints v1 on THIS
+    // machine and registers it via rotate-key (the setEncryption path).
+    if (opts.encrypted === true) {
+      await this.setEncryption(channelId, true);
+    }
     return { channelId, password };
+  }
+
+  async startVote(channelId: string, target: string, opts: { banIp?: boolean; revokeInvitees?: boolean } = {}): Promise<{ voteId: string; endsAt: number }> {
+    const res = await this.request(`/channels/${channelId}/votes`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({ type: "kick", target, ...(opts.banIp ? { banIp: true } : {}), ...(opts.revokeInvitees ? { revokeInvitees: true } : {}) }),
+    });
+    if (typeof res.voteId !== "string") throw new Error("relay did not open the vote");
+    return { voteId: res.voteId, endsAt: res.endsAt as number };
+  }
+
+  /**
+   * Owner-only message-key rotation (v3 spec §3.3, CLI path): mint the next
+   * key LOCALLY, register the new version via the creator-gated rotate-key
+   * endpoint (with a sealed copy on the public tier), store it in the local
+   * keyring. Members on the old key get 409 on send and need a fresh blob.
+   */
+  async rotateKey(channelId: string): Promise<number> {
+    const ch = await this.request(`/channels/${channelId}/meta`, {
+      method: "GET",
+      headers: this.authHeaders(channelId),
+    });
+    const currentVersion = typeof ch.keyVersion === "number" ? ch.keyVersion : 0;
+    const visibility = typeof ch.visibility === "string" ? ch.visibility : "public";
+    const nextVersion = currentVersion + 1;
+    const key = new Uint8Array(randomBytes(32));
+    await this.request(`/channels/${channelId}/rotate-key`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({
+        keyVersion: nextVersion,
+        ...(visibility === "public" ? { sealedKey: Buffer.from(key).toString("base64") } : {}),
+      }),
+    });
+    this.store.setMessageKey(channelId, nextVersion, key);
+    this.store.setEncryptionState(channelId, true, nextVersion);
+    return nextVersion;
   }
 
   async join(channelId: string, password: string, memberName: string, _opts?: { gitUrl?: string }): Promise<void> {
@@ -533,6 +592,7 @@ export class RelayBridge implements ChannelBridge {
       creatorMember: (data.creatorMember as string | null | undefined) ?? null,
       managerMember: (data.managerMember as string | null | undefined) ?? null,
       admissionMode: data.admissionMode as string | undefined,
+      visibility: (data.visibility as string | undefined) ?? "public",
       invitePolicy: data.invitePolicy as string | undefined,
       contactInfo: (data.contactInfo as string | null | undefined) ?? null,
       encrypted: data.encrypted === true,

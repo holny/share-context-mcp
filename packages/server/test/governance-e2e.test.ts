@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { encodeJoinBlob, mintAdmissionCredential } from "@share-context-mcp/protocol";
+import { encodeBlobEnvelope, mintAdmissionCredential } from "@share-context-mcp/protocol";
 import { startRelay, type RelayHandle } from "@share-context-mcp/relay";
 import { buildMcpServer } from "../src/mcp";
 import { RelayBridge } from "../src/bridge/relay";
@@ -67,13 +67,15 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
   test("full governance lifecycle", async () => {
     // ---- 1. alice creates; bob + carol + dave join ----
     const alice = await mkAgent("alice");
-    const created = textOf(await alice.client.callTool({ name: "channel", arguments: { action: "create", memberName: "alice", name: "governed" } }));
-    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    const created = textOf(await alice.client.callTool({ name: "create_channel",
+      arguments: { memberName: "alice", name: "governed" } }));
+    const channelId = JSON.parse(created).channel_id;
+    const password = JSON.parse(created).password;
 
     const mkJoin = async (label: string, memberName: string) => {
       const agent = await mkAgent(label);
-      await agent.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName } });
+      await agent.client.callTool({ name: "join_channel",
+      arguments: { channel_id: channelId, password, member_name: memberName } });
       return agent;
     };
     const bob = await mkJoin("bob", "bob");
@@ -81,7 +83,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     const dave = await mkJoin("dave", "dave"); // the future kick target
 
     // ---- 2. channel_info: roles + membership from every angle ----
-    const info = JSON.parse(unwrapQuote(textOf(await alice.client.callTool({ name: "channel_info", arguments: {} })))) as {
+    const info = JSON.parse(unwrapQuote(textOf(await alice.client.callTool({ name: "channel_info", arguments: { channel_id: channelId } })))) as {
       creatorMember: string;
       managerMember: string;
       members: Array<{ memberName: string; role: string }>;
@@ -93,8 +95,8 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     expect(info.openVotes).toEqual([]);
 
     // ---- 3. message round trip ----
-    await alice.client.callTool({ name: "send_message", arguments: { statement: "decided: governance rules apply", kind: "decision", topic: "gov" } });
-    const fetched = JSON.parse(unwrapQuote(textOf(await bob.client.callTool({ name: "fetch_messages", arguments: {} })))) as {
+    await alice.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "decided: governance rules apply", kind: "decision", topic: "gov"} });
+    const fetched = JSON.parse(unwrapQuote(textOf(await bob.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } })))) as {
       messages: Array<{ statement: string }>;
     };
     expect(fetched.messages.some((m) => m.statement.includes("governance rules apply"))).toBe(true);
@@ -110,7 +112,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     const { voteId } = (await voteRes.json()) as { voteId: string };
 
     // ---- 5. agents PERCEIVE the open vote in fetch_messages, then cast ----
-    const withVote = JSON.parse(unwrapQuote(textOf(await bob.client.callTool({ name: "fetch_messages", arguments: {} })))) as {
+    const withVote = JSON.parse(unwrapQuote(textOf(await bob.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } })))) as {
       openVotes: Array<{ id: string; type: string; target: string }>;
     };
     expect(withVote.openVotes.some((v) => v.id === voteId && v.target === "dave")).toBe(true);
@@ -123,7 +125,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
       body: JSON.stringify({ choice: "no" }),
     });
     expect(daveBallot.status).toBe(403);
-    await bob.client.callTool({ name: "cast_vote", arguments: { voteId, choice: "yes" } });
+    await bob.client.callTool({ name: "cast_vote", arguments: { channel_id: channelId, vote_id: voteId, choice: "yes" } });
     // carol votes via raw HTTP (vote weight math is relay-side either way)
     await fetch(`${baseUrl}/channels/${channelId}/votes/${voteId}/ballot`, {
       method: "POST",
@@ -165,13 +167,14 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
 
     // ---- 8. encrypted toggle: manager encrypts; a fresh joiner can't read ----
     await alice.bridge.setEncryption(channelId, true);
-    await alice.client.callTool({ name: "send_message", arguments: { statement: "sealed plan v1", kind: "decision", topic: "secret" } });
+    await alice.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "sealed plan v1", kind: "decision", topic: "secret"} });
 
     const erin = await mkAgent("erin");
-    await erin.client.callTool({ name: "channel", arguments: { action: "join", channelId, password: newCredential, memberName: "erin" } });
-    await erin.client.callTool({ name: "fetch_messages", arguments: {} }); // drain join window
-    await alice.client.callTool({ name: "send_message", arguments: { statement: "sealed plan v2", kind: "decision", topic: "secret" } });
-    const erinFetch = JSON.parse(unwrapQuote(textOf(await erin.client.callTool({ name: "fetch_messages", arguments: {} })))) as {
+    await erin.client.callTool({ name: "join_channel",
+      arguments: { channel_id: channelId, password: newCredential, member_name: "erin" } });
+    await erin.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } }); // drain join window
+    await alice.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "sealed plan v2", kind: "decision", topic: "secret"} });
+    const erinFetch = JSON.parse(unwrapQuote(textOf(await erin.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } })))) as {
       encryptedCount: number;
       encryptedNote?: string;
       messages: Array<{ statement: string }>;
@@ -181,20 +184,18 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     expect(erinFetch.messages).toHaveLength(0);
 
     // ---- 9. join_from_blob: a new agent joins from one pasted string ----
-    const blob = encodeJoinBlob({
-      relayUrl: baseUrl,
-      channelId,
-      credential: newCredential,
-      channelName: "governed",
-      admissionMode: "password",
+    const blob = encodeBlobEnvelope({
+      type: "join_password",
+      payload: { relayUrl: baseUrl, channelId, password: newCredential, channelName: "governed", admissionMode: "password" },
     });
     const frank = await mkAgent("frank");
-    const card = textOf(await frank.client.callTool({ name: "join_from_blob", arguments: { blob, memberName: "frank" } }));
+    const card = textOf(await frank.client.callTool({ name: "join_channel", arguments: { blob, member_name: "frank" } }));
     expect(card).toContain(channelId);
     expect(card).toContain("governed");
 
     // ---- 9. list + leave; dissolution when the last member leaves ----
-    const listing = JSON.parse(unwrapQuote(textOf(await frank.client.callTool({ name: "list", arguments: { scope: "channels" } })))) as {
+    const listing = JSON.parse(unwrapQuote(textOf(await frank.client.callTool({ name: "list_channels",
+      arguments: {} })))) as {
       channels: Array<{ channelId: string; memberName?: string }>;
     };
     expect(listing.channels).toHaveLength(1);
@@ -202,7 +203,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
 
     // everyone leaves — the LAST leave dissolves the channel
     for (const agent of [alice, bob, carol, erin, frank]) {
-      const res = await agent.client.callTool({ name: "channel", arguments: { action: "leave" } });
+      const res = await agent.client.callTool({ name: "leave_channel", arguments: { channel_id: channelId } });
       expect(isError(res)).toBe(false);
     }
     const gone = await fetch(`${baseUrl}/channels/${channelId}/meta`, {

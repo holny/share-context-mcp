@@ -111,8 +111,8 @@ describe("consumer identity via _meta sessionID", () => {
     client = new Client({ name: "consumer-test", version: "0.0.0" });
     await Promise.all([client.connect(ct), server.connect(st)]);
     // channel create answers with plain text (not quote-wrapped JSON)
-    const createdRaw = ((await call("channel", { action: "create", memberName: "alice" })) as { raw: string }).raw;
-    channelId2 = /channel_id=([a-z0-9]+)/.exec(createdRaw)![1];
+    const createdJson = (await call("create_channel", { memberName: "alice" })) as { channel_id: string };
+    channelId2 = createdJson.channel_id;
   });
 
   afterAll(async () => { await stopRelay(); rmSync(root2, { recursive: true, force: true }); });
@@ -127,28 +127,28 @@ describe("consumer identity via _meta sessionID", () => {
 
   test("two sessions sharing one process each consume the same messages independently", async () => {
     for (let i = 1; i <= 3; i++) {
-      await call("send_message", { statement: `shared fact ${i}`, kind: "progress", topic: "t" }, "ses_abcdefgh123");
+      await call("send_message", { channel_id: channelId2, statement: `shared fact ${i}`, kind: "progress", topic: "t" }, "ses_abcdefgh123");
     }
     // consumer 1 fetches → sees all 3
-    const c1 = (await call("fetch_messages", {}, "ses_abcdefgh123")) as { messages: unknown[] };
+    const c1 = (await call("fetch_messages", { channel_id: channelId2 }, "ses_abcdefgh123")) as { messages: unknown[] };
     expect(c1.messages.length).toBe(3);
     // consumer 2 (different sessionID, same process) ALSO sees all 3
-    const c2 = (await call("fetch_messages", {}, "ses_zzzzzzzz999")) as { messages: unknown[] };
+    const c2 = (await call("fetch_messages", { channel_id: channelId2 }, "ses_zzzzzzzz999")) as { messages: unknown[] };
     expect(c2.messages.length).toBe(3);
     // consumer 1 again → nothing new
-    const c1b = (await call("fetch_messages", {}, "ses_abcdefgh123")) as { messages: unknown[] };
+    const c1b = (await call("fetch_messages", { channel_id: channelId2 }, "ses_abcdefgh123")) as { messages: unknown[] };
     expect(c1b.messages.length).toBe(0);
   });
 
   test("client without _meta falls back to a pid-scoped consumer and still works", async () => {
-    const r = (await call("fetch_messages", {})) as { messages: unknown[]; cursor: number };
+    const r = (await call("fetch_messages", { channel_id: channelId2 })) as { messages: unknown[]; cursor: number };
     expect(Array.isArray(r.messages)).toBe(true);
     expect(r.cursor).toBeGreaterThan(0);
   });
 
   test("digest posting failure does not turn fetch_messages into a tool error", async () => {
-    await call("send_message", { statement: "decided: digest failure probe", kind: "decision", topic: "t" }, "ses_abcdefgh123");
-    await call("fetch_messages", {}, "ses_abcdefgh123"); // cache the message
+    await call("send_message", { channel_id: channelId2, statement: "decided: digest failure probe", kind: "decision", topic: "t" }, "ses_abcdefgh123");
+    await call("fetch_messages", { channel_id: channelId2 }, "ses_abcdefgh123"); // cache the message
     // force the gap so maybePostDigest attempts a post (pending = the cached message)
     process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "1";
     store.setKv(`gap:${channelId2}`, "5"); // pending (0,4] includes the probe decision
@@ -159,7 +159,7 @@ describe("consumer identity via _meta sessionID", () => {
       throw new Error("relay down");
     };
     try {
-      const r = (await call("fetch_messages", {}, "ses_abcdefgh123")) as { messages?: unknown[]; raw?: string; isError?: boolean };
+      const r = (await call("fetch_messages", { channel_id: channelId2 }, "ses_abcdefgh123")) as { messages?: unknown[]; raw?: string; isError?: boolean };
       expect(r.isError).toBeUndefined();
       expect(Array.isArray(r.messages)).toBe(true);
     } finally {

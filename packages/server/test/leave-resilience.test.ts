@@ -64,12 +64,14 @@ describe("channel leave is locally resilient", () => {
 
   test("relay-side dissolution does not strand the local ledger", async () => {
     const a = await mkAgent("a");
-    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
-    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-    const password = created.match(/password=([a-z0-9-]+)/)![1];
+    const created = textOf(await a.client.callTool({ name: "create_channel",
+      arguments: { memberName: "a" } }));
+    const channelId = JSON.parse(created).channel_id;
+    const password = JSON.parse(created).password;
 
     const b = await mkAgent("b");
-    await b.client.callTool({ name: "channel", arguments: { action: "join", channelId, password, memberName: "b" } });
+    await b.client.callTool({ name: "join_channel",
+      arguments: { channel_id: channelId, password, member_name: "b" } });
 
     // the creator dissolves the channel OUT FROM UNDER b (b never left)
     const key = deriveChannelKey(password, channelId);
@@ -82,12 +84,13 @@ describe("channel leave is locally resilient", () => {
       body: JSON.stringify({}),
     });
     // b leaves the (now dead) channel — the relay errors, local cleanup must run
-    const res = await b.client.callTool({ name: "channel", arguments: { action: "leave" } });
+    const res = await b.client.callTool({ name: "leave_channel", arguments: { channel_id: channelId } });
     expect(isError(res)).toBe(false);
     const body = JSON.parse(unwrapQuote(textOf(res))) as { ok: boolean; left: boolean };
     expect(body.ok).toBe(true);
     expect(body.left).toBe(true);
-    const list = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "list", arguments: { scope: "channels" } })))) as { channels: unknown[] };
+    const list = JSON.parse(unwrapQuote(textOf(await b.client.callTool({ name: "list_channels",
+      arguments: {} })))) as { channels: unknown[] };
     expect(list.channels).toHaveLength(0);
     expect(b.store.getChannelSecret(channelId)).toBeNull();
     void dis;
@@ -95,14 +98,16 @@ describe("channel leave is locally resilient", () => {
 
   test("leave of an unknown channel still cleans the active-channel pointer", async () => {
     const a = await mkAgent("a2");
-    const created = textOf(await a.client.callTool({ name: "channel", arguments: { action: "create", memberName: "a" } }));
-    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const created = textOf(await a.client.callTool({ name: "create_channel",
+      arguments: { memberName: "a" } }));
+    const channelId = JSON.parse(created).channel_id;
     // forge a stale ledger entry pointing at a channel the relay never had
     a.store.recordConsumerChannel("p/nowhere", "ghostchannel01");
     // make it resolvable locally (leave needs a channel secret to resolve)
     a.store.upsertChannel({ channelId: "ghostchannel01", password: "scmc1-nope", memberName: "a", epoch: 1 });
     void channelId;
-    const res = await a.client.callTool({ name: "channel", arguments: { action: "leave", channelId: "ghostchannel01" } });
+    const res = await a.client.callTool({ name: "leave_channel",
+      arguments: { channel_id: "ghostchannel01" } });
     // relay 404s — but the local state must be cleaned regardless
     expect(isError(res)).toBe(false);
     expect(a.store.getChannelSecret("ghostchannel01")).toBeNull();

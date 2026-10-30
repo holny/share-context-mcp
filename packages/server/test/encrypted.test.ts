@@ -175,20 +175,22 @@ describe("fetch_messages surfaces encryptedCount", () => {
 
   test("member without the key sees encryptedCount + contact hint in fetch_messages", async () => {
     const mgr = await mkAgent("mgr");
-    const created = textOf(await mgr.client.callTool({ name: "channel", arguments: { action: "create", memberName: "mgr", name: "vault" } }));
-    const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
+    const created = textOf(await mgr.client.callTool({ name: "create_channel",
+      arguments: { memberName: "mgr", name: "vault" } }));
+    const channelId = JSON.parse(created).channel_id;
     await mgr.bridge.setEncryption(channelId, true);
 
     // peer joins BEFORE the secrets arrive — its fetch window then covers them
     const peer = await mkAgent("peer");
     const secret = mgr.store.getChannelSecret(channelId)!;
-    await peer.client.callTool({ name: "channel", arguments: { action: "join", channelId, password: secret.password, memberName: "peer" } });
-    await peer.client.callTool({ name: "fetch_messages", arguments: {} }); // drain the join window
+    await peer.client.callTool({ name: "join_channel",
+      arguments: { channel_id: channelId, password: secret.password, member_name: "peer" } });
+    await peer.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } }); // drain the join window
 
     for (let i = 1; i <= 2; i++) {
-      await mgr.client.callTool({ name: "send_message", arguments: { statement: `hidden ${i}`, kind: "progress", topic: "t" } });
+      await mgr.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: `hidden ${i}`, kind: "progress", topic: "t" } });
     }
-    const fetched = JSON.parse(unwrapQuote(textOf(await peer.client.callTool({ name: "fetch_messages", arguments: {} })))) as {
+    const fetched = JSON.parse(unwrapQuote(textOf(await peer.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } })))) as {
       encryptedCount?: number;
       encryptedNote?: string;
       messages: unknown[];
@@ -199,7 +201,7 @@ describe("fetch_messages surfaces encryptedCount", () => {
     expect(fetched.encryptedNote).toContain("mgr");
 
     // manager's own fetch: everything readable, no count noise
-    const own = JSON.parse(unwrapQuote(textOf(await mgr.client.callTool({ name: "fetch_messages", arguments: {} })))) as { encryptedCount?: number };
+    const own = JSON.parse(unwrapQuote(textOf(await mgr.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } })))) as { encryptedCount?: number };
     expect(own.encryptedCount ?? 0).toBe(0);
   });
 });

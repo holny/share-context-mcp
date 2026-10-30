@@ -1,16 +1,17 @@
 /**
- * MCP tool surface (spec §13, governance v2) — the agent-facing product.
+ * MCP tool surface (v3, spec §5) — the agent-facing product.
  *
- * Seven tools (consolidated from eleven): send_message, fetch_messages,
- * channel, list, cast_vote, channel_info, join_from_blob. Every tool
- * description below is product-grade copy; change it only with a behavioral
- * reason. All tool output that embeds channel content is wrapped in a
+ * Eleven flat tools: send_message, fetch_messages, create_channel,
+ * join_channel, leave_channel, generate_share_blob, list_channels,
+ * list_members, start_vote, cast_vote, channel_info. Every channel-scoped
+ * tool takes channel_id as a REQUIRED parameter — no default-channel
+ * fallback. All tool output that embeds channel content is wrapped in a
  * reference block (header + "> " per line) per the injection-defense
  * requirement (spec §5.2/§5.9).
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { CLAIM_KINDS, parseJoinBlob, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
+import { CLAIM_KINDS, parseBlobEnvelope, type ClaimKind, type ClaimMessage } from "@share-context-mcp/protocol";
 import { hostname } from "node:os";
 import { INSTRUCTIONS } from "./instructions";
 import { buildDigestMessages } from "./digest";
@@ -18,16 +19,21 @@ import type { ChannelBridge, Store } from "./index";
 
 /**
  * Tool surface for the DEFAULT (relay-backed) bridge. git/S3 bridges omit
- * `cast_vote` (relay-tier governance). Responses all echo `channelId`.
+ * `cast_vote` and `start_vote` (relay-tier governance). Responses all echo
+ * `channelId`.
  */
 export const TOOL_NAMES = [
   "send_message",
   "fetch_messages",
-  "channel",
-  "list",
+  "create_channel",
+  "join_channel",
+  "leave_channel",
+  "generate_share_blob",
+  "list_channels",
+  "list_members",
+  "start_vote",
   "cast_vote",
   "channel_info",
-  "join_from_blob",
 ] as const;
 
 const SERVER_NAME = "share-context-mcp";
@@ -72,31 +78,19 @@ function truncate(text: string, max: number): string {
 }
 
 /**
- * Resolve the target channel: explicit arg > active (most recently used)
- * channel > last joined. Friendly error when nothing is joined.
+ * Resolve the target channel for a scoped tool. channel_id is REQUIRED on
+ * every scoped tool (v3 spec §5) — no default-channel fallback. Friendly
+ * error when the id names a channel this server is not joined to.
  */
 function resolveChannel(store: Store, channelId?: string): string {
-  const ch = resolveChannelInner(store, channelId);
-  activityHooks.get(store)?.(ch);
-  return ch;
-}
-
-function resolveChannelInner(store: Store, channelId?: string): string {
-  if (channelId !== undefined && channelId !== "") {
-    if (!store.getChannelSecret(channelId)) {
-      throw new Error(`not joined to channel ${channelId} — use channel(action:"join") first`);
-    }
-    return channelId;
+  if (typeof channelId !== "string" || channelId.length === 0) {
+    throw new Error("channel_id is required");
   }
-  const active = store.getKv(ACTIVE_CHANNEL_KEY);
-  if (active && store.getChannelSecret(active)) return active;
-  const channels = store.listChannels();
-  if (channels.length === 0) {
-    throw new Error('no channel joined yet — use channel(action:"create") or channel(action:"join")');
+  if (!store.getChannelSecret(channelId)) {
+    throw new Error(`not joined to channel ${channelId} — use join_channel first`);
   }
-  const last = channels[channels.length - 1];
-  if (store.getChannelSecret(last)) return last;
-  throw new Error('no channel joined yet — use channel(action:"create") or channel(action:"join")');
+  activityHooks.get(store)?.(channelId);
+  return channelId;
 }
 
 /**
@@ -400,10 +394,14 @@ function safe(handler: (args: any, extra: unknown) => Promise<string>) {
 }
 
 const channelIdParam = {
-  channelId: z
+  // Schema-level optional + handler-level check: the tool error must read
+  // exactly "channel_id is required" (a zod .required() failure would surface
+  // as an opaque SDK validation message instead).
+  channel_id: z
     .string()
+    .min(1)
     .optional()
-    .describe("Target channel. Omit to use your most recently used channel."),
+    .describe("Target channel id (required)."),
 };
 
 // ---- join blob (spec §14: copy-paste onboarding) ----
@@ -490,6 +488,32 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   };
 
   /**
+   * Shared join tail (password or invite-code credential): runs the bridge
+   * join, records the consumer ledger entry, activates broadcasting, and
+   * sets the channel as active. Throws on relay admission errors.
+   */
+  const performJoin = async (
+    channelId: string,
+    secret: string,
+    memberName: string,
+    viaInvite: boolean,
+    extra: unknown,
+  ): Promise<void> => {
+    if (viaInvite) {
+      const inviteBridge = bridge as ChannelBridge & { joinWithInvite?: (ch: string, code: string, name: string) => Promise<void> };
+      if (typeof inviteBridge.joinWithInvite !== "function") {
+        throw new Error("invite-code joins need a relay-backed bridge");
+      }
+      await inviteBridge.joinWithInvite(channelId, secret, memberName);
+    } else {
+      await bridge.join(channelId, secret, memberName);
+    }
+    store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
+    setActiveChannel(store, channelId);
+    onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
+  };
+
+  /**
    * Open-votes visibility for fetch_messages/channel_info (governance
    * bridges only). Auth failures are LOGGED (never swallowed silently) —
    * a 401/403 means the token died or the member was banned, and the agent
@@ -559,8 +583,8 @@ NEVER include credentials, secrets, tokens, or sensitive personal information in
         ...channelIdParam,
       },
     },
-    safe(async ({ statement, kind, topic, detail, scope, to, channelId }) => {
-      const ch = resolveChannel(store, channelId);
+    safe(async ({ statement, kind, topic, detail, scope, to, channel_id }) => {
+      const ch = resolveChannel(store, channel_id);
       const secret = store.getChannelSecret(ch);
       if (!secret) throw new Error(`unknown channel: ${ch}`);
       // The idempotency key is derived inside send()'s validation —
@@ -636,8 +660,8 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
         ...channelIdParam,
       },
     },
-    safe(async ({ since, query, topic, kind, scopePrefix, limit, setFilters, channelId }, extra) => {
-      const ch = resolveChannel(store, channelId);
+    safe(async ({ since, query, topic, kind, scopePrefix, limit, setFilters, channel_id }, extra) => {
+      const ch = resolveChannel(store, channel_id);
       // SUBSCRIBE mode: a config action, not a fetch — store and acknowledge.
       if (setFilters !== undefined) {
         store.setSubscription(ch, setFilters);
@@ -736,104 +760,183 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
     }),
   );
 
-  // ---- channel (create | join | leave) ----
+  // ---- create_channel (v3 spec §2.2) ----
   server.registerTool(
-    "channel",
+    "create_channel",
     {
-      description: `Manage channel membership — one tool with three actions:
+      description: `Create a new shared context channel and join it as the first member (the creator/owner). Returns the channel_id and password — the password is the ONLY way teammates can join and is shown exactly once, so pass it to them out of band (chat, verbally) together with the channel_id. One channel per project or workstream (e.g. "repo-x-dev", "incident-42").
 
-- action="create": start a new shared context channel and join it as the first member. Returns the channel_id and password — the password is the ONLY way teammates can join and is shown exactly once, so pass it to them out of band (chat, verbally) together with the channel_id. One channel per project or workstream (e.g. "repo-x-dev", "incident-42").
-- action="join": join an existing channel with the channel_id and password a teammate gave you, under your member name. On success you get a join card: the channel's members and its active topics (each with the last statement and seq), so you can decide what to fetch. Choose a stable member name your teammates will recognize — directed messages and mentions use it.
-- action="leave": leave a channel. Relay-side succession and dissolution rules apply: a leaving creator transfers roles (transferTo, or the default most-active rule); the last active member leaving dissolves the channel. You can re-join later with valid credentials.`,
+visibility (public|private) controls discoverability; admissionMode (no_limit|password|invite) controls how members join; private+no_limit is rejected. encrypted:true seals messages E2E — the key is minted on THIS machine at creation and travels only inside share blobs. probationEnabled:true puts new members in a 7-day trial tier.`,
       inputSchema: {
-        action: z.enum(["create", "join", "leave"]).describe("Which membership action to perform."),
         name: z
           .string()
           .max(64)
           .optional()
-          .describe('create: optional display name for the channel, e.g. "checkout-refactor".'),
+          .describe('Optional display name for the channel, e.g. "checkout-refactor".'),
         memberName: z
           .string()
           .min(1)
           .max(32)
-          .optional()
-          .describe('create/join: your member name on the channel, shown to teammates (unique per channel), e.g. "alice".'),
-        password: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("join: channel password received from a teammate."),
-        ...channelIdParam,
-        gitUrl: z
-          .string()
-          .optional()
-          .describe("create/join (GitBridge only): the git repo URL that backs this channel."),
-        s3: z
-          .record(z.unknown())
-          .optional()
-          .describe("create/join (S3Bridge only): S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
+          .describe('Your member name on the channel (creator/owner), shown to teammates, e.g. "alice".'),
+        visibility: z.enum(["public", "private"]).optional().describe("Channel visibility. Default: public. Private channels are hidden from the directory."),
         admissionMode: z
-          .enum(["public", "invite", "password"])
+          .enum(["no_limit", "password", "invite"])
           .optional()
-          .describe("create: admission mode. Default: password."),
-        contactInfo: z
-          .string()
-          .max(256)
-          .optional()
-          .describe("create: contact info for directory listing (invite/password tiers, opt-in)."),
-        transferTo: z
-          .string()
-          .optional()
-          .describe('leave: creator only — hand roles to this active member when leaving. Omit for the default rule.'),
+          .describe("How members join. Default: password. no_limit = anyone with the id; invite = single-use codes."),
+        password: z.string().min(1).optional().describe("Supply a specific channel password. Omit to get a generated grouped password."),
+        encrypted: z.boolean().optional().describe("Seal messages E2E. The message key is minted on this machine at creation (owner-only key governance)."),
+        probationEnabled: z.boolean().optional().describe("Put new members in a 7-day trial tier (reduced quota/weight). Default: off."),
+        contactInfo: z.string().max(256).optional().describe("Owner contact string for directory listing and key-rotation notices."),
+        gitUrl: z.string().optional().describe("create (GitBridge only): the git repo URL that backs this channel."),
+        s3: z.record(z.unknown()).optional().describe("create (S3Bridge only): S3-compatible connection params {endpoint, bucket, region, accessKeyId, secretAccessKey, prefix?}."),
       },
     },
     safe(async (args, extra) => {
-      const { action, name, memberName, password, channelId, gitUrl, s3, admissionMode, contactInfo, transferTo } = args;
-      if (action === "create") {
-        if (typeof memberName !== "string" || memberName.length === 0) {
-          throw new Error('channel(action:"create") requires memberName');
-        }
-        const { channelId: newId, password: newPassword } = await bridge.createChannel({
-          name,
-          memberName,
-          gitUrl,
-          s3,
-          admissionMode,
-          contactInfo,
-        });
-        store.recordConsumerChannel(consumerIdFromExtra(extra), newId);
-        setActiveChannel(store, newId);
-        onChannelJoined?.(newId); // create joins implicitly — start broadcasting
-        if (name) store.setKv(`channelName:${newId}`, name);
-        return (
-          `channel created. Share with teammates: channel_id=${newId} password=${newPassword}\n` +
-          "The password is shown only this once — deliver it out of band; never post it back through the channel."
-        );
+      const { name, memberName, visibility, admissionMode, password, encrypted, probationEnabled, contactInfo, gitUrl, s3 } = args;
+      if (typeof memberName !== "string" || memberName.length === 0) {
+        throw new Error("create_channel requires memberName");
       }
-      if (action === "join") {
-        if (typeof channelId !== "string" || channelId.length === 0) {
-          throw new Error('channel(action:"join") requires channelId');
+      const { channelId: newId, password: newPassword } = await bridge.createChannel({
+        name,
+        memberName,
+        gitUrl,
+        s3,
+        visibility,
+        admissionMode,
+        password,
+        encrypted: encrypted === true,
+        probationEnabled: probationEnabled === true,
+        contactInfo,
+      });
+      store.recordConsumerChannel(consumerIdFromExtra(extra), newId);
+      setActiveChannel(store, newId);
+      onChannelJoined?.(newId); // create joins implicitly — start broadcasting
+      if (name) store.setKv(`channelName:${newId}`, name);
+      return JSON.stringify({
+        ok: true,
+        channel_id: newId,
+        password: newPassword,
+        note: "The password is shown only this once — deliver it out of band; never post it back through the channel.",
+      });
+    }),
+  );
+
+  // ---- join_channel (password / invite code / share blob, spec §4.5) ----
+  server.registerTool(
+    "join_channel",
+    {
+      description: `Join an existing channel. Pass either channel_id + password, channel_id + invite_code, or a share blob (the scmc2- string from generate_share_blob) — the blob fills in everything else, including the message key for encrypted channels. Choose a stable member name your teammates will recognize — directed messages and mentions use it.
+
+If you are ALREADY a member and the blob carries a newer message key, this performs a key top-up (no re-join, no error) — use it to resume after the owner rotated the key.`,
+      inputSchema: {
+        ...channelIdParam,
+        member_name: z
+          .string()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe("Your member name on the channel. Omit to derive one from the machine hostname."),
+        password: z.string().min(1).optional().describe("Channel password received from a teammate (or inside a share blob)."),
+        invite_code: z.string().min(1).optional().describe("Single-use invite code for invite-admission channels."),
+        blob: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Share blob (scmc2-...) from generate_share_blob — extracts channel_id, credentials and message key."),
+      },
+    },
+    safe(async ({ channel_id, member_name, password, invite_code, blob }, extra) => {
+      // Blob mode: everything is extracted from the envelope.
+      if (typeof blob === "string" && blob.length > 0) {
+        const parsed = parseBlobEnvelope(blob);
+        const p = parsed.payload as {
+          relayUrl?: string;
+          channelId?: string;
+          password?: string;
+          inviteCode?: string;
+          channelName?: string;
+          messageKey?: string;
+          keyVersion?: number;
+        };
+        if (typeof p.channelId !== "string" || p.channelId.length === 0) {
+          throw new Error("invalid blob: payload is missing channelId");
         }
-        if (typeof password !== "string" || password.length === 0) {
-          throw new Error('channel(action:"join") requires password');
+        if (
+          bridge.relayUrl !== undefined &&
+          p.relayUrl !== undefined &&
+          p.relayUrl.replace(/\/+$/, "") !== bridge.relayUrl
+        ) {
+          throw new Error(
+            `blob is for relay ${p.relayUrl} but this server is connected to ${bridge.relayUrl} — connect to the right relay first`,
+          );
         }
-        if (typeof memberName !== "string" || memberName.length === 0) {
-          throw new Error('channel(action:"join") requires memberName');
+        const name = member_name ?? defaultMemberName();
+        const key =
+          typeof p.messageKey === "string" && p.messageKey.length > 0
+            ? new Uint8Array(Buffer.from(p.messageKey, "base64"))
+            : null;
+        if (key !== null && key.length !== 32) throw new Error("invalid blob: messageKey must decode to 32 bytes");
+        // Already a member? Top up the key and NEVER re-join (spec §4.5): a
+        // re-join attempt would 409 on the live member name.
+        if (store.getChannelSecret(p.channelId)) {
+          if (key === null || typeof p.keyVersion !== "number") {
+            return quoteWrap(JSON.stringify({ ok: true, channelId: p.channelId, alreadyMember: true }));
+          }
+          store.setMessageKey(p.channelId, p.keyVersion, key);
+          store.setEncryptionState(p.channelId, true, p.keyVersion);
+          return JSON.stringify({
+            ok: true,
+            channelId: p.channelId,
+            keyTopUp: true,
+            keyVersion: p.keyVersion,
+            note: `message key v${p.keyVersion} installed locally — sending on the encrypted channel works again`,
+          });
         }
-        await bridge.join(channelId, password, memberName, { gitUrl, s3 });
-        store.recordConsumerChannel(consumerIdFromExtra(extra), channelId);
-        setActiveChannel(store, channelId);
-        onChannelJoined?.(channelId); // runtime join — start broadcasting (idempotent)
-        return await joinCard(channelId);
+        const secret = p.inviteCode ?? p.password;
+        if (typeof secret !== "string" || secret.length === 0) {
+          throw new Error("invalid blob: payload needs a password or inviteCode");
+        }
+        await performJoin(p.channelId, secret, name, p.inviteCode !== undefined, extra);
+        if (key !== null && typeof p.keyVersion === "number") {
+          store.setMessageKey(p.channelId, p.keyVersion, key);
+          store.setEncryptionState(p.channelId, true, p.keyVersion);
+        }
+        if (p.channelName) store.setKv(`channelName:${p.channelId}`, p.channelName);
+        return await joinCard(p.channelId);
       }
-      // leave
-      const ch = resolveChannel(store, channelId);
+      // Plain mode.
+      if (typeof channel_id !== "string" || channel_id.length === 0) {
+        throw new Error("channel_id is required");
+      }
+      const secret = invite_code ?? password;
+      if (typeof secret !== "string" || secret.length === 0) {
+        throw new Error("join_channel requires password, invite_code, or blob");
+      }
+      const name = member_name ?? defaultMemberName();
+      await performJoin(channel_id, secret, name, invite_code !== undefined, extra);
+      return await joinCard(channel_id);
+    }),
+  );
+
+  // ---- leave_channel ----
+  server.registerTool(
+    "leave_channel",
+    {
+      description:
+        'Leave a channel. Relay-side succession and dissolution rules apply: a leaving creator transfers roles (transfer_to, or the default most-active rule); the last active member leaving dissolves the channel. You can re-join later with valid credentials.',
+      inputSchema: {
+        ...channelIdParam,
+        transfer_to: z.string().optional().describe("Creator only — hand roles to this active member when leaving. Omit for the default rule."),
+      },
+    },
+    safe(async ({ channel_id, transfer_to }, extra) => {
+      const ch = resolveChannel(store, channel_id);
       // Relay errors never strand local state (T6): a dissolved/dead channel
       // 404s or 401s at the relay, but this machine's ledger, secrets and
       // broadcaster attachment must still be cleaned — the member's intent
       // to leave is local and final.
       try {
-        await bridge.leave(ch, transferTo ? { transferTo } : undefined);
+        await bridge.leave(ch, transfer_to ? { transferTo: transfer_to } : undefined);
       } catch (err) {
         console.error(
           `share-context-mcp: relay leave failed for ${ch} (cleaning up locally anyway): ${err instanceof Error ? err.message : String(err)}`,
@@ -852,44 +955,55 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
     }),
   );
 
-  // ---- list (channels | members) ----
+  // ---- list_channels (the session ledger) ----
   server.registerTool(
-    "list",
+    "list_channels",
     {
       description:
-        'List what you are working with. scope="channels": every channel THIS session has joined (id, name, membership name, active flag) — use it after a context reset to rediscover your channels. scope="members": the members currently on a channel, with join times and activity buckets — check it before directing a message with the `to` parameter, and to see who you are collaborating with. `query` narrows the result (substring over channel id/name or member name).',
+        'List every channel THIS session has joined (id, name, membership name, active flag) — use it after a context reset to rediscover your channels. `query` narrows the result (substring over channel id/name).',
       inputSchema: {
-        scope: z.enum(["channels", "members"]).describe("What to list: your joined channels, or a channel's members."),
-        query: z.string().optional().describe("Optional substring filter (channel id/name, or member name)."),
-        ...channelIdParam,
+        query: z.string().optional().describe("Optional substring filter (channel id/name)."),
       },
     },
-    safe(async ({ scope, query, channelId }, extra) => {
-      if (scope === "channels") {
-        const consumerId = consumerIdFromExtra(extra);
-        const q = query?.toLowerCase();
-        const channels = store
-          .listConsumerChannels(consumerId)
-          .map(({ channelId: cid, joinedAt }) => {
-            const secret = store.getChannelSecret(cid);
-            const name = store.getKv(`channelName:${cid}`) ?? undefined;
-            return {
-              channelId: cid,
-              name,
-              memberName: secret?.memberName,
-              joinedAt,
-              active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
-            };
-          })
-          .filter(
-            (c) =>
-              q === undefined ||
-              c.channelId.toLowerCase().includes(q) ||
-              (c.name ?? "").toLowerCase().includes(q),
-          );
-        return quoteWrap(JSON.stringify({ consumerId, channels }));
-      }
-      const ch = resolveChannel(store, channelId);
+    safe(async ({ query }, extra) => {
+      const consumerId = consumerIdFromExtra(extra);
+      const q = query?.toLowerCase();
+      const channels = store
+        .listConsumerChannels(consumerId)
+        .map(({ channelId: cid, joinedAt }) => {
+          const secret = store.getChannelSecret(cid);
+          const name = store.getKv(`channelName:${cid}`) ?? undefined;
+          return {
+            channelId: cid,
+            name,
+            memberName: secret?.memberName,
+            joinedAt,
+            active: store.getKv(ACTIVE_CHANNEL_KEY) === cid,
+          };
+        })
+        .filter(
+          (c) =>
+            q === undefined ||
+            c.channelId.toLowerCase().includes(q) ||
+            (c.name ?? "").toLowerCase().includes(q),
+        );
+      return quoteWrap(JSON.stringify({ consumerId, channels }));
+    }),
+  );
+
+  // ---- list_members ----
+  server.registerTool(
+    "list_members",
+    {
+      description:
+        "List the members currently on a channel, with join times and activity buckets — check it before directing a message with the `to` parameter, and to see who you are collaborating with. `query` narrows by member name substring.",
+      inputSchema: {
+        ...channelIdParam,
+        query: z.string().optional().describe("Optional substring filter over member names."),
+      },
+    },
+    safe(async ({ channel_id, query }) => {
+      const ch = resolveChannel(store, channel_id);
       const meta = await bridge.meta(ch);
       const q = query?.toLowerCase();
       const members = meta.members
@@ -912,8 +1026,8 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
         "Full briefing card for a channel: the structural index card (per-topic rollup, digests, unresolved questions) plus members with governance roles and activity, open votes, admission mode, and relay compaction state (minSeq). Call it to re-orient after a break or before any governance action.",
       inputSchema: { ...channelIdParam },
     },
-    safe(async ({ channelId }) => {
-      const ch = resolveChannel(store, channelId);
+    safe(async ({ channel_id }) => {
+      const ch = resolveChannel(store, channel_id);
       const meta = await bridge.meta(ch);
       const all = store.searchCache(ch, "");
       const pendingQuestions = all.filter((m) => m.kind === "question").length;
@@ -962,69 +1076,60 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
     }),
   );
 
-  // ---- cast_vote (governance — relay-backed bridges only) ----
-  if (bridge.governance) {
+  // ---- start_vote (governance — relay-backed bridges only; v3 MCP surface) ----
+  if (bridge.governance && typeof (bridge as { startVote?: unknown }).startVote === "function") {
     server.registerTool(
-      "cast_vote",
+      "start_vote",
       {
         description:
-          "Cast your ballot on an open governance vote (e.g. a kick vote). Pass the voteId from an openVotes entry in fetch_messages. The vote target cannot vote; one ballot per member.",
+          'Open a governance vote (v1: kick) against a channel member. Same governance checks as the CLI: at least 3 active members, single open vote, cooldowns, the target must be active and cannot vote. Members cast ballots with cast_vote.',
         inputSchema: {
-          voteId: z.string().min(1).describe("Vote id from an openVotes entry."),
-          choice: z.enum(["yes", "no"]).describe("yes = vote for the proposal (e.g. kick); no = against."),
           ...channelIdParam,
+          type: z.enum(["kick"]).describe("Vote type (v1: kick only)."),
+          target: z.string().min(1).describe("Member name the vote targets."),
+          reason: z.string().max(500).optional().describe("Optional human-readable reason, recorded in the audit log context."),
         },
       },
-      safe(async ({ voteId, choice, channelId }) => {
-        const ch = resolveChannel(store, channelId);
-        await bridge.castVote(ch, voteId, choice);
-        return quoteWrap(JSON.stringify({ ok: true, voteId, choice, channelId: ch }));
+      safe(async ({ channel_id, type, target, reason }) => {
+        const ch = resolveChannel(store, channel_id);
+        void reason; // v1: the relay records params only; surfaced in the vote frame later
+        const res = await (bridge as Required<Pick<ChannelBridge, "startVote">>).startVote(ch, target);
+        return quoteWrap(JSON.stringify({ ok: true, channelId: ch, type, target, ...res }));
       }),
     );
   }
 
-  // ---- join_from_blob (spec §14: copy-paste onboarding) ----
+  // ---- cast_vote (governance — relay-backed bridges only) ----
   server.registerTool(
-    "join_from_blob",
+    "cast_vote",
     {
       description:
-        'Join a channel from a copy-paste invite blob (base64 JSON produced by the CLI invite flow: {relayUrl, channelId, credential?, inviteCode?, channelName, admissionMode}). Parses the blob and runs the full join flow — no need to juggle channel_id/password/memberName by hand. Pass memberName explicitly, or one is derived from the machine hostname.',
+        "Cast your ballot on an open governance vote (e.g. a kick vote). Pass the vote_id from an openVotes entry in fetch_messages. The vote target cannot vote; one ballot per member.",
       inputSchema: {
-        blob: z.string().min(1).describe("The blob string copied from the invite text."),
-        memberName: z
-          .string()
-          .min(1)
-          .max(32)
-          .optional()
-          .describe("Your member name on the channel. Omit to derive one from the machine hostname."),
+        ...channelIdParam,
+        vote_id: z.string().min(1).describe("Vote id from an openVotes entry."),
+        choice: z.enum(["yes", "no"]).describe("yes = vote for the proposal (e.g. kick); no = against."),
       },
     },
-    safe(async ({ blob, memberName }, extra) => {
-      const parsed = parseJoinBlob(blob);
-      const name = memberName ?? defaultMemberName();
-      if (
-        bridge.relayUrl !== undefined &&
-        parsed.relayUrl !== undefined &&
-        parsed.relayUrl.replace(/\/+$/, "") !== bridge.relayUrl
-      ) {
-        throw new Error(
-          `blob is for relay ${parsed.relayUrl} but this server is connected to ${bridge.relayUrl} — connect to the right relay first`,
-        );
-      }
-      if (parsed.inviteCode !== undefined) {
-        const inviteBridge = bridge as ChannelBridge & { joinWithInvite?: (ch: string, code: string, name: string) => Promise<void> };
-        if (typeof inviteBridge.joinWithInvite !== "function") {
-          throw new Error("invite-code joins need a relay-backed bridge");
-        }
-        await inviteBridge.joinWithInvite(parsed.channelId, parsed.inviteCode, name);
-      } else {
-        await bridge.join(parsed.channelId, parsed.credential!, name);
-      }
-      store.recordConsumerChannel(consumerIdFromExtra(extra), parsed.channelId);
-      setActiveChannel(store, parsed.channelId);
-      onChannelJoined?.(parsed.channelId);
-      if (parsed.channelName) store.setKv(`channelName:${parsed.channelId}`, parsed.channelName);
-      return await joinCard(parsed.channelId);
+    safe(async ({ channel_id, vote_id, choice }) => {
+      const ch = resolveChannel(store, channel_id);
+      await bridge.castVote(ch, vote_id, choice);
+      return quoteWrap(JSON.stringify({ ok: true, voteId: vote_id, choice, channelId: ch }));
+    }),
+  );
+
+  // ---- generate_share_blob (spec §4.3; implemented in the v3 iteration) ----
+  server.registerTool(
+    "generate_share_blob",
+    {
+      description:
+        "Generate a copy-paste share blob for a channel you belong to. The blob type is inferred from the channel: invite-admission → one-time invite blob; password admission → password blob; encrypted channels embed the current message key so joiners can decrypt. Returns { blob, text } — hand BOTH to the joining teammate out of band.",
+      inputSchema: { ...channelIdParam },
+    },
+    safe(async ({ channel_id }) => {
+      const ch = resolveChannel(store, channel_id);
+      void ch;
+      throw new Error("generate_share_blob: not implemented yet (v3 task 6)");
     }),
   );
 
