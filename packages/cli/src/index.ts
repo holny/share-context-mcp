@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -58,19 +58,71 @@ async function cmdServer() {
 async function cmdCreateChannel() {
   const { Store } = await import("@share-context-mcp/server");
   const { RelayBridge } = await import("@share-context-mcp/server");
+  const { encodeBlobEnvelope } = await import("@share-context-mcp/protocol");
   const store = new Store(dbPath());
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
+  const mode = arg("mode");
   const created = await bridge.createChannel({
     memberName: arg("member") ?? "me",
-    admissionMode: arg("mode"),
+    admissionMode: mode,
+    visibility: arg("visibility"),
+    encrypted: arg("encrypted") !== undefined,
+    probationEnabled: arg("probation") !== undefined,
     contactInfo: arg("contact"),
   });
-  console.log(`\n✅ Channel created!\n  channel_id: ${created.channelId}\n  password:   ${created.password}\n`);
+  console.log(`\n✅ Channel created!\n  channel_id: ${created.channelId}\n  password:   ${created.password}`);
+  // Copy-paste onboarding (spec §14): the join blob carries everything a
+  // teammate's agent needs — no juggling channel_id + password by hand.
+  const blob = encodeBlobEnvelope({
+    type: "join_password",
+    payload: {
+      relayUrl: relayUrl(),
+      channelId: created.channelId,
+      password: created.password,
+      admissionMode: mode ?? "password",
+    },
+  });
+  console.log(`\n  join blob (paste to an agent, or: share-context join --blob "<blob>"):\n  ${blob}\n`);
 }
 
 async function cmdJoin() {
   const { Store, RelayBridge } = await import("@share-context-mcp/server");
   const store = new Store(dbPath());
+  const blobStr = arg("blob");
+  if (blobStr) {
+    // Copy-paste onboarding (spec §14): one scmc2- string carries relay,
+    // channel, credential/invite code and (when encrypted) the message key.
+    const { parseBlobEnvelope } = await import("@share-context-mcp/protocol");
+    const env = parseBlobEnvelope(blobStr);
+    const p = env.payload as {
+      relayUrl?: string; channelId: string; password?: string; inviteCode?: string;
+      channelName?: string; messageKey?: string; keyVersion?: number;
+    };
+    const bridge = new RelayBridge({ baseUrl: p.relayUrl ?? relayUrl(), store });
+    const member = arg("member") ?? (hostname().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "me");
+    const alreadyJoined = store.getChannelSecret(p.channelId) !== null;
+    if (p.inviteCode) {
+      await bridge.joinWithInvite(p.channelId, p.inviteCode, member);
+    } else if (p.password) {
+      if (alreadyJoined) {
+        // already a member: bridge.join would 409 on the taken name — the only
+        // interesting payload is the key top-up below
+      } else {
+        await bridge.join(p.channelId, p.password, member);
+      }
+    } else if (!alreadyJoined) {
+      console.error("Error: this blob carries a message key, not an admission credential — join with a password/invite blob (or share-context join --channel-id/--password) first");
+      process.exit(1);
+    }
+    // key top-up (spec §4.5): an already-joined member resumes after rotation
+    if (p.messageKey) {
+      store.setMessageKey(p.channelId, p.keyVersion ?? 1, new Uint8Array(Buffer.from(p.messageKey, "base64")));
+      console.log(`  message key v${p.keyVersion ?? 1} installed from blob.`);
+    }
+    if (p.channelName) store.setKv(`channelName:${p.channelId}`, p.channelName);
+    console.log(`\n✅ ${alreadyJoined ? `Key updated for ${p.channelName ?? p.channelId}` : `Joined ${p.channelName ?? p.channelId} as ${member}`} (via share blob)\n`);
+    return;
+  }
   const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
   const inviteCode = arg("invite-code");
   if (inviteCode) {
@@ -144,8 +196,8 @@ function cmdHelp() {
 Commands:
   relay                        Start blind relay server
   server                       Start local MCP server (stdio)
-  create-channel               Create a channel (--member <name> [--mode public|invite|password] [--contact "..."])
-  join                         Join a channel (--channel-id <id> --password <pw> | --invite-code <code> --member <name>)
+  create-channel               Create a channel (--member <name> [--visibility public|private] [--mode no_limit|invite|password] [--encrypted] [--probation] [--contact "..."])
+  join                         Join a channel (--channel-id <id> --password <pw> | --invite-code <code> | --blob "<blob>") [--member <name>]
   status                       Show channel status (roles, admission mode, contact)
   fetch                        Fetch recent messages
   leave                        Leave channels (--channel-id <id> [--transfer-to <name>])
@@ -158,11 +210,14 @@ Commands:
   channel grant-invite --id <id> --name N    Restore a member's invite right
   channel transfer --id <id> --to N   Creator hands the manager role to N
   channel dissolve --id <id> [--yes]   Delete the channel (manager/creator)
-  channel set-admission <id> --mode public|invite|password
+  channel set-admission <id> --mode no_limit|invite|password [--visibility public|private]
+                               [--probation 1|0] [--invite-skips 1|0]
                                [--invite-policy everyone|managers-only] [--contact "..."]
   rotate --id <id> --mode access|full [--password <pw>]
                                access (default): new admission credential only;
                                full: + message key (all members need the new credential)
+  rotate-key --id <id>         OWNER ONLY — mint message key vN+1 locally, bump the
+                               relay version, broadcast a contact notice (no key travels)
   invite --id <id> [--ttl hours]   Mint an invite code (invite tier, per invite rights)
   token refresh --id <id>      Rotate this member's channel token
   vote start --channel <id> --type kick --target <name> [--reason R] [--revoke-invitees]
@@ -233,8 +288,8 @@ async function cmdChannelUnban() {
   const name = arg("name");
   if (!name) { console.error("Error: --name required"); process.exit(1); }
   const out = await relayPostJson(id, "/unban", { name });
-  if (out.ok === false) console.log(`⚠️  ${name} had no active ban — nothing changed.`);
-  else console.log(`✅ ${name} unbanned${out.reminder ? ` — ${out.reminder}` : ""} (readmission still needs valid credentials)`);
+  if (out.ok) console.log(`✅ ${name} unbanned${out.reminder ? ` — ${out.reminder}` : ""}`);
+  else console.log(`⚠️  ${name} had no active ban — nothing changed.`);
 }
 
 async function cmdChannelRevokeInvite() {
@@ -279,21 +334,43 @@ async function cmdChannelDissolve() {
 async function cmdChannelSetAdmission() {
   const id = requireId();
   const mode = arg("mode");
-  if (!mode || !["public", "invite", "password"].includes(mode)) {
-    console.error("Error: --mode public|invite|password required"); process.exit(1);
+  if (!mode || !["no_limit", "invite", "password"].includes(mode)) {
+    console.error("Error: --mode no_limit|invite|password required"); process.exit(1);
   }
-  if (mode === "public") {
-    console.error("WARNING: public = the relay holds the channel key — NEW messages will be relay-readable. Old messages stay E2E.");
-    if (!arg("yes")) { console.error("Re-run with --yes to confirm."); process.exit(1); }
+  const visibility = arg("visibility");
+  if (visibility && !["public", "private"].includes(visibility)) {
+    console.error("Error: --visibility public|private"); process.exit(1);
+  }
+  if (visibility === "private" && mode === "no_limit") {
+    console.error("Error: private channels cannot use no_limit admission"); process.exit(1);
+  }
+  if (mode === "no_limit" && visibility !== "private") {
+    const anyEncrypted = false; // relay warns if the channel is encrypted
+    void anyEncrypted;
   }
   const body: Record<string, unknown> = { mode };
+  if (visibility) body.visibility = visibility;
+  const probation = arg("probation");
+  if (probation !== undefined) body.probationEnabled = probation === "1" || probation === "true";
+  const inviteSkips = arg("invite-skips");
+  if (inviteSkips !== undefined) body.inviteSkipsProbation = inviteSkips === "1" || inviteSkips === "true";
   const policy = arg("invite-policy");
   if (policy) body.invitePolicy = policy;
   const contact = arg("contact");
   if (contact) body.contactInfo = contact;
   const out = await relayPostJson(id, "/set-admission", body);
-  console.log(`✅ admission mode = ${out.mode} (future admissions only — existing members unaffected)`);
+  console.log(`✅ admission mode = ${out.mode}${visibility ? `, visibility = ${visibility}` : ""} (future admissions only — existing members unaffected)`);
   if (typeof out.warning === "string") console.log(`⚠️  ${out.warning}`);
+}
+
+/** Owner-only message-key rotation (spec §3): local mint → relay version bump → broadcast. */
+async function cmdRotateKey() {
+  const id = requireId();
+  const { bridge } = await govBridge();
+  const nextVersion = await bridge.rotateKey(id);
+  console.log(`✅ message key rotated to v${nextVersion} (minted locally — the relay only knows the version number).`);
+  console.log(`\nAll other members' sends are now REJECTED with a key-mismatch notice pointing at your contact string.`);
+  console.log(`Distribute the new key via an MCP generate_share_blob (join_key blob), or paste it to each member out of band.`);
 }
 
 async function cmdRotate() {
@@ -341,6 +418,14 @@ async function cmdInvite() {
   const reg = await relayPostJson(id, "/invite-codes", { codeId, expiresAt: Date.now() + ttlHours * 3_600_000 });
   void reg;
   console.log(`✅ invite code (expires in ${ttlHours}h, single-use):\n${code}`);
+  const { encodeBlobEnvelope } = await import("@share-context-mcp/protocol");
+  const blob = encodeBlobEnvelope({
+    type: "join_invite",
+    payload: { relayUrl: relayUrl(), channelId: id, inviteCode: code, admissionMode: "invite" },
+    expiresAt: Date.now() + ttlHours * 3_600_000,
+    maxUses: 1,
+  });
+  console.log(`\n  join blob (paste to an agent, or: share-context join --blob "<blob>"):\n${blob}`);
 }
 
 async function cmdTokenRefresh() {
@@ -405,6 +490,7 @@ const commands: Record<string, () => Promise<void>> = {
     await h();
   },
   rotate: cmdRotate,
+  "rotate-key": cmdRotateKey,
   invite: cmdInvite,
   token: async () => {
     if (process.argv[3] !== "refresh") { console.error("Unknown: token — use `token refresh <id>`"); process.exit(1); }

@@ -10,9 +10,12 @@
 import { openDb, type ChannelRow } from "./db";
 import type { Database } from "bun:sqlite";
 import { authenticateUpgradeToken, createRelayHandler, DEFAULT_MAX_AGE_DAYS, DEFAULT_MAX_MESSAGES, jsonError } from "./routes";
+import { scanActivityRoles } from "./activity";
 import { createWsHub, type WsConnData } from "./ws";
 
 const DEFAULT_PING_INTERVAL_MS = 25_000;
+/** Activity role scan cadence (governance v2 §5): once per day. */
+const DEFAULT_ACTIVITY_SCAN_INTERVAL_MS = 24 * 3_600_000;
 
 export interface RelayOptions {
   /** Port to listen on; 0 (default) picks an ephemeral port. */
@@ -43,6 +46,12 @@ export interface RelayOptions {
    * would let idle channels keep ciphertext past maxAgeDays forever.
    */
   sweepIntervalMs?: number;
+  /**
+   * Activity role scan interval in ms (governance v2 §5; default 24h, 0
+   * disables). The scan also runs once at startup so a restarted relay
+   * re-tiers immediately.
+   */
+  activityScanIntervalMs?: number;
 }
 
 export interface RelayHandle {
@@ -126,11 +135,27 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
   const pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
   const pingTimer = pingIntervalMs > 0 ? setInterval(() => hub.pingAll(), pingIntervalMs) : null;
 
+  // Activity role daily scan (§5): once at startup + on a daily cadence.
+  // unref'd + crash-guarded — the scan must never take the relay down.
+  const activityScanIntervalMs = options.activityScanIntervalMs ?? DEFAULT_ACTIVITY_SCAN_INTERVAL_MS;
+  try {
+    scanActivityRoles(db);
+  } catch { /* startup scan is best-effort */ }
+  const activityTimer = activityScanIntervalMs > 0
+    ? setInterval(() => {
+        try {
+          scanActivityRoles(db);
+        } catch { /* db may be closing — best-effort */ }
+      }, activityScanIntervalMs)
+    : null;
+  activityTimer?.unref();
+
   return {
     port: server.port ?? 0,
     db,
     async stop() {
       if (pingTimer) clearInterval(pingTimer);
+      if (activityTimer) clearInterval(activityTimer);
       hub.closeAll();
       server.stop(true);
       db.close();

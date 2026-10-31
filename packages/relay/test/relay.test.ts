@@ -19,6 +19,7 @@ import {
 } from "@share-context-mcp/protocol";
 import { startRelay, type RelayHandle } from "../src/index";
 import { applyKick } from "../src/routes";
+import { openDb } from "../src/db";
 
 const PASSWORD = "correct horse battery staple";
 const NEW_PASSWORD = "rotated password #2";
@@ -98,6 +99,207 @@ async function joinChannel(
   const res = await postJson(`/channels/${channelId}/join`, { memberName, proof, consumerId });
   return { status: res.status, body: (await res.json()) as Record<string, unknown> };
 }
+
+describe("visibility × admission model (v3)", () => {
+  test("private + no_limit creation is rejected with a clear 400", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    const res = await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      visibility: "private",
+      admissionMode: "no_limit",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("private channels cannot use no_limit admission");
+    // nothing created
+    const ch = await postJson(`/channels/${channelId}/challenge`, { memberName: "alice" });
+    expect(ch.status).toBe(404);
+  });
+
+  test("public + no_limit creation succeeds; open join without proof; meta reports visibility", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      visibility: "public",
+      admissionMode: "no_limit",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    expect(created.status).toBe(200);
+    const join = await postJson(`/channels/${channelId}/join`, { memberName: "bob", consumerId: "s/nolim0001" });
+    expect(join.status).toBe(200);
+    const token = ((await join.json()) as { token: string }).token;
+    const meta = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${token}` } })).json()) as {
+      admissionMode: string;
+      visibility: string;
+    };
+    expect(meta.admissionMode).toBe("no_limit");
+    expect(meta.visibility).toBe("public");
+  });
+
+  test("one-time migration maps legacy 'public' admission rows to 'no_limit'", () => {
+    const dbPath = join(dir, `migrate-${randomBytes(4).toString("hex")}.db`);
+    const db = openDb(dbPath);
+    const channelId = randomBytes(8).toString("hex");
+    db.prepare(
+      "INSERT INTO channels(id, epoch, next_seq, verify_key, created_at, admission_mode) VALUES (?, 1, 1, ?, ?, 'public')",
+    ).run(channelId, verifyKeyB64Of(PASSWORD, channelId), new Date().toISOString());
+    db.close();
+    const db2 = openDb(dbPath); // migration runs on open
+    const row = db2.prepare("SELECT admission_mode, visibility FROM channels WHERE id = ?").get(channelId) as {
+      admission_mode: string;
+      visibility: string;
+    };
+    db2.close();
+    expect(row.admission_mode).toBe("no_limit");
+    expect(row.visibility).toBe("public");
+  });
+
+  test("set-admission validates the pair: flipping visibility to private while no_limit → 400", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      admissionMode: "no_limit",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/vis00001")).body as { token: string };
+    const bad = await postJson(`/channels/${channelId}/set-admission`, { visibility: "private" }, alice.token);
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toContain("private channels cannot use no_limit admission");
+    // switching BOTH at once to a valid pair is fine
+    // I-2: probation flags persist via set-admission (not create-only)
+    const prob = await postJson(`/channels/${channelId}/set-admission`, { probationEnabled: true, inviteSkipsProbation: false }, alice.token);
+    expect(prob.status).toBe(200);
+    const meta2 = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as { probationEnabled: boolean; inviteSkipsProbation: boolean };
+    expect(meta2.probationEnabled).toBe(true);
+    expect(meta2.inviteSkipsProbation).toBe(false);
+    const probOff = await postJson(`/channels/${channelId}/set-admission`, { probationEnabled: false }, alice.token);
+    expect(probOff.status).toBe(200);
+    const meta3 = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as { probationEnabled: boolean };
+    expect(meta3.probationEnabled).toBe(false);
+    const ok = await postJson(`/channels/${channelId}/set-admission`, { visibility: "private", mode: "password" }, alice.token);
+    expect(ok.status).toBe(200);
+    const meta = (await (await fetch(`${base}/channels/${channelId}/meta`, { headers: { authorization: `Bearer ${alice.token}` } })).json()) as {
+      admissionMode: string;
+      visibility: string;
+    };
+    expect(meta.admissionMode).toBe("password");
+    expect(meta.visibility).toBe("private");
+  });
+
+  test("directory lists public channels only — private channels are hidden", async () => {
+    const pubId = randomBytes(8).toString("hex");
+    const privId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId: pubId,
+      memberName: "alice",
+      visibility: "public",
+      admissionMode: "password",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, pubId),
+    });
+    await postJson("/channels", {
+      channelId: privId,
+      memberName: "alice",
+      visibility: "private",
+      admissionMode: "password",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, privId),
+    });
+    const dir = (await (await fetch(`${base}/directory?q=${pubId.slice(0, 6)}`)).json()) as { channels: Array<{ channelId: string }> };
+    expect(dir.channels.find((c) => c.channelId === pubId)).toBeDefined();
+    const dir2 = (await (await fetch(`${base}/directory?q=${privId.slice(0, 6)}`)).json()) as { channels: Array<{ channelId: string }> };
+    expect(dir2.channels.find((c) => c.channelId === privId)).toBeUndefined();
+  });
+
+  test("set-admission still rejects legacy 'public' mode value", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/vis00002")).body as { token: string };
+    const res = await postJson(`/channels/${channelId}/set-admission`, { mode: "public" }, alice.token);
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("probation (v3 §6)", () => {
+  async function mkChannel(extra: Record<string, unknown> = {}): Promise<string> {
+    const channelId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+      ...extra,
+    });
+    expect(created.status).toBe(200);
+    const joined = await joinChannel(channelId, "alice", PASSWORD, "s/prob0001");
+    expect(joined.status).toBe(200);
+    return channelId;
+  }
+
+  const memberRole = (channelId: string, name: string) =>
+    relay.db.prepare("SELECT permission_role, probation_until FROM members WHERE channel_id = ? AND name = ?").get(channelId, name) as
+      | { permission_role: string; probation_until: string | null }
+      | undefined;
+
+  test("password join to a probation channel lands in trial with probation_until ≈ now+7d; creator exempt", async () => {
+    const channelId = await mkChannel({ probationEnabled: true });
+    expect(memberRole(channelId, "alice")).toMatchObject({ permission_role: "regular", probation_until: null });
+    const bob = await joinChannel(channelId, "bob", PASSWORD, "s/prob0002");
+    expect(bob.status).toBe(200);
+    const row = memberRole(channelId, "bob");
+    expect(row?.permission_role).toBe("trial");
+    expect(row?.probation_until).not.toBeNull();
+    const until = Date.parse(row!.probation_until!);
+    expect(until).toBeGreaterThan(Date.now() + 6.9 * 86_400_000);
+    expect(until).toBeLessThan(Date.now() + 7.1 * 86_400_000);
+  });
+
+  test("no probation without the channel flag; invite joins skip probation by default", async () => {
+    // flag off: password join → regular
+    const plain = await mkChannel();
+    await joinChannel(plain, "bob", PASSWORD, "s/prob0003");
+    expect(memberRole(plain, "bob")?.permission_role).toBe("regular");
+    expect(memberRole(plain, "bob")?.probation_until).toBeNull();
+
+    // invite tier + probation + default invite_skips_probation=1 → no probation
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      admissionMode: "invite",
+      probationEnabled: true,
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/prob0004")).body as { token: string };
+    await postJson(`/channels/${channelId}/invite-codes`, { codeId: "code-prob01", expiresAt: Date.now() + 86_400_000 }, alice.token);
+    const dave = await postJson(`/channels/${channelId}/join`, { memberName: "dave", consumerId: "s/prob0005", inviteCodeId: "code-prob01" });
+    expect(dave.status).toBe(200);
+    expect(memberRole(channelId, "dave")).toMatchObject({ permission_role: "regular", probation_until: null });
+  });
+
+  test("invite joins are probated when invite_skips_probation is disabled", async () => {
+    const channelId = randomBytes(8).toString("hex");
+    await postJson("/channels", {
+      channelId,
+      memberName: "alice",
+      admissionMode: "invite",
+      probationEnabled: true,
+      inviteSkipsProbation: false,
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    const alice = (await joinChannel(channelId, "alice", PASSWORD, "s/prob0006")).body as { token: string };
+    await postJson(`/channels/${channelId}/invite-codes`, { codeId: "code-prob02", expiresAt: Date.now() + 86_400_000 }, alice.token);
+    const eve = await postJson(`/channels/${channelId}/join`, { memberName: "eve", consumerId: "s/prob0007", inviteCodeId: "code-prob02" });
+    expect(eve.status).toBe(200);
+    expect(memberRole(channelId, "eve")?.permission_role).toBe("trial");
+    expect(memberRole(channelId, "eve")?.probation_until).not.toBeNull();
+  });
+});
 
 describe("blind relay", () => {
   test("challenge → wrong password 401 → correct join token", async () => {
@@ -469,12 +671,12 @@ describe("blind relay", () => {
   });
 
   test("admission modes: public direct join, invite code gating, set-admission, directory", async () => {
-    // --- public channel: direct join, no challenge/proof ---
+    // --- no_limit channel: direct join, no challenge/proof ---
     const pubId = randomBytes(8).toString("hex");
     const created = await postJson("/channels", {
       channelId: pubId,
       memberName: "alice",
-      admissionMode: "public",
+      admissionMode: "no_limit",
       verifyKeyB64: verifyKeyB64Of(PASSWORD, pubId),
     });
     expect(created.status).toBe(200);
@@ -512,12 +714,12 @@ describe("blind relay", () => {
     expect(eveJoin.status).toBe(403);
 
     // --- set-admission: manager-only, audit-logged ---
-    const nonManager = await postJson(`/channels/${invId}/set-admission`, { mode: "public" }, daveToken);
+    const nonManager = await postJson(`/channels/${invId}/set-admission`, { mode: "no_limit" }, daveToken);
     expect(nonManager.status).toBe(403);
-    const switchRes = await postJson(`/channels/${invId}/set-admission`, { mode: "public" }, invToken);
+    const switchRes = await postJson(`/channels/${invId}/set-admission`, { mode: "no_limit" }, invToken);
     expect(switchRes.status).toBe(200);
     const meta = (await (await fetch(`${base}/channels/${invId}/meta`, { headers: { authorization: `Bearer ${invToken}` } })).json()) as { admissionMode: string };
-    expect(meta.admissionMode).toBe("public");
+    expect(meta.admissionMode).toBe("no_limit");
     // switch took effect: a brand-new member joins WITHOUT any proof
     const eveJoin2 = await postJson(`/channels/${invId}/join`, { memberName: "eve2", consumerId: "s/eve000002" });
     expect(eveJoin2.status).toBe(200);
@@ -526,11 +728,13 @@ describe("blind relay", () => {
     const dir = (await (await fetch(`${base}/directory?q=`)).json()) as { channels: Array<{ channelId: string; contactInfo?: string }> };
     const pubEntry = dir.channels.find((c) => c.channelId === pubId);
     expect(pubEntry).toBeDefined();
-    // password channel without contact info → hidden
+    // v3: directory lists every PUBLIC-visibility channel (spec §2.1) —
+    // a password channel defaults to public visibility and is listed;
+    // only private-visibility channels are hidden.
     const pwdId = randomBytes(8).toString("hex");
     await postJson("/channels", { channelId: pwdId, memberName: "alice", verifyKeyB64: verifyKeyB64Of(PASSWORD, pwdId) });
     const dir2 = (await (await fetch(`${base}/directory?q=`)).json()) as { channels: Array<{ channelId: string }> };
-    expect(dir2.channels.find((c) => c.channelId === pwdId)).toBeUndefined();
+    expect(dir2.channels.find((c) => c.channelId === pwdId)).toBeDefined();
   });
 
   test("governance schema: creator/manager recorded at create+join, exposed via meta; audit rows written", async () => {    const channelId = randomBytes(8).toString("hex");
@@ -867,9 +1071,9 @@ describe("blind relay", () => {
     });
     expect(rejoin2.status).toBe(403);
 
-    // public tier: kicked member cannot re-enter with the same consumer id
+    // no_limit tier: kicked member cannot re-enter with the same consumer id
     const pubId = randomBytes(8).toString("hex");
-    await postJson("/channels", { channelId: pubId, memberName: "alice", admissionMode: "public", verifyKeyB64: verifyKeyB64Of(PASSWORD, pubId) });
+    await postJson("/channels", { channelId: pubId, memberName: "alice", admissionMode: "no_limit", verifyKeyB64: verifyKeyB64Of(PASSWORD, pubId) });
     await joinChannel(pubId, "alice", PASSWORD, "s/alice3001");
     const mallory = "s/mallory01";
     await postJson(`/channels/${pubId}/join`, { memberName: "mallory", consumerId: mallory });

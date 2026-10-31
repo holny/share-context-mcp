@@ -196,11 +196,21 @@ export class Store {
         joined_at   TEXT NOT NULL,
         PRIMARY KEY(consumer_id, channel_id)
       );
+      CREATE TABLE IF NOT EXISTS message_keys (
+        channel_id  TEXT NOT NULL,
+        key_version INTEGER NOT NULL,
+        key_enc     TEXT NOT NULL,
+        PRIMARY KEY(channel_id, key_version)
+      );
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
         statement, detail, topic, kind, scope,
         tokenize = 'trigram'
       );
     `);
+    // Encrypted toggle (governance v2 §11): per-channel state columns
+    // (older stores get them via ALTER).
+    try { this.db.exec("ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { this.db.exec("ALTER TABLE channels ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
     // One-time backfill for stores created before the FTS index existed:
     // rows cached pre-upgrade would otherwise be invisible to >=3-char
     // searches forever. Runs only when the index is empty while the cache
@@ -306,6 +316,75 @@ export class Store {
     return rows.map((r) => r.channel_id);
   }
 
+  // ---- message keyring (encrypted toggle, governance v2 §11) ----
+  //
+  // {channelId → {keyVersion → key}} in memory; entries are persisted
+  // GCM-sealed under the machine key so a restarted server keeps decrypting
+  // old-version rows. Keys are NEVER derived from the admission credential —
+  // they travel out-of-band (credential wrap / manager handoff).
+
+  private readonly keyring = new Map<string, Map<number, Uint8Array>>();
+
+  /** Channel encryption state: {encrypted, keyVersion}. Defaults off/0. */
+  encryptionState(channelId: string): { encrypted: boolean; keyVersion: number } {
+    const row = this.db.prepare("SELECT encrypted, key_version FROM channels WHERE channel_id = ?").get(channelId) as
+      | { encrypted: number; key_version: number }
+      | undefined;
+    return { encrypted: (row?.encrypted ?? 0) === 1, keyVersion: row?.key_version ?? 0 };
+  }
+
+  /** Record the relay-reported toggle state (post set-encryption / join meta). */
+  setEncryptionState(channelId: string, encrypted: boolean, keyVersion: number): void {
+    this.db
+      .prepare("UPDATE channels SET encrypted = ?, key_version = ? WHERE channel_id = ?")
+      .run(encrypted ? 1 : 0, keyVersion, channelId);
+  }
+
+  /** Store a message key under its version (memory + GCM-sealed at rest). */
+  setMessageKey(channelId: string, keyVersion: number, key: Uint8Array): void {
+    if (key.length !== 32) throw new Error("message key must be 32 bytes");
+    let perChannel = this.keyring.get(channelId);
+    if (!perChannel) {
+      perChannel = new Map();
+      this.keyring.set(channelId, perChannel);
+    }
+    perChannel.set(keyVersion, key);
+    this.db
+      .prepare(
+        "INSERT INTO message_keys(channel_id, key_version, key_enc) VALUES (?, ?, ?) " +
+          "ON CONFLICT(channel_id, key_version) DO UPDATE SET key_enc = excluded.key_enc",
+      )
+      .run(channelId, keyVersion, encryptSecret(this.machineKey, Buffer.from(key).toString("base64")));
+  }
+
+  /** Drop one locally-held message key (tests / owner re-mint scenarios). */
+  forgetMessageKey(channelId: string, keyVersion: number): void {
+    this.keyring.get(channelId)?.delete(keyVersion);
+    this.db.prepare("DELETE FROM message_keys WHERE channel_id = ? AND key_version = ?").run(channelId, keyVersion);
+  }
+
+  /** The key for a version, or null when this member does not hold it. */
+  messageKey(channelId: string, keyVersion: number): Uint8Array | null {
+    const cached = this.keyring.get(channelId)?.get(keyVersion);
+    if (cached) return cached;
+    const row = this.db
+      .prepare("SELECT key_enc FROM message_keys WHERE channel_id = ? AND key_version = ?")
+      .get(channelId, keyVersion) as { key_enc: string } | undefined;
+    if (!row) return null;
+    try {
+      const key = new Uint8Array(Buffer.from(decryptSecret(this.machineKey, row.key_enc), "base64"));
+      let perChannel = this.keyring.get(channelId);
+      if (!perChannel) {
+        perChannel = new Map();
+        this.keyring.set(channelId, perChannel);
+      }
+      perChannel.set(keyVersion, key);
+      return key;
+    } catch {
+      return null; // undecryptable residue — treat as not held
+    }
+  }
+
   /** Rejoin candidates: channels with a stored (encrypted) password. */
   rejoinable(): string[] {
     const rows = this.db.prepare("SELECT channel_id FROM channels WHERE password_enc IS NOT NULL ORDER BY joined_at ASC").all() as Array<{
@@ -320,6 +399,7 @@ export class Store {
       this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(ch);
       this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(ch);
       this.db.prepare("DELETE FROM consumer_channels WHERE channel_id = ?").run(ch);
+      this.db.prepare("DELETE FROM message_keys WHERE channel_id = ?").run(ch);
       // FTS mirror cleanup: orphan rows are otherwise only reclaimed lazily
       // when a later insert happens to reuse their rowid.
       this.db

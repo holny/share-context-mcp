@@ -204,7 +204,7 @@ export class GitBridge implements ChannelBridge {
     const s = this.secret(channelId);
     this.syncHead(s);
     const base = join(this.workCopy(channelId), `channels/${channelId}/messages`);
-    if (!existsSync(base)) return { messages: [], skipped: 0 };
+    if (!existsSync(base)) return { messages: [], skipped: 0, encryptedCount: 0 };
     const out: ClaimMessage[] = [];
     let skipped = 0;
     // Read every epoch directory this member can decrypt (spec §5.5: old-key
@@ -227,7 +227,7 @@ export class GitBridge implements ChannelBridge {
       }
     }
     out.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    return { messages: out, skipped };
+    return { messages: out, skipped, encryptedCount: 0 };
   }
 
   /** After a raced push, find the seq our claim actually landed at (by idemKey file suffix). */

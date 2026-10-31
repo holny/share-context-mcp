@@ -158,7 +158,7 @@ describe("vote module", () => {
     expect(metaAfter.managerMember).toBe("alice");
   });
 
-  test("edge behaviors: expired-vote ballot 409, --revoke-invitees exempt leadership, target-left voids", async () => {
+  test("edge behaviors: expired-vote ballot 409, --revoke-invitees exempt leadership", async () => {
     const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol", "dave"]);
     // late ballot on an expired-but-unswept vote: backdate ends_at via db, then ballot → 409
     const opened = await startVote(channelId, tokens.alice, { target: "dave" });
@@ -192,18 +192,44 @@ describe("vote module", () => {
     expect(daveRow.can_invite).toBe(1);
   });
 
-  test("target leaving mid-vote voids the vote (expired), no kick applies", async () => {
-    const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol"]);
-    const opened = await startVote(channelId, tokens.alice, { target: "carol" });
+  test("v3 §7: a kick vote SURVIVES the target leaving — pass applies the ban, re-entry blocked", async () => {
+    const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol", "dave"]);
+    const opened = await startVote(channelId, tokens.alice, { target: "dave" });
+    expect(opened.status).toBe(200);
+    const { voteId } = (await opened.json()) as { voteId: string };
+    // target dave leaves MID-VOTE — the vote is NOT voided
+    const leave = await post(`/channels/${channelId}/leave`, {}, tokens.dave);
+    expect(leave.status).toBe(200);
+    // the vote is still open: remaining eligible members can cast
+    await castBallot(channelId, voteId, tokens.alice, "yes");
+    await castBallot(channelId, voteId, tokens.bob, "yes");
+    // 2 yes of 2 cast > 1/2 → passes even though the target already left
+    const votes = await getVotes(channelId, tokens.alice);
+    expect(votes.open.find((v) => v.id === voteId)).toBeUndefined();
+    expect(votes.history.find((v) => v.id === voteId)?.status).toBe("passed");
+    // the ban row is written for the DEPARTED target — re-admission is blocked
+    const banRow = relay.db.prepare("SELECT name FROM member_bans WHERE channel_id = ? AND name = 'dave'").get(channelId);
+    expect(banRow).toBeDefined();
+    const ch = await post(`/channels/${channelId}/challenge`, { memberName: "dave" });
+    const { nonceB64 } = (await ch.json()) as { nonceB64: string };
+    const rejoin = await post(`/channels/${channelId}/join`, {
+      memberName: "dave",
+      proof: proofOf(vk(channelId), nonceB64),
+      consumerId: "s/dave-rejoin",
+    });
+    expect(rejoin.status).toBe(403);
+  });
+
+  test("v3 §7: a target-left vote can also FAIL — on fail, nothing is applied", async () => {
+    const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol", "dave"]);
+    const opened = await startVote(channelId, tokens.alice, { target: "dave" });
     const { voteId } = (await opened.json()) as { voteId: string };
     await castBallot(channelId, voteId, tokens.alice, "yes");
-    await castBallot(channelId, voteId, "bob", "yes");
-    // target carol leaves mid-vote
-    await post(`/channels/${channelId}/leave`, {}, tokens.carol);
-    // settlement: voided — carol NOT banned (she's gone; row status left, no ban row)
+    await post(`/channels/${channelId}/leave`, {}, tokens.dave);
+    await castBallot(channelId, voteId, tokens.bob, "no");
+    await castBallot(channelId, voteId, tokens.carol, "no");
     const votes = await getVotes(channelId, tokens.alice);
-    expect(votes.history.find((v) => v.id === voteId)?.status).toBe("expired");
-    const banRow = relay.db.prepare("SELECT name FROM member_bans WHERE channel_id = ? AND name = 'carol'").get(channelId);
-    expect(banRow).toBeNull();
+    expect(votes.history.find((v) => v.id === voteId)?.status).toBe("failed");
+    expect(relay.db.prepare("SELECT name FROM member_bans WHERE channel_id = ? AND name = 'dave'").get(channelId)).toBeNull();
   });
 });

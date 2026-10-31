@@ -1,5 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { deriveChannelKey, seal, open, hmacProof, mintAdmissionCredential, parseAdmissionCredential, mintInviteCode, parseInviteCode } from "../src/crypto";
+import {
+  encodeBlobEnvelope,
+  parseBlobEnvelope,
+  isBlobExpired,
+  deriveChannelKey,
+  seal,
+  open,
+  hmacProof,
+  mintAdmissionCredential,
+  parseAdmissionCredential,
+  mintInviteCode,
+  parseInviteCode,
+} from "../src/crypto";
 import { validateClaim, type ClaimMessage } from "../src/schema";
 
 function validInput() {
@@ -132,5 +144,79 @@ describe("self-contained credentials", () => {
   test("parse rejects tampered/truncated credentials", () => {
     expect(() => parseAdmissionCredential("scmc1-garbage")).toThrow();
     expect(() => parseInviteCode("scmc1-garbage")).toThrow();
+  });
+});
+
+describe("scmc2 blob envelope", () => {
+  const ALL_TYPES = ["join_password", "join_invite", "join_key", "key_update"] as const;
+  const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+
+  test("round trip preserves type, payload, expiresAt, maxUses for all four types", () => {
+    for (const [i, type] of ALL_TYPES.entries()) {
+      const blob = encodeBlobEnvelope({
+        type,
+        payload: { channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 },
+        expiresAt: 1_780_000_000_000 + i,
+        maxUses: i + 1,
+      });
+      expect(blob.startsWith("scmc2-")).toBe(true);
+      expect(blob).not.toMatch(/\s/);
+      const parsed = parseBlobEnvelope(blob);
+      expect(parsed.type).toBe(type);
+      expect(parsed.payload).toEqual({ channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 });
+      expect(parsed.expiresAt).toBe(1_780_000_000_000 + i);
+      expect(parsed.maxUses).toBe(i + 1);
+    }
+  });
+
+  test("optional fields round trip as absent", () => {
+    const blob = encodeBlobEnvelope({ type: "key_update", payload: { channelId: "ch", keyVersion: 2 } });
+    const parsed = parseBlobEnvelope(blob);
+    expect(parsed.type).toBe("key_update");
+    expect(parsed.payload).toEqual({ channelId: "ch", keyVersion: 2 });
+    expect(parsed.expiresAt).toBeUndefined();
+    expect(parsed.maxUses).toBeUndefined();
+  });
+
+  test("a single mutated character anywhere in the base32 body fails the parse", () => {
+    const blob = encodeBlobEnvelope({
+      type: "join_invite",
+      payload: { channelId: "invite0ch01", inviteCode: "scmc1-xxxx-yyyy", keyVersion: 1 },
+      expiresAt: Date.now() + 7 * 86_400_000,
+      maxUses: 1,
+    });
+    const body = blob.slice("scmc2-".length);
+    // five positions spanning the body: start, early, middle, late, end
+    const positions = [0, 7, Math.floor(body.length / 2), body.length - 9, body.length - 1];
+    for (const p of positions) {
+      const mutated = body[p];
+      const replacement = B32[(B32.indexOf(mutated) + 7) % B32.length];
+      const tampered = `scmc2-${body.slice(0, p)}${replacement}${body.slice(p + 1)}`;
+      expect(() => parseBlobEnvelope(tampered)).toThrow(/invalid blob:/);
+    }
+  });
+
+  test("isBlobExpired: past expiresAt → true; future → false; absent → false", () => {
+    const now = Date.now();
+    expect(isBlobExpired({ expiresAt: now - 1 }, now)).toBe(true);
+    expect(isBlobExpired({ expiresAt: now + 60_000 }, now)).toBe(false);
+    expect(isBlobExpired({}, now)).toBe(false);
+  });
+
+  test("input longer than 8192 chars throws", () => {
+    // encode refuses to produce an over-long envelope
+    expect(() =>
+      encodeBlobEnvelope({ type: "join_password", payload: { channelId: "ch", password: "y".repeat(6000) } }),
+    ).toThrow(/invalid blob:/);
+    // parse rejects an over-long input before decoding anything
+    expect(() => parseBlobEnvelope(`scmc2-${"a".repeat(9000)}`)).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope(`scmc2-${"a".repeat(8186)}`)).not.toThrow(/size/);
+  });
+
+  test("non-scmc2 prefix and garbage input throw", () => {
+    expect(() => parseBlobEnvelope("scmc1-abcdefg")).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope("")).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope("scmc2-notbase32!!!")).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope("scmc2-" + Buffer.from("garbage").toString("base64"))).toThrow(/invalid blob:/);
   });
 });

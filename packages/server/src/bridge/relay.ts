@@ -65,10 +65,15 @@ interface EnvelopeRow {
   seq: number;
   nonce: string;
   ciphertext: string;
+  /** Encrypted-toggle stamp (§11): 1 = sealed under a keyed envelope. */
+  encrypted?: number;
+  /** Present on encrypted rows: the key version the sender sealed with. */
+  keyVersion?: number;
 }
 
 export class RelayBridge implements ChannelBridge {
-  private readonly baseUrl: string;
+  /** Relay origin, e.g. https://relay.corp:8931 (blob payloads embed it). */
+  readonly baseUrl: string;
   private readonly store: Store;
   /** Session tokens per channel — memory first, encrypted fallback in the store. */
   private readonly tokens = new Map<string, string>();
@@ -81,12 +86,14 @@ export class RelayBridge implements ChannelBridge {
   private readonly lastActivityPost = new Map<string, number>();
 
   readonly governance = true;
+  readonly relayUrl: string;
 
   /** Consumer id bound into every request (X-SCM-Consumer); registered at join. */
   consumerId = `p/${process.pid}`;
 
   constructor(opts: { baseUrl: string; store: Store }) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.relayUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = this.relayUrl;
     this.store = opts.store;
   }
 
@@ -96,6 +103,14 @@ export class RelayBridge implements ChannelBridge {
     const res = await fetch(`${this.baseUrl}${path}`, init);
     const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
     if (!res.ok) {
+      // Key-rotation mismatches (spec §3.2) surface verbatim: the relay
+      // returns currentVersion + contact so the agent can act on the error.
+      if (res.status === 409 && (body?.currentVersion !== undefined || body?.contact !== undefined)) {
+        const parts = [typeof body.error === "string" ? body.error : "request failed"];
+        if (body.currentVersion !== undefined) parts.push(`currentVersion=${body.currentVersion}`);
+        if (body.contact !== undefined) parts.push(`contact=${body.contact}`);
+        throw new Error(parts.join(" "));
+      }
       // The relay's fixed error strings are the contract ("auth failed: wrong
       // password", "member name already taken", "unauthorized") — pass through.
       throw new Error(typeof body?.error === "string" ? body.error : `relay request failed: ${res.status}`);
@@ -243,11 +258,24 @@ export class RelayBridge implements ChannelBridge {
 
   // ---- ChannelBridge ----
 
-  async createChannel(opts: { name?: string; memberName: string; gitUrl?: string; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }> {
+  async createChannel(opts: {
+    name?: string;
+    memberName: string;
+    gitUrl?: string;
+    s3?: import("./types").S3ConnectionParams;
+    visibility?: string;
+    admissionMode?: string;
+    password?: string;
+    encrypted?: boolean;
+    probationEnabled?: boolean;
+    contactInfo?: string;
+  }): Promise<{ channelId: string; password: string }> {
     // `name` is a local display label in v1; the blind relay stores no title.
     void opts.name;
+    void opts.gitUrl;
+    void opts.s3;
     const channelId = generateChannelId();
-    const password = generateGroupedPassword();
+    const password = opts.password ?? generateGroupedPassword();
     const key = deriveChannelKey(password, channelId);
     const created = await this.request("/channels", {
       method: "POST",
@@ -256,6 +284,8 @@ export class RelayBridge implements ChannelBridge {
         channelId,
         memberName: opts.memberName,
         admissionMode: opts.admissionMode,
+        visibility: opts.visibility,
+        probationEnabled: opts.probationEnabled === true ? true : undefined,
         contactInfo: opts.contactInfo,
         verifyKeyB64: deriveVerifyKeyB64(key),
       }),
@@ -268,7 +298,60 @@ export class RelayBridge implements ChannelBridge {
       epoch: typeof created.epoch === "number" ? created.epoch : 1,
     });
     this.defaultChannelId = channelId;
+    // Owner-only key governance (spec §3.1): channel creation is one of the
+    // two key-generation points. Enabling encryption here mints v1 on THIS
+    // machine and registers it via rotate-key (the setEncryption path).
+    if (opts.encrypted === true) {
+      await this.setEncryption(channelId, true);
+    }
     return { channelId, password };
+  }
+
+  async startVote(channelId: string, target: string, opts: { banIp?: boolean; revokeInvitees?: boolean } = {}): Promise<{ voteId: string; endsAt: number }> {
+    const res = await this.request(`/channels/${channelId}/votes`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({ type: "kick", target, ...(opts.banIp ? { banIp: true } : {}), ...(opts.revokeInvitees ? { revokeInvitees: true } : {}) }),
+    });
+    if (typeof res.voteId !== "string") throw new Error("relay did not open the vote");
+    return { voteId: res.voteId, endsAt: res.endsAt as number };
+  }
+
+  /**
+   * Owner-only message-key rotation (v3 spec §3.3, CLI path): mint the next
+   * key LOCALLY, register the new version via the creator-gated rotate-key
+   * endpoint (with a sealed copy on the public tier), store it in the local
+   * keyring. Members on the old key get 409 on send and need a fresh blob.
+   */
+  /** Register a freshly minted invite code with the relay (single-use ledger entry). */
+  async registerInviteCode(channelId: string, codeId: string, expiresAt: number): Promise<void> {
+    await this.request(`/channels/${channelId}/invite-codes`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders(channelId) },
+      body: JSON.stringify({ codeId, expiresAt }),
+    });
+  }
+
+  async rotateKey(channelId: string): Promise<number> {
+    const ch = await this.request(`/channels/${channelId}/meta`, {
+      method: "GET",
+      headers: this.authHeaders(channelId),
+    });
+    const currentVersion = typeof ch.keyVersion === "number" ? ch.keyVersion : 0;
+    const visibility = typeof ch.visibility === "string" ? ch.visibility : "public";
+    const nextVersion = currentVersion + 1;
+    const key = new Uint8Array(randomBytes(32));
+    await this.request(`/channels/${channelId}/rotate-key`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({
+        keyVersion: nextVersion,
+        ...(visibility === "public" ? { sealedKey: Buffer.from(key).toString("base64") } : {}),
+      }),
+    });
+    this.store.setMessageKey(channelId, nextVersion, key);
+    this.store.setEncryptionState(channelId, true, nextVersion);
+    return nextVersion;
   }
 
   async join(channelId: string, password: string, memberName: string, _opts?: { gitUrl?: string }): Promise<void> {
@@ -311,6 +394,15 @@ export class RelayBridge implements ChannelBridge {
       memberName,
       epoch: typeof meta.epoch === "number" ? meta.epoch : 1,
     });
+    // Sync the encrypted-toggle state (§11): a joining member must know the
+    // channel is encrypted and at which key version — it holds no key yet
+    // (keys travel out-of-band), so sends will fail with a readable error
+    // and polls will surface encryptedCount until the key is handed over.
+    this.store.setEncryptionState(
+      channelId,
+      meta.encrypted === true,
+      typeof meta.keyVersion === "number" ? meta.keyVersion : 0,
+    );
     this.defaultChannelId = channelId;
   }
 
@@ -318,7 +410,28 @@ export class RelayBridge implements ChannelBridge {
     const ch = this.channelIdFor(msg, channelId);
     const validated = validateClaim(msg);
     if (!validated.ok) throw new Error(validated.reason);
-    const envelope: SealedEnvelope = seal(validated.msg, this.channelKey(ch));
+    if (!this.store.getChannelSecret(ch)) throw new Error(`unknown channel: ${ch}`);
+    // Encrypted toggle (§11): encrypted channels seal with the CURRENT
+    // keyring key and carry its version; unencrypted channels carry
+    // plaintext JSON (the relay stores content in the clear by design).
+    const encState = this.store.encryptionState(ch);
+    let envelope: SealedEnvelope;
+    let keyVersion: number | undefined;
+    if (encState.encrypted) {
+      const key = this.store.messageKey(ch, encState.keyVersion);
+      if (!key) {
+        throw new Error(
+          `no message key for version ${encState.keyVersion} — ask the channel manager for the current key before sending`,
+        );
+      }
+      envelope = seal(validated.msg, key);
+      keyVersion = encState.keyVersion;
+    } else {
+      envelope = {
+        nonce: randomBytes(12).toString("base64"), // unused in plaintext mode; wire format stays uniform
+        ciphertext: Buffer.from(JSON.stringify(validated.msg), "utf8").toString("base64"),
+      };
+    }
     const res = (await this.request(`/channels/${ch}/messages`, {
       method: "POST",
       headers: { ...this.authHeaders(ch), "content-type": "application/json" },
@@ -326,6 +439,7 @@ export class RelayBridge implements ChannelBridge {
         nonce: envelope.nonce,
         ciphertext: envelope.ciphertext,
         idemKey: validated.msg.idempotencyKey,
+        ...(keyVersion !== undefined ? { keyVersion } : {}),
       }),
     })) as { seq?: unknown; deduped?: unknown };
     // A successful send is activity (spec §5.8): poll-mode listeners of this
@@ -377,20 +491,50 @@ export class RelayBridge implements ChannelBridge {
     }
     const out: ClaimMessage[] = [];
     let best = 0; // index of the last key that opened an envelope
+    let encryptedCount = 0; // encrypted rows this member could NOT open
     for (const env of envelopes) {
-      for (let i = 0; i < keys.length; i++) {
+      const isEncryptedRow = env.encrypted === 1;
+      // Encrypted rows (§11): the row's keyVersion selects the keyring entry;
+      // the channel key is NOT a fallback that can open them (keys are
+      // independent random secrets) — but trying it is harmless.
+      const candidates: Uint8Array[] = [];
+      if (isEncryptedRow && typeof env.keyVersion === "number") {
+        const ringKey = this.store.messageKey(channelId, env.keyVersion);
+        if (ringKey) candidates.push(ringKey);
+      }
+      candidates.push(...keys);
+      let opened: ClaimMessage | null = null;
+      for (let i = 0; i < candidates.length; i++) {
         try {
-          const msg = open({ nonce: env.nonce, ciphertext: env.ciphertext }, keys[(best + i) % keys.length]);
-          // Spec §5.9 server-side clamp: truncate (never drop) overlong
-          // content so the cache stays truthful to the cursor.
-          msg.statement = msg.statement.slice(0, LIMITS.statementMax);
-          if (msg.detail !== undefined) msg.detail = msg.detail.slice(0, LIMITS.detailMax);
-          out.push({ ...msg, seq: env.seq });
-          best = (best + i) % keys.length;
+          opened = open({ nonce: env.nonce, ciphertext: env.ciphertext }, candidates[(best + i) % candidates.length]);
+          best = (best + i) % candidates.length;
           break;
         } catch {
-          // wrong epoch key — try the next candidate before giving up
+          // wrong key — try the next candidate before giving up
         }
+      }
+      if (!opened && !isEncryptedRow) {
+        // Plaintext rows (§11 default): base64(JSON) with no seal. Legacy
+        // sealed rows stamped encrypted=0 fall through JSON parse to the
+        // key candidates above.
+        try {
+          const parsed = JSON.parse(Buffer.from(env.ciphertext, "base64").toString("utf8")) as ClaimMessage;
+          if (typeof parsed?.statement === "string" && typeof parsed?.kind === "string" && typeof parsed?.topic === "string") {
+            opened = parsed;
+          }
+        } catch {
+          // not plaintext JSON — legacy sealed row already tried above
+        }
+      }
+      if (opened) {
+        const msg = opened;
+        // Spec §5.9 server-side clamp: truncate (never drop) overlong
+        // content so the cache stays truthful to the cursor.
+        msg.statement = msg.statement.slice(0, LIMITS.statementMax);
+        if (msg.detail !== undefined) msg.detail = msg.detail.slice(0, LIMITS.detailMax);
+        out.push({ ...msg, seq: env.seq });
+      } else if (isEncryptedRow) {
+        encryptedCount++;
       }
     }
     if (out.length > 0) this.store.cacheMessages(channelId, out);
@@ -404,7 +548,7 @@ export class RelayBridge implements ChannelBridge {
     // (Review F3): the broadcaster's background poll passes markActivity:
     // false — self-marking would keep poll mode at the active pace forever.
     if (opts?.markActivity !== false) this.markListeners(channelId);
-    return { messages: out, skipped: envelopes.length - out.length, minSeq };
+    return { messages: out, skipped: envelopes.length - out.length, encryptedCount, minSeq };
   }
 
   /**
@@ -460,9 +604,55 @@ export class RelayBridge implements ChannelBridge {
       headers: this.authHeaders(channelId),
     });
     return {
-      members: (data.members as ChannelMember[]) ?? [],
+      members: ((data.members as Array<Record<string, unknown>>) ?? []).map((m) => ({
+        memberName: m.memberName as string,
+        joinedAt: m.joinedAt as string,
+        lastActiveAt: (m.lastActiveAt as string | null) ?? null,
+        permissionRole: m.permissionRole as string | undefined,
+      })),
       nextSeq: data.nextSeq as number,
+      minSeq: typeof data.minSeq === "number" ? data.minSeq : undefined,
+      creatorMember: (data.creatorMember as string | null | undefined) ?? null,
+      managerMember: (data.managerMember as string | null | undefined) ?? null,
+      admissionMode: data.admissionMode as string | undefined,
+      visibility: (data.visibility as string | undefined) ?? "public",
+      invitePolicy: data.invitePolicy as string | undefined,
+      contactInfo: (data.contactInfo as string | null | undefined) ?? null,
+      encrypted: data.encrypted === true,
+      keyVersion: typeof data.keyVersion === "number" ? data.keyVersion : 0,
     };
+  }
+
+  /**
+   * Encrypted toggle (§11 + v3 §3.5 — OWNER/CLI path, never an MCP tool):
+   * the relay endpoint only flips the channel flag. Enabling encryption on a
+   * channel with no key yet mints v1 CLIENT-SIDE (random 32 bytes, independent
+   * of the admission credential) and registers the new version through the
+   * creator-only rotate-key endpoint — the ONLY relay-side key-version writer.
+   * Toggle-OFF leaves the keyring intact so old encrypted rows stay readable.
+   */
+  async setEncryption(channelId: string, encrypted: boolean): Promise<void> {
+    const res = await this.request(`/channels/${channelId}/set-encryption`, {
+      method: "POST",
+      headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+      body: JSON.stringify({ encrypted }),
+    });
+    const currentVersion = typeof res.keyVersion === "number" ? res.keyVersion : 0;
+    if (encrypted && currentVersion < 1) {
+      const meta = await this.meta(channelId);
+      const key = new Uint8Array(randomBytes(32));
+      const rotateBody: Record<string, unknown> = { keyVersion: 1 };
+      if (meta.visibility === "public") rotateBody.sealedKey = Buffer.from(key).toString("base64");
+      await this.request(`/channels/${channelId}/rotate-key`, {
+        method: "POST",
+        headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
+        body: JSON.stringify(rotateBody),
+      });
+      this.store.setMessageKey(channelId, 1, key);
+      this.store.setEncryptionState(channelId, true, 1);
+      return;
+    }
+    this.store.setEncryptionState(channelId, encrypted, currentVersion);
   }
 
   /** Presence receipts: POST the member's last-activity timestamp to the relay,
@@ -527,8 +717,7 @@ export class RelayBridge implements ChannelBridge {
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
   }
 
-  async leave(channelId: string, opts?: { transferTo?: string }): Promise<void> {
-    // Governance leave (§2): succession + dissolution live at the relay.
+  async leave(channelId: string, opts?: { transferTo?: string }): Promise<void> {    // Governance leave (§2): succession + dissolution live at the relay.
     // Local cleanup only after the relay accepted the departure.
     await this.request(`/channels/${channelId}/leave`, {
       method: "POST",
@@ -542,20 +731,27 @@ export class RelayBridge implements ChannelBridge {
 
   /**
    * Invite-tier join: the code is self-contained (code id + wrapped channel
-   * key). Parses it, presents the code id to the relay, stores the code as
-   * the channel secret (channelKey() unwraps it later).
+   * key). Parses it, presents the code id to the relay, captures the issued
+   * token from the join response, and stores the code as the channel secret
+   * (channelKey() unwraps it later).
    */
   async joinWithInvite(channelId: string, code: string, memberName: string): Promise<void> {
     const { parseInviteCode } = await import("@share-context-mcp/protocol");
     const parsed = parseInviteCode(code);
-    await this.request(`/channels/${channelId}/join`, {
+    const joined = (await this.request(`/channels/${channelId}/join`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ memberName, consumerId: this.consumerId, inviteCodeId: parsed.codeId }),
+    })) as { token?: string; epoch?: number };
+    if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
+    this.tokens.set(channelId, joined.token);
+    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: joined.token, memberName }));
+    this.store.upsertChannel({
+      channelId,
+      password: code,
+      memberName,
+      epoch: typeof joined.epoch === "number" ? joined.epoch : 1,
     });
-    this.tokens.set(channelId, (this.loadStoredSession(channelId)?.token ?? ""));
-    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: this.loadStoredSession(channelId)?.token ?? "", memberName }));
-    this.store.upsertChannel({ channelId, password: code, memberName, epoch: 1 });
     this.defaultChannelId = channelId;
   }
 }

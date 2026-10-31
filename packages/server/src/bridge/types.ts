@@ -45,6 +45,8 @@ export interface ChannelMember {
   joinedAt: string;
   /** ISO timestamp of the member's last reported activity; null when never reported. Relay-backed bridges only. */
   lastActiveAt?: string | null;
+  /** Permission tier from the relay (creator | manager | representative | vip | regular | trial). Relay-backed bridges only. */
+  permissionRole?: string;
 }
 
 export interface ChannelMeta {
@@ -54,9 +56,13 @@ export interface ChannelMeta {
   creatorMember?: string | null;
   managerMember?: string | null;
   admissionMode?: string;
+  visibility?: string;
   invitePolicy?: string;
   contactInfo?: string | null;
   minSeq?: number;
+  /** Encrypted toggle (§11, relay-backed bridges). */
+  encrypted?: boolean;
+  keyVersion?: number;
 }
 
 export interface PollResult {
@@ -69,6 +75,13 @@ export interface PollResult {
    */
   skipped: number;
   /**
+   * Encrypted rows (encrypted toggle, §11) in the window this member could
+   * NOT open — no keyring entry for the row's key version. Subset of
+   * `skipped`; surfaced so the agent can be told how many messages exist
+   * that it cannot read.
+   */
+  encryptedCount: number;
+  /**
    * Lowest seq the relay still retains (relay-backed bridges only). When the
    * relay has evicted a prefix below the consumer's cursor, the cursor is
    * raised to minSeq and the gap recorded locally — evicted text is gone and
@@ -79,11 +92,26 @@ export interface PollResult {
 
 export interface ChannelBridge {
   /** Create a channel and join it as `memberName`. Returns the human-shareable secret.
-   * gitUrl (GitBridge only): the remote repo URL for this channel. */
-  createChannel(opts: { name?: string; memberName: string; gitUrl?: string; s3?: S3ConnectionParams; admissionMode?: string; contactInfo?: string }): Promise<{ channelId: string; password: string }>;
+   * gitUrl (GitBridge only): the remote repo URL for this channel.
+   * v3 (spec §2.2): visibility/admissionMode shape validated at the relay;
+   * password may be caller-supplied (owner-chosen) or generated;
+   * encrypted:true mints the message key v1 on THIS machine (owner-only
+   * key governance — creation is one of the two generation points);
+   * probationEnabled toggles the 7-day trial tier for new members. */
+  createChannel(opts: {
+    name?: string;
+    memberName: string;
+    gitUrl?: string;
+    s3?: S3ConnectionParams;
+    visibility?: string;
+    admissionMode?: string;
+    password?: string;
+    encrypted?: boolean;
+    probationEnabled?: boolean;
+    contactInfo?: string;
+  }): Promise<{ channelId: string; password: string }>;
   /** Join an existing channel with a password. gitUrl (GitBridge only): the remote repo URL. */
-  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;
-  /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
+  join(channelId: string, password: string, memberName: string, opts?: { gitUrl?: string; s3?: S3ConnectionParams }): Promise<void>;  /** Validate + seal + publish a claim. Throws with the validation reason on invalid input. */
   send(msg: ClaimInput, channelId?: string): Promise<{ seq: number; deduped: boolean }>;
   /** Fetch envelopes since a seq, decrypt with the best held key, cache; the cursor high-waters over the whole returned window. */
   poll(channelId: string, since: number, opts?: { markActivity?: boolean }): Promise<PollResult>;
@@ -114,9 +142,21 @@ export interface ChannelBridge {
   }>;
   castVote(channelId: string, voteId: string, choice: "yes" | "no"): Promise<void>;
   /**
+   * Open a governance vote (v3 spec §5: start_vote on the MCP surface —
+   * same relay checks as the CLI path). Relay-backed bridges only.
+   */
+  startVote?(channelId: string, target: string, opts?: { banIp?: boolean; revokeInvitees?: boolean }): Promise<{ voteId: string; endsAt: number }>;
+  /**
    * Governance capability (§governance): true only for the relay-backed
    * bridge — roles/votes/bans/directory are relay-tier features. git/S3
    * bridges run basic messaging and the MCP surface omits governance tools.
    */
   readonly governance: boolean;
+  /**
+   * Base URL of the backing relay (relay-backed bridges only; undefined for
+   * git/S3). join_from_blob compares it against a blob's relayUrl so a
+   * copy-paste invite for a DIFFERENT relay fails with a readable error
+   * instead of silently joining the wrong server.
+   */
+  readonly relayUrl?: string;
 }

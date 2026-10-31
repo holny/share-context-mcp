@@ -13,7 +13,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { hmacProof } from "@share-context-mcp/protocol";
-import type { ChannelRow, MemberRow } from "./db";
+import type { ChannelRow, MemberRow, UserRow } from "./db";
 import type { WsHub } from "./ws";
 
 // ---- tunables (spec §5.5: token TTL 24h default) ----
@@ -131,6 +131,29 @@ function validMemberName(v: unknown): v is string {
   return typeof v === "string" && v.trim().length >= 1 && v.trim().length <= MEMBER_NAME_MAX;
 }
 
+/**
+ * v3 channel-shape validator (spec §2.1): visibility (public|private) ×
+ * admission mode (no_limit|password|invite) with the one forbidden pair —
+ * private + no_limit (an open-admission channel cannot be hidden; anyone who
+ * can find it can join it, so "private" would be a false promise).
+ * Shared by create and set-admission.
+ */
+export function validateChannelShape(
+  visibility: string,
+  admissionMode: string,
+): { ok: true } | { ok: false; error: string } {
+  if (visibility !== "public" && visibility !== "private") {
+    return { ok: false, error: "invalid request: visibility must be public|private" };
+  }
+  if (admissionMode !== "no_limit" && admissionMode !== "password" && admissionMode !== "invite") {
+    return { ok: false, error: "invalid request: admissionMode must be no_limit|password|invite" };
+  }
+  if (visibility === "private" && admissionMode === "no_limit") {
+    return { ok: false, error: "private channels cannot use no_limit admission" };
+  }
+  return { ok: true };
+}
+
 function isLiveToken(m: MemberRow, channel: { epoch: number }, now: number): boolean {
   return (
     m.token_hash !== null &&
@@ -186,10 +209,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     timer.unref();
   }
 
-  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked FROM channels WHERE id = ?");
-  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at FROM members WHERE channel_id = ? AND name = ?");
-  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite FROM members WHERE channel_id = ? AND token_hash = ?");
-  const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
+  const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, visibility, probation_enabled, invite_skips_probation, sealed_key, key_rotated_at, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
+  const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
+  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id FROM members WHERE channel_id = ? AND token_hash = ?");
+  const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at, permission_role, activity_role, activity_expires_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
   const stmtUpsertMember = db.prepare(`
@@ -203,9 +226,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   `);
   const stmtClearTokens = db.prepare("UPDATE members SET token_hash = NULL, token_expires_at = NULL WHERE channel_id = ?");
   const stmtBumpEpoch = db.prepare("UPDATE channels SET epoch = epoch + 1 WHERE id = ?");
-  const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, sender, nonce, ciphertext, idem_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  const stmtInsertMessage = db.prepare("INSERT INTO messages(channel_id, seq, sender, nonce, ciphertext, idem_key, created_at, encrypted, key_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
   const stmtMessageByIdem = db.prepare("SELECT seq FROM messages WHERE channel_id = ? AND idem_key = ?");
-  const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
+  const stmtMessagesSince = db.prepare("SELECT seq, nonce, ciphertext, encrypted, key_version FROM messages WHERE channel_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?");
   // Returns the LIVE epoch alongside the allocated seq so push notifications
   // are allocated atomically with the message (a concurrent rotate cannot
   // split seq from its epoch).
@@ -225,16 +248,16 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     "INSERT INTO invite_codes(channel_id, code_id, owner, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, 'active')",
   );
   const stmtSetAdmission = db.prepare(
-    "UPDATE channels SET admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+    "UPDATE channels SET admission_mode = ?, visibility = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
   );
   const stmtSetCredential = db.prepare(
     "UPDATE channels SET verify_key = ?, admission_credential_revoked = ? WHERE id = ?",
   );
   const stmtDirectory = db.prepare(`
-    SELECT c.id, c.admission_mode, c.contact_info,
+    SELECT c.id, c.admission_mode, c.contact_info, c.visibility,
            (SELECT COUNT(*) FROM members m WHERE m.channel_id = c.id AND m.status = 'active') AS members
     FROM channels c
-    WHERE c.admission_mode = 'public' OR c.contact_info IS NOT NULL
+    WHERE c.visibility = 'public'
     ORDER BY c.created_at ASC
   `);
   const stmtLeave = db.prepare(
@@ -329,18 +352,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     const now = Date.now();
     stmtSetCooldown.run(now + VOTE_GLOBAL_COOLDOWN_MS, channelId);
     if (!vote) return;
-    if (vote.type === "kick") {
-      // Target departed mid-vote (status left/removed) → the vote is VOID:
-      // no kick applies (there is no one to kick); the 4h global cooldown
-      // still applies.
-      const targetRow = stmtMemberByName.get(channelId, vote.target) as MemberRow | undefined;
-      if (!targetRow || targetRow.status !== "active") {
-        db.prepare("UPDATE votes SET status = 'expired' WHERE channel_id = ? AND id = ?").run(channelId, voteId);
-        wsHub?.notifyGovernance(channelId, { type: "vote-settled", voteId, target: vote.target, outcome: "expired" });
-        return;
-      }
-    }
     if (passed && vote.type === "kick") {
+      // v3 (spec §7): a vote whose target left mid-vote CONTINUES. The ban
+      // applies on pass even to the departed member — it blocks re-entry at
+      // the admission gate. applyKick tolerates a departed target (the member
+      // row may be status 'left'; the ban row is what matters).
       const params = vote.params_json ? (JSON.parse(vote.params_json) as { banIp?: boolean; revokeInvitees?: boolean }) : {};
       const ip = (
         db.prepare("SELECT ip FROM member_bans WHERE channel_id = ? AND name = ?").get(channelId, vote.target) as
@@ -436,7 +452,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     const ch = stmtChannel.get(channelId) as ChannelRow;
     const leadership = vote.target === ch.manager_member || vote.target === ch.creator_member;
     const active = activeMemberNames(channelId);
-    const eligible = active.length - 1; // the target cannot vote
+    // The target cannot vote — but only subtract them when they are actually
+    // among the active members (a departed target no longer suppresses anyone
+    // else's ballot; v3 §7 ballot math counts the REMAINING eligible voters).
+    const eligible = active.includes(vote.target) ? active.length - 1 : active.length;
     const remaining = eligible - cast;
     // EARLY PASS — even a unanimous remaining "no" cannot flip the outcome.
     if (leadership) {
@@ -492,6 +511,89 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   function audit(channelId: string, actor: string, action: string, target?: string, result?: string): void {
     stmtAudit.run(channelId, new Date().toISOString(), actor, action, target ?? null, result ?? null);
   }
+
+  // ---- user / consumer model (governance v2 §3) ----
+
+  const stmtUserByName = db.prepare("SELECT user_id FROM users WHERE name = ?");
+  const stmtInsertUser = db.prepare(
+    "INSERT INTO users(user_id, name, ip, os_type, os_version, mcp_version, token_hash, registered_at, last_active_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  const stmtUpdateUserProfile = db.prepare(
+    "UPDATE users SET ip = COALESCE(?, ip), os_type = COALESCE(?, os_type), os_version = COALESCE(?, os_version), mcp_version = COALESCE(?, mcp_version), token_hash = ?, last_active_at = ? WHERE user_id = ?",
+  );
+  const stmtUserByTokenHash = db.prepare("SELECT user_id FROM users WHERE token_hash = ?");
+  const stmtBindUserToken = db.prepare("UPDATE users SET token_hash = ? WHERE user_id = ?");
+  const stmtUserById = db.prepare("SELECT user_id, name, ip, os_type, os_version, mcp_version, registered_at, last_active_at FROM users WHERE user_id = ?");
+  const stmtUpsertConsumer = db.prepare(
+    "INSERT INTO consumers(consumer_id, user_id, agent_type, agent_version, session_id, last_active_at) VALUES (?, ?, ?, ?, ?, ?) " +
+      "ON CONFLICT(consumer_id) DO UPDATE SET user_id = excluded.user_id, agent_type = COALESCE(excluded.agent_type, consumers.agent_type), agent_version = COALESCE(excluded.agent_version, consumers.agent_version), session_id = COALESCE(excluded.session_id, consumers.session_id), last_active_at = excluded.last_active_at",
+  );
+  const stmtTouchConsumer = db.prepare(
+    "INSERT INTO consumers(consumer_id, user_id, last_active_at) VALUES (?, ?, ?) " +
+      "ON CONFLICT(consumer_id) DO UPDATE SET user_id = excluded.user_id, last_active_at = excluded.last_active_at",
+  );
+  const stmtConsumersOfUser = db.prepare(
+    "SELECT consumer_id, agent_type, agent_version, session_id, last_active_at FROM consumers WHERE user_id = ? ORDER BY last_active_at DESC",
+  );
+
+  const USER_NAME_MAX = 64;
+  const USER_FIELD_MAX = 64;
+
+  function validUserField(v: unknown, max = USER_FIELD_MAX): v is string {
+    return typeof v === "string" && v.trim().length >= 1 && v.trim().length <= max;
+  }
+
+  function clientIp(req: Request): string | null {
+    const fwd = req.headers.get("x-forwarded-for");
+    if (fwd) {
+      const first = fwd.split(",")[0]?.trim();
+      if (first) return first;
+    }
+    return req.headers.get("x-real-ip");
+  }
+
+  /**
+   * Find-or-create the relay-global user for a join. Identity key: user name
+   * (client sends its machine hostname; legacy clients fall back to the
+   * member name). Profile fields are refresh-on-join (COALESCE keeps the
+   * first-seen value when a later join omits them); the token hash is
+   * overwritten — the LATEST issued token is the live user token.
+   */
+  function upsertUser(spec: { name: string; ip: string | null; osType?: string; osVersion?: string; mcpVersion?: string }, tokenHash: string): string {
+    const now = new Date().toISOString();
+    const existing = stmtUserByName.get(spec.name) as { user_id: string } | undefined;
+    if (existing) {
+      stmtUpdateUserProfile.run(spec.ip, spec.osType ?? null, spec.osVersion ?? null, spec.mcpVersion ?? null, tokenHash, now, existing.user_id);
+      return existing.user_id;
+    }
+    const userId = `u${randomBytes(8).toString("hex")}`;
+    stmtInsertUser.run(userId, spec.name, spec.ip, spec.osType ?? null, spec.osVersion ?? null, spec.mcpVersion ?? null, tokenHash, now, now);
+    return userId;
+  }
+
+  /** Parse the optional join/consumers `user` block into bounded strings. */
+  function parseUserSpec(body: Record<string, unknown>, fallbackName: string): { name: string; osType?: string; osVersion?: string; mcpVersion?: string } {
+    const raw = body.user;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return { name: fallbackName };
+    }
+    const u = raw as Record<string, unknown>;
+    return {
+      name: validUserField(u.name, USER_NAME_MAX) ? (u.name as string).trim() : fallbackName,
+      ...(validUserField(u.osType) ? { osType: (u.osType as string).trim() } : {}),
+      ...(validUserField(u.osVersion) ? { osVersion: (u.osVersion as string).trim() } : {}),
+      ...(validUserField(u.mcpVersion) ? { mcpVersion: (u.mcpVersion as string).trim() } : {}),
+    };
+  }
+
+  function parseAgentSpec(body: Record<string, unknown>): { agentType?: string; agentVersion?: string; sessionId?: string } {
+    return {
+      ...(validUserField(body.agentType, 32) ? { agentType: (body.agentType as string).trim() } : {}),
+      ...(validUserField(body.agentVersion, 32) ? { agentVersion: (body.agentVersion as string).trim() } : {}),
+      ...(validUserField(body.sessionId, 128) ? { sessionId: (body.sessionId as string).trim() } : {}),
+    };
+  }
+
   const stmtMinSeqAbove = db.prepare("SELECT MIN(seq) AS s FROM messages WHERE channel_id = ? AND created_at > ?");
   const stmtEvictPrefix = db.prepare("DELETE FROM messages WHERE channel_id = ? AND seq < ?");
   const stmtSetMinSeq = db.prepare("UPDATE channels SET min_seq = MAX(min_seq, ?) WHERE id = ?");
@@ -590,6 +692,15 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       }
       if (!consumerBanned && isWrite) {
         stmtRegisterConsumer.run(channelId, member.name, consumer, new Date().toISOString());
+        // User/consumer ledger (governance v2 §3): a valid token + a fresh
+        // consumer id is a registration — the consumer auto-joins the user's
+        // ledger without an explicit /consumers call. The user's own
+        // last_active_at rides the same write.
+        if (member.user_id) {
+          const nowIso = new Date().toISOString();
+          stmtTouchConsumer.run(consumer, member.user_id, nowIso);
+          db.prepare("UPDATE users SET last_active_at = ? WHERE user_id = ?").run(nowIso, member.user_id);
+        }
       }
     }
     if (memberBanned || consumerBanned) return "banned";
@@ -619,7 +730,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   }
 
   const storeMessage = db.transaction(
-    (channelId: string, sender: string, nonce: string, ciphertext: string, idemKey: string): { seq: number; epoch: number; deduped: boolean } => {
+    (channelId: string, sender: string, nonce: string, ciphertext: string, idemKey: string, encrypted: number, keyVersion: number): { seq: number; epoch: number; deduped: boolean } => {
       const existing = stmtMessageByIdem.get(channelId, idemKey) as { seq: number } | undefined;
       if (existing) {
         return { seq: existing.seq, epoch: 0, deduped: true };
@@ -632,7 +743,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         // unreachable: channel existence verified in authenticate()
         throw new Error("channel vanished mid-transaction");
       }
-      stmtInsertMessage.run(channelId, allocated.seq, sender, nonce, ciphertext, idemKey, new Date().toISOString());
+      stmtInsertMessage.run(channelId, allocated.seq, sender, nonce, ciphertext, idemKey, new Date().toISOString(), encrypted, keyVersion);
       return { seq: allocated.seq, epoch: allocated.epoch, deduped: false };
     },
   );
@@ -675,21 +786,28 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
       } else {
         channelId = randomBytes(16).toString("hex");
       }
+      // v3 (spec §2.2): visibility defaults 'public'; admissionMode defaults
+      // 'password'; the pair is strictly validated (private+no_limit → 400)
+      // BEFORE anything is written.
+      const visibility = typeof parsed.body.visibility === "string" ? parsed.body.visibility : "public";
+      const admissionModeRaw = parsed.body.admissionMode;
+      const mode = typeof admissionModeRaw === "string" ? admissionModeRaw : "password";
+      const shape = validateChannelShape(visibility, mode);
+      if (!shape.ok) return jsonError(400, shape.error);
       stmtInsertChannel.run(channelId, verifyKeyB64, new Date().toISOString());
       // reserve the creator's member name (no token yet → not "live",
       // so the creator can still join under it)
       stmtUpsertMember.run(channelId, (memberName as string).trim(), null, null, 1, new Date().toISOString());
       // Governance: the creating member is creator AND manager (§2). Optional
-      // admission mode/policy/contact come from the create payload.
-      const admissionMode = parsed.body.admissionMode;
-      const mode =
-        admissionMode === "public" || admissionMode === "invite" ? admissionMode : "password";
+      // admission mode/policy/contact/visibility come from the create payload.
       const invitePolicy = parsed.body.invitePolicy === "managers-only" ? "managers-only" : "everyone";
       const contactInfo = typeof parsed.body.contactInfo === "string" ? (parsed.body.contactInfo as string) : null;
+      const probationEnabled = parsed.body.probationEnabled === true ? 1 : 0;
+      const inviteSkipsProbation = parsed.body.inviteSkipsProbation === false ? 0 : 1;
       const stmtSetRolesAndAdmission = db.prepare(
-        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
+        "UPDATE channels SET creator_member = ?, manager_member = ?, admission_mode = ?, visibility = ?, probation_enabled = ?, invite_skips_probation = ?, invite_policy = ?, contact_info = ? WHERE id = ?",
       );
-      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, invitePolicy, contactInfo, channelId);
+      stmtSetRolesAndAdmission.run((memberName as string).trim(), (memberName as string).trim(), mode, visibility, probationEnabled, inviteSkipsProbation, invitePolicy, contactInfo, channelId);
       audit(channelId, (memberName as string).trim(), "channel.created", channelId, `mode=${mode}`);
       return json({ channelId, epoch: 1, nextSeq: 1 });
     }
@@ -750,7 +868,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
     }
 
     // ---- /channels/:id/... ----
-    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit))?$/);
+    const match = path.match(/^\/channels\/([^/]+)(?:\/(challenge|join|messages|meta|rotate|rotate-key|activity|consumers|token-refresh|invite-codes|set-admission|set-credential|set-encryption|transfer|leave|votes|votes\/[^/]+\/ballot|bans|unban|invite-rights|member-stats|dissolve|audit|me))?$/);
     if (!match) return jsonError(404, "not found");
     const [, channelId, action] = match;
     if (!action) {
@@ -826,7 +944,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           pendingInviteCodeId = codeId;
         }
         const proof = parsed.body.proof;
-        const needsProof = mode === "password" || (isCreator && mode !== "public");
+        const needsProof = mode === "password" || (isCreator && mode !== "no_limit");
         if (
           needsProof &&
           (typeof proof !== "string" || proof.length === 0 || proof.length > 128)
@@ -863,18 +981,48 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           member?.joined_at ?? new Date().toISOString(),
         );
         stmtRegisterConsumer.run(channelId, memberName, consumerId, new Date().toISOString());
+        // User/consumer model (§3): the token binds to the relay-global USER,
+        // not the channel. Find-or-create the user (identity key: client
+        // hostname; legacy clients fall back to the member name), bind the
+        // token, link the member row, and register the consumer under it.
+        const agentSpec = parseAgentSpec(parsed.body);
+        const userSpec = parseUserSpec(parsed.body, memberName);
+        const userId = upsertUser({ ...userSpec, ip: clientIp(req) }, sha256Hex(token));
+        db.prepare("UPDATE members SET user_id = ? WHERE channel_id = ? AND name = ?").run(userId, channelId, memberName);
+        stmtUpsertConsumer.run(
+          consumerId,
+          userId,
+          agentSpec.agentType ?? null,
+          agentSpec.agentVersion ?? null,
+          agentSpec.sessionId ?? null,
+          new Date().toISOString(),
+        );
         if (pendingInviteCodeId !== null) {
           // Admission succeeded — consume the code (F-4).
           stmtUseInviteCode.run(memberName, channelId, pendingInviteCodeId);
         }
+        // v3 probation (spec §6): probated joins land in the trial tier with a
+        // 7-day probation_until. Skipped by invite joins while
+        // invite_skips_probation is set (default), and always for the creator.
+        const probationEnabled = (channel.probation_enabled ?? 0) === 1;
+        const inviteJoinSkips = pendingInviteCodeId !== null && (channel.invite_skips_probation ?? 1) === 1;
+        if (probationEnabled && !inviteJoinSkips && !isCreator) {
+          db.prepare("UPDATE members SET probation_until = ?, permission_role = 'trial' WHERE channel_id = ? AND name = ?").run(
+            new Date(now + 7 * 86_400_000).toISOString(),
+            channelId,
+            memberName,
+          );
+          audit(channelId, memberName, "member.probation", memberName, "until=" + new Date(now + 7 * 86_400_000).toISOString());
+        }
         challenges.delete(key); // one-time use
         audit(channelId, memberName, "member.joined", memberName, "ok");
-        return json({ token, epoch: channel.epoch, memberName });
+        return json({ token, epoch: channel.epoch, memberName, userId });
       }
 
       case "consumers": {
         // Register an ADDITIONAL consumer id under this membership (multi-
-        // session processes share one member). Token-authenticated.
+        // session processes share one member). Token-authenticated. Also
+        // recorded in the user-level consumer ledger (governance v2 §3).
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
         if (auth === "banned") return jsonError(403, "banned");
@@ -887,7 +1035,61 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         if (auth.member.status === "banned") return jsonError(403, "banned");
         stmtRegisterConsumer.run(channelId, auth.member.name, consumerId, new Date().toISOString());
+        if (auth.member.user_id) {
+          const agentSpec = parseAgentSpec(parsed.body);
+          stmtUpsertConsumer.run(
+            consumerId,
+            auth.member.user_id,
+            agentSpec.agentType ?? null,
+            agentSpec.agentVersion ?? null,
+            agentSpec.sessionId ?? null,
+            new Date().toISOString(),
+          );
+        }
         return json({ ok: true });
+      }
+
+      case "me": {
+        // Identity card of the authenticated member's relay-global user
+        // (governance v2 §3): profile + the consumer ledger (agent
+        // processes/sessions) registered under it.
+        if (method !== "GET") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        const userId = auth.member.user_id;
+        if (!userId) {
+          // Pre-model member (joined before the users table existed): the
+          // identity is channel-local only.
+          return json({ userId: null, user: null, consumers: [] });
+        }
+        const user = stmtUserById.get(userId) as
+          | { user_id: string; name: string; ip: string | null; os_type: string | null; os_version: string | null; mcp_version: string | null; registered_at: string; last_active_at: string }
+          | undefined;
+        if (!user) return json({ userId: null, user: null, consumers: [] });
+        const consumers = stmtConsumersOfUser.all(userId) as Array<{
+          consumer_id: string; agent_type: string | null; agent_version: string | null; session_id: string | null; last_active_at: string;
+        }>;
+        return json({
+          userId,
+          user: {
+            userId: user.user_id,
+            name: user.name,
+            ip: user.ip,
+            osType: user.os_type,
+            osVersion: user.os_version,
+            mcpVersion: user.mcp_version,
+            registeredAt: user.registered_at,
+            lastActiveAt: user.last_active_at,
+          },
+          consumers: consumers.map((c) => ({
+            consumerId: c.consumer_id,
+            agentType: c.agent_type ?? undefined,
+            agentVersion: c.agent_version ?? undefined,
+            sessionId: c.session_id ?? undefined,
+            lastActiveAt: c.last_active_at,
+          })),
+        });
       }
 
       case "token-refresh": {
@@ -905,8 +1107,13 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           channel.epoch,
           auth.member.joined_at,
         );
+        // Rebind the user-scoped token: the refreshed token becomes the live
+        // user token; the old one stops resolving everywhere.
+        if (auth.member.user_id) {
+          stmtBindUserToken.run(sha256Hex(token), auth.member.user_id);
+        }
         audit(channelId, auth.member.name, "token.refreshed", auth.member.name, "ok");
-        return json({ token, epoch: channel.epoch, memberName: auth.member.name });
+        return json({ token, epoch: channel.epoch, memberName: auth.member.name, ...(auth.member.user_id ? { userId: auth.member.user_id } : {}) });
       }
 
       case "invite-codes": {
@@ -953,9 +1160,27 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const parsed = await readJson(req);
         if (!parsed.ok) return parsed.resp;
         const mode = parsed.body.mode;
-        if (mode !== "public" && mode !== "invite" && mode !== "password") {
-          return jsonError(400, "invalid request: mode must be public|invite|password");
+        const visibility = parsed.body.visibility;
+        if (
+          mode === undefined && visibility === undefined && parsed.body.invitePolicy === undefined &&
+          parsed.body.contactInfo === undefined && parsed.body.probationEnabled === undefined &&
+          parsed.body.inviteSkipsProbation === undefined
+        ) {
+          return jsonError(400, "invalid request: mode, visibility, invitePolicy, contactInfo, probationEnabled or inviteSkipsProbation required");
         }
+        if (visibility !== undefined && visibility !== "public" && visibility !== "private") {
+          return jsonError(400, "invalid request: visibility must be public|private");
+        }
+        if (mode !== undefined && mode !== "no_limit" && mode !== "invite" && mode !== "password") {
+          return jsonError(400, "invalid request: mode must be no_limit|invite|password");
+        }
+        // v3 (spec §2.2): the (visibility, admission) PAIR is validated against
+        // the effective post-change values — flipping visibility to private on
+        // a no_limit channel is rejected instead of silently coerced.
+        const nextMode = typeof mode === "string" ? mode : (auth.channel.admission_mode ?? "password");
+        const nextVisibility = typeof visibility === "string" ? visibility : (auth.channel.visibility ?? "public");
+        const shape = validateChannelShape(nextVisibility, nextMode);
+        if (!shape.ok) return jsonError(400, shape.error);
         const invitePolicy = parsed.body.invitePolicy;
         if (invitePolicy !== undefined && invitePolicy !== "everyone" && invitePolicy !== "managers-only") {
           return jsonError(400, "invalid request: invitePolicy must be everyone|managers-only");
@@ -964,17 +1189,44 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (contactInfo !== undefined && typeof contactInfo !== "string") {
           return jsonError(400, "invalid request: contactInfo must be a string");
         }
+        // v3 (spec §6): probation flags are persisted here (not create-only) —
+        // the CLI `channel set-admission --probation/--invite-skips` path.
+        const probationEnabled = parsed.body.probationEnabled;
+        if (probationEnabled !== undefined && typeof probationEnabled !== "boolean") {
+          return jsonError(400, "invalid request: probationEnabled must be a boolean");
+        }
+        const inviteSkipsProbation = parsed.body.inviteSkipsProbation;
+        if (inviteSkipsProbation !== undefined && typeof inviteSkipsProbation !== "boolean") {
+          return jsonError(400, "invalid request: inviteSkipsProbation must be a boolean");
+        }
+        if (probationEnabled !== undefined || inviteSkipsProbation !== undefined) {
+          db.prepare(
+            "UPDATE channels SET probation_enabled = COALESCE(?, probation_enabled), invite_skips_probation = COALESCE(?, invite_skips_probation) WHERE id = ?",
+          ).run(
+            probationEnabled === true ? 1 : probationEnabled === false ? 0 : null,
+            inviteSkipsProbation === true ? 1 : inviteSkipsProbation === false ? 0 : null,
+            channelId,
+          );
+        }
         stmtSetAdmission.run(
-          mode,
+          nextMode,
+          nextVisibility,
           typeof invitePolicy === "string" ? invitePolicy : auth.channel.invite_policy,
           typeof contactInfo === "string" ? contactInfo : auth.channel.contact_info,
           channelId,
         );
-        audit(channelId, name, "admission.changed", mode, `policy=${auth.channel.invite_policy}`);
+        // Spec §2.3: switching visibility to private DELETES the relay-held
+        // sealed key copy. (Blind-ness is only fully restored by an owner key
+        // rotation — the relay has seen the old key — but no copy may remain.)
+        if (nextVisibility === "private") {
+          db.prepare("UPDATE channels SET sealed_key = NULL WHERE id = ?").run(channelId);
+        }
+        audit(channelId, name, "admission.changed", nextMode, `visibility=${nextVisibility}${probationEnabled !== undefined ? ` probation=${probationEnabled}` : ""}${inviteSkipsProbation !== undefined ? ` inviteSkips=${inviteSkipsProbation}` : ""}`);
         return json({
           ok: true,
-          mode,
-          ...(mode === "password" && auth.channel.admission_credential_revoked === 1
+          mode: nextMode,
+          visibility: nextVisibility,
+          ...(nextMode === "password" && auth.channel.admission_credential_revoked === 1
             ? { warning: "admission credential was revoked by a kick — run `rotate --mode access` to mint a fresh credential before accepting new members" }
             : {}),
         });
@@ -1022,12 +1274,9 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         }
         // Mark left + revoke tokens.
         stmtLeave.run(channelId, name);
-        // An open kick vote targeting the leaver is VOID (F-15): no kick
-        // applies to a departed member.
-        const openVote = stmtOpenVote.get(channelId) as { id: string; target: string } | undefined;
-        if (openVote && openVote.target === name) {
-          settleVote(channelId, openVote.id, false);
-        }
+        // v3 (spec §7): an open kick vote targeting the leaver is NOT voided —
+        // the vote continues over the remaining eligible voters and a pass
+        // bans the departed member (blocking re-entry).
         // Succession.
         if (isCreator) {          const successor =
             transferTo !== null && transferTo !== name
@@ -1050,11 +1299,14 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           audit(channelId, name, "role.reverted", creator, "manager");
           wsHub?.notifyGovernance(channelId, { type: "role-changed", manager: creator });
         }
-        // Dissolution: no active members remain.
+        // Dissolution: no active members remain. The audit entry is written
+        // BEFORE the wipe — dissolve() deletes this channel's audit_log rows,
+        // so an entry written after would be silently lost (ordering matters
+        // for any external audit sink too).
         const activeLeft = stmtActiveCount.get(channelId) as { n: number };
         if ((activeLeft?.n ?? 0) === 0) {
-          dissolve(channelId);
           audit(channelId, name, "channel.dissolved", channelId, "last member left");
+          dissolve(channelId);
           // Dissolved: evict every live connection for the dead channel.
           wsHub?.invalidateChannel(channelId, 0);
         } else {
@@ -1258,6 +1510,75 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         });
       }
 
+      case "set-encryption": {
+        // Encrypted toggle (§11): manager/creator flips the channel-level
+        // boolean ONLY. v3 (spec §3.5): the endpoint no longer mints or bumps
+        // key material in any form — key_version starts at 0 and is bumped
+        // exclusively by the owner's rotate-key. Toggle-OFF leaves the counter
+        // and any sealed copy intact: old encrypted rows remain readable to
+        // key holders; new messages go out plaintext.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.manager_member && auth.member.name !== auth.channel.creator_member) {
+          return jsonError(403, "manager or creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const wanted = parsed.body.encrypted;
+        if (typeof wanted !== "boolean") {
+          return jsonError(400, "invalid request: encrypted must be a boolean");
+        }
+        const keyVersion = auth.channel.key_version ?? 0;
+        db.prepare("UPDATE channels SET encrypted = ? WHERE id = ?").run(wanted ? 1 : 0, channelId);
+        audit(channelId, auth.member.name, "encryption.changed", channelId, wanted ? `on keyVersion=${keyVersion}` : `off keyVersion=${keyVersion}`);
+        wsHub?.notifyGovernance(channelId, { type: "encryption-changed", encrypted: wanted, keyVersion });
+        return json({ ok: true, encrypted: wanted, keyVersion });
+      }
+
+      case "rotate-key": {
+        // v3 key governance (spec §3): CREATOR-ONLY. The owner's CLI mints
+        // the new key locally and submits only the version counter (plus an
+        // optional sealed copy on the PUBLIC tier — the relay must never hold
+        // key material for private channels). WS broadcast carries the
+        // version + contact, NEVER key material.
+        if (method !== "POST") return jsonError(405, "method not allowed");
+        const auth = authenticate(channelId, req);
+        if (auth === "banned") return jsonError(403, "banned");
+        if (!auth) return jsonError(401, "unauthorized");
+        if (auth.member.name !== auth.channel.creator_member) {
+          audit(channelId, auth.member.name, "rotate-key.denied", auth.member.name, "not creator");
+          return jsonError(403, "creator only");
+        }
+        const parsed = await readJson(req);
+        if (!parsed.ok) return parsed.resp;
+        const kv = parsed.body.keyVersion;
+        if (typeof kv !== "number" || !Number.isInteger(kv) || kv < 1) {
+          return jsonError(400, "invalid request: keyVersion must be an integer >= 1");
+        }
+        if (kv <= (auth.channel.key_version ?? 0)) {
+          return jsonError(409, "invalid request: keyVersion must be greater than the current version");
+        }
+        let sealedKey: string | null = null;
+        if (typeof parsed.body.sealedKey === "string" && (parsed.body.sealedKey as string).length > 0) {
+          if ((auth.channel.visibility ?? "public") !== "public") {
+            return jsonError(400, "invalid request: sealedKey is only accepted on public channels");
+          }
+          sealedKey = parsed.body.sealedKey as string;
+        }
+        const rotatedAt = new Date().toISOString();
+        db.prepare("UPDATE channels SET key_version = ?, sealed_key = ?, key_rotated_at = ? WHERE id = ?").run(kv, sealedKey, rotatedAt, channelId);
+        audit(channelId, auth.member.name, "rotate-key", auth.member.name, `keyVersion=${kv}`);
+        wsHub?.notifyGovernance(channelId, {
+          type: "key_rotated",
+          keyVersion: kv,
+          contact: auth.channel.contact_info ?? "",
+          rotatedAt,
+        });
+        return json({ ok: true, keyVersion: kv });
+      }
+
       case "dissolve": {
         if (method !== "POST") return jsonError(405, "method not allowed");
         const auth = authenticate(channelId, req);
@@ -1302,7 +1623,42 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           if (Buffer.from(ciphertext, "base64").length > MAX_CIPHERTEXT_BYTES) {
             return jsonError(413, "message too large: ciphertext must be at most 8192 bytes");
           }
-          const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey);
+          // Encrypted-toggle stamping (§11): the RELAY owns the row stamps —
+          // clients cannot lie a row into (or out of) the encrypted state.
+          // Re-read the live channel row: the auth snapshot may predate a
+          // concurrent set-encryption.
+          const liveChannel = stmtChannel.get(channelId) as ChannelRow | undefined;
+          const channelEncrypted = (liveChannel?.encrypted ?? 0) === 1;
+          let encrypted = 0;
+          let keyVersion = 0;
+          if (channelEncrypted && parsed.body.keyVersion !== undefined) {
+            const kv = parsed.body.keyVersion;
+            if (typeof kv !== "number" || !Number.isInteger(kv) || kv < 1) {
+              return jsonError(400, "invalid request: keyVersion must be an integer >= 1");
+            }
+            const current = liveChannel?.key_version ?? 0;
+            if (kv !== current) {
+              // v3 (spec §3.2): the sender holds a stale key. The error must be
+              // agent-actionable: the CURRENT version + the owner contact
+              // string, verbatim, so the member knows who to ask for a blob.
+              return new Response(
+                JSON.stringify({
+                  error: "message key rotated",
+                  currentVersion: current,
+                  contact: liveChannel?.contact_info ?? "",
+                  rotatedAt: liveChannel?.key_rotated_at ?? null,
+                }),
+                { status: 409, headers: { "content-type": "application/json" } },
+              );
+            }
+            encrypted = 1;
+            keyVersion = kv;
+          }
+          // A send WITHOUT keyVersion on an encrypted channel is a plaintext
+          // send — allowed (spec §3.2: unencrypted messages are unaffected;
+          // the E2E/plain mismatch is a client concern). The row is stamped
+          // with what the sender actually sent.
+          const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey, encrypted, keyVersion);
           if (!stored.deduped) {
             // Push-wake only (spec §5.7): notifications carry seq+epoch, never
             // content. Dedup re-sends nothing (the original insert already
@@ -1326,9 +1682,17 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
             seq: number;
             nonce: string;
             ciphertext: string;
+            encrypted: number;
+            key_version: number;
           }>;
           return json({
-            messages: rows,
+            messages: rows.map((r) => ({
+              seq: r.seq,
+              nonce: r.nonce,
+              ciphertext: r.ciphertext,
+              encrypted: r.encrypted,
+              ...(r.encrypted === 1 ? { keyVersion: r.key_version } : {}),
+            })),
             nextSeq: auth.channel.next_seq,
             minSeq: auth.channel.min_seq ?? 1,
           });
@@ -1363,7 +1727,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const auth = authenticate(channelId, req);
         if (auth === "banned") return jsonError(403, "banned");
         if (!auth) return jsonError(401, "unauthorized");
-        const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string; last_active_at: string | null }>;
+        const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string; last_active_at: string | null; permission_role: string; activity_role: string | null; activity_expires_at: number | null }>;
         return json({
           channelId: auth.channel.id,
           epoch: auth.channel.epoch,
@@ -1372,9 +1736,21 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           creatorMember: auth.channel.creator_member,
           managerMember: auth.channel.manager_member,
           admissionMode: auth.channel.admission_mode ?? "password",
+          visibility: auth.channel.visibility ?? "public",
+          probationEnabled: (auth.channel.probation_enabled ?? 0) === 1,
+          inviteSkipsProbation: (auth.channel.invite_skips_probation ?? 1) === 1,
           invitePolicy: auth.channel.invite_policy ?? "everyone",
           contactInfo: auth.channel.contact_info,
-          members: members.map((m) => ({ memberName: m.name, joinedAt: m.joined_at, lastActiveAt: m.last_active_at })),
+          encrypted: (auth.channel.encrypted ?? 0) === 1,
+          keyVersion: auth.channel.key_version ?? 0,
+          members: members.map((m) => ({
+            memberName: m.name,
+            joinedAt: m.joined_at,
+            lastActiveAt: m.last_active_at,
+            permissionRole: m.permission_role,
+            activityRole: m.activity_role ?? undefined,
+            ...(m.activity_expires_at !== null ? { activityExpiresAt: m.activity_expires_at } : {}),
+          })),
         });
       }
 

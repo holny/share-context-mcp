@@ -4,7 +4,7 @@
  * window; this module merges the cards that accumulated in the plugin's
  * pending slot (several windows can pass between two tool calls) and renders
  * the summary card text in the M1 style: concise one-liner + per-line
- * bullets + "用 fetch_updates 展开详情" hint.
+ * bullets + "用 fetch_messages 展开详情" hint.
  *
  * No mutation, no I/O — fully unit-testable.
  */
@@ -35,7 +35,7 @@ export const CARD_SEPARATOR = "\n\n---\n";
 export const MAX_BULLET_LINES = 8;
 
 /** Expand hint — the M1 tool name the agent should call to see full text. */
-export const EXPAND_HINT = "用 fetch_updates 展开详情";
+export const EXPAND_HINT = "用 fetch_messages 展开详情";
 
 /**
  * Merge cards accumulated in the pending slot: lines in seq order with

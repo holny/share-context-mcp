@@ -8,6 +8,7 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHash,
   createHmac,
   hkdfSync,
   randomBytes,
@@ -254,6 +255,142 @@ export function parseInviteCode(code: string): { codeId: string; channelKey: Uin
   const expiresAt = typeof payload.exp === "number" ? payload.exp : null;
   return { codeId, channelKey, expiresAt };
 }
+
+// ---- scmc2 blob envelope (spec §4.1, v3) ----
+//
+// A unified, tamper-evident, optionally time-limited blob envelope:
+//   scmc2-<base32(JSON { v, type, exp?, max?, payload, sum })>
+// `sum` is SHA-256 over the canonical body JSON — changing ANY character of
+// the base32 body either breaks the decode/parse or the checksum. GCM
+// sealing is reserved for relay-executable blobs (protocol-reserved); v1
+// client-executable blobs rely on the checksum wall plus relay registry
+// backing (invite codes, sealed keys).
+
+export type BLOB_TYPES = "join_password" | "join_invite" | "join_key" | "key_update";
+
+export const BLOB_TYPES: readonly BLOB_TYPES[] = ["join_password", "join_invite", "join_key", "key_update"];
+
+const BLOB_PREFIX = "scmc2-";
+const BLOB_VERSION = 1;
+/** Hard size bound on the envelope string — parse AND encode both enforce it. */
+export const BLOB_MAX_CHARS = 8192;
+
+/** Encoded blob shape: the body string plus its checksum. */
+interface BlobEnvelopeInner {
+  v: number;
+  type: string;
+  exp?: number;
+  max?: number;
+  payload: Record<string, unknown>;
+  sum: string;
+}
+
+/** True when the envelope's expiry has passed. No expiresAt → never expires. */
+export function isBlobExpired(env: { expiresAt?: number }, now: number = Date.now()): boolean {
+  return typeof env.expiresAt === "number" && env.expiresAt <= now;
+}
+
+/** Blob type names (open-ended registry — v1 ships the four share types). */
+export type BlobTypes = BLOB_TYPES;
+
+/** Encode a blob envelope. Throws `invalid blob:` errors on bad input or size overflow. */
+export function encodeBlobEnvelope(params: {
+  type: string;
+  payload: Record<string, unknown>;
+  expiresAt?: number;
+  maxUses?: number;
+}): string {
+  if (typeof params.type !== "string" || params.type.length === 0 || params.type.length > 32) {
+    throw new Error("invalid blob: type must be a string of 1..32 characters");
+  }
+  if (typeof params.payload !== "object" || params.payload === null || Array.isArray(params.payload)) {
+    throw new Error("invalid blob: payload must be a JSON object");
+  }
+  if (params.expiresAt !== undefined && (!Number.isFinite(params.expiresAt) || !Number.isInteger(params.expiresAt))) {
+    throw new Error("invalid blob: expiresAt must be an integer epoch ms value");
+  }
+  if (params.maxUses !== undefined && (!Number.isFinite(params.maxUses) || !Number.isInteger(params.maxUses) || params.maxUses < 1)) {
+    throw new Error("invalid blob: maxUses must be an integer >= 1");
+  }
+  const inner: BlobEnvelopeInner = {
+    v: BLOB_VERSION,
+    type: params.type,
+    ...(params.expiresAt !== undefined ? { exp: params.expiresAt } : {}),
+    ...(params.maxUses !== undefined ? { max: params.maxUses } : {}),
+    payload: params.payload,
+    sum: "",
+  };
+  // Checksum covers EVERY meaningful field (type/exp/max/payload + version):
+  // a mutated type or expiry must fail the parse just like a mutated payload.
+  const body = JSON.stringify({ ...inner, sum: undefined });
+  inner.sum = createHash("sha256").update(body, "utf8").digest("hex");
+  const blob = BLOB_PREFIX + b32(Buffer.from(JSON.stringify(inner), "utf8"));
+  if (blob.length > BLOB_MAX_CHARS) {
+    throw new Error(`invalid blob: encoded size ${blob.length} exceeds the ${BLOB_MAX_CHARS}-character limit`);
+  }
+  return blob;
+}
+
+/** Parse + verify a blob envelope. Throws `invalid blob:` errors on any failure. */
+export function parseBlobEnvelope(blob: string): {
+  type: string;
+  payload: Record<string, unknown>;
+  expiresAt?: number;
+  maxUses?: number;
+} {
+  if (typeof blob !== "string" || blob.length === 0) {
+    throw new Error("invalid blob: expected a non-empty string");
+  }
+  const trimmed = blob.trim();
+  if (trimmed.length > BLOB_MAX_CHARS) {
+    throw new Error(`invalid blob: exceeds the ${BLOB_MAX_CHARS}-character limit`);
+  }
+  if (!trimmed.startsWith(BLOB_PREFIX)) {
+    throw new Error("invalid blob: missing scmc2- prefix");
+  }
+  let inner: BlobEnvelopeInner;
+  try {
+    inner = JSON.parse(Buffer.from(b32decode(trimmed.slice(BLOB_PREFIX.length))).toString("utf8")) as BlobEnvelopeInner;
+  } catch {
+    throw new Error("invalid blob: body is not a decodable envelope");
+  }
+  if (typeof inner !== "object" || inner === null) throw new Error("invalid blob: body is not a JSON object");
+  if (inner.v !== BLOB_VERSION) throw new Error(`invalid blob: unsupported version ${String(inner.v)}`);
+  if (typeof inner.type !== "string" || inner.type.length === 0) throw new Error("invalid blob: type missing");
+  if (typeof inner.payload !== "object" || inner.payload === null || Array.isArray(inner.payload)) {
+    throw new Error("invalid blob: payload must be a JSON object");
+  }
+  if (typeof inner.sum !== "string" || inner.sum.length !== 64) throw new Error("invalid blob: checksum missing");
+  if (
+    (inner.exp !== undefined && (!Number.isInteger(inner.exp) || !Number.isFinite(inner.exp))) ||
+    (inner.max !== undefined && (!Number.isInteger(inner.max) || !Number.isFinite(inner.max) || inner.max < 1))
+  ) {
+    throw new Error("invalid blob: malformed expiry or maxUses");
+  }
+  const body = JSON.stringify({
+    v: inner.v,
+    type: inner.type,
+    ...(inner.exp !== undefined ? { exp: inner.exp } : {}),
+    ...(inner.max !== undefined ? { max: inner.max } : {}),
+    payload: inner.payload,
+    sum: undefined,
+  });
+  const expected = createHash("sha256").update(body, "utf8").digest("hex");
+  if (expected !== inner.sum) throw new Error("invalid blob: checksum mismatch");
+  return {
+    type: inner.type,
+    payload: inner.payload,
+    ...(inner.exp !== undefined ? { expiresAt: inner.exp } : {}),
+    ...(inner.max !== undefined ? { maxUses: inner.max } : {}),
+  };
+}
+
+// ---- join blob (spec §14: copy-paste onboarding) ----
+//
+// A join blob carries everything an agent needs to join in one pasteable
+// string: base64(JSON) — compact, no line breaks, safe to wrap in quotes.
+// The credential/inviteCode travel INSIDE the blob exactly as the human
+// received them; the blob adds no secrecy of its own.
 
 export { idempotencyKey } from "./schema";
 export type { ClaimKind, ClaimMessage, ClaimProvenance, ClaimSource } from "./schema";

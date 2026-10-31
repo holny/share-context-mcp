@@ -232,7 +232,7 @@ describe("plugin smoke (in-process, promise-plugin contract)", () => {
     expect(first).toContain(CARD_SEPARATOR);
     expect(first).toContain("📋 协作通道：1 条新消息");
     expect(first).toContain("alice: use JWT rotation");
-    expect(first).toContain("用 fetch_updates 展开详情");
+    expect(first).toContain("用 fetch_messages 展开详情");
 
     // pending was cleared — the next tool result is untouched
     const second = { content: "plain", metadata: {} };
@@ -256,7 +256,7 @@ describe("plugin smoke (in-process, promise-plugin contract)", () => {
     // next turn starts (session.execution.started) → reminder judged + injected
     f.pushEvent({ type: "session.execution.started", data: { sessionID: SESSION } });
     await until(() => f.syntheticCalls.length === 1);
-    expect(f.syntheticCalls[0].text).toContain("share_update");
+    expect(f.syntheticCalls[0].text).toContain("send_message");
     expect(f.syntheticCalls[0].resume).toBe(false);
 
     // counters reset: a second turn start with no actions → no reminder
@@ -284,9 +284,9 @@ describe("plugin smoke (in-process, promise-plugin contract)", () => {
     f.pushEvent({ type: "session.execution.started", data: { sessionID: SESSION } });
     await settle();
 
-    // turn that shared via share_update
-    await before.callback(event("share_update", "c2"));
-    await after.callback({ ...event("share_update", "c2"), status: "completed", result: { content: "ok" } });
+    // turn that shared via send_message
+    await before.callback(event("send_message", "c2"));
+    await after.callback({ ...event("send_message", "c2"), status: "completed", result: { content: "ok" } });
     await before.callback(event("edit", "c3"));
     await after.callback({ ...event("edit", "c3"), status: "completed", result: { content: "ok" } });
     f.pushEvent({ type: "session.execution.started", data: { sessionID: SESSION } });
@@ -318,7 +318,7 @@ describe("plugin smoke (in-process, promise-plugin contract)", () => {
     // the real judge point still sees the turn's actions
     f.pushEvent({ type: "session.execution.started", data: { sessionID: SESSION } });
     await until(() => f.syntheticCalls.length === 1);
-    expect(f.syntheticCalls[0].text).toContain("share_update");
+    expect(f.syntheticCalls[0].text).toContain("send_message");
 
     if (cleanup) await cleanup();
   });
@@ -340,7 +340,7 @@ describe("plugin smoke (in-process, promise-plugin contract)", () => {
     await after.callback({ tool: "write", sessionID: SESSION, agent: "ag", messageID: "m", id: "c1", input: {}, status: "completed", result: { content: "ok" } });
     f.pushEvent({ type: "session.execution.started", data: { sessionID: SESSION } });
     await until(() => f.syntheticCalls.length === 1);
-    expect(f.syntheticCalls[0].text).toContain("share_update");
+    expect(f.syntheticCalls[0].text).toContain("send_message");
     if (cleanup) await cleanup();
   });
 });
