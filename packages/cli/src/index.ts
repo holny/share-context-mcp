@@ -218,6 +218,8 @@ Commands:
                                full: + message key (all members need the new credential)
   rotate-key --id <id>         OWNER ONLY — mint message key vN+1 locally, bump the
                                relay version, broadcast a contact notice (no key travels)
+  share-key --id <id>          OWNER ONLY — print a key_update blob carrying the current
+                               message key for members who already joined (post-rotation)
   invite --id <id> [--ttl hours]   Mint an invite code (invite tier, per invite rights)
   token refresh --id <id>      Rotate this member's channel token
   vote start --channel <id> --type kick --target <name> [--reason R] [--revoke-invitees]
@@ -344,10 +346,6 @@ async function cmdChannelSetAdmission() {
   if (visibility === "private" && mode === "no_limit") {
     console.error("Error: private channels cannot use no_limit admission"); process.exit(1);
   }
-  if (mode === "no_limit" && visibility !== "private") {
-    const anyEncrypted = false; // relay warns if the channel is encrypted
-    void anyEncrypted;
-  }
   const body: Record<string, unknown> = { mode };
   if (visibility) body.visibility = visibility;
   const probation = arg("probation");
@@ -361,6 +359,34 @@ async function cmdChannelSetAdmission() {
   const out = await relayPostJson(id, "/set-admission", body);
   console.log(`✅ admission mode = ${out.mode}${visibility ? `, visibility = ${visibility}` : ""} (future admissions only — existing members unaffected)`);
   if (typeof out.warning === "string") console.log(`⚠️  ${out.warning}`);
+}
+
+/** Owner-only: print a key_update share blob carrying the CURRENT key (post-rotation distribution, spec §4.2). */
+async function cmdShareKey() {
+  const id = requireId();
+  const { Store } = await import("@share-context-mcp/server");
+  const { RelayBridge } = await import("@share-context-mcp/server");
+  const { encodeBlobEnvelope } = await import("@share-context-mcp/protocol");
+  const store = new Store(dbPath());
+  const bridge = new RelayBridge({ baseUrl: relayUrl(), store });
+  const meta = await bridge.meta(id);
+  const keyVersion = meta.keyVersion ?? 0;
+  const key = store.messageKey(id, keyVersion);
+  if (!key) {
+    console.error(`Error: message key v${keyVersion} not available locally — run rotate-key here first`);
+    process.exit(1);
+  }
+  const blob = encodeBlobEnvelope({
+    type: "key_update",
+    payload: {
+      relayUrl: relayUrl(),
+      channelId: id,
+      messageKey: Buffer.from(key).toString("base64"),
+      keyVersion,
+    },
+  });
+  console.log(`✅ key_update blob for ${id} (key v${keyVersion}).`);
+  console.log(`\nMembers who already joined paste this to their agent — join_channel({ blob }) tops up the key;\nCLI members use: share-context join --blob "<blob>":\n${blob}\n`);
 }
 
 /** Owner-only message-key rotation (spec §3): local mint → relay version bump → broadcast. */
@@ -491,6 +517,7 @@ const commands: Record<string, () => Promise<void>> = {
   },
   rotate: cmdRotate,
   "rotate-key": cmdRotateKey,
+  "share-key": cmdShareKey,
   invite: cmdInvite,
   token: async () => {
     if (process.argv[3] !== "refresh") { console.error("Unknown: token — use `token refresh <id>`"); process.exit(1); }

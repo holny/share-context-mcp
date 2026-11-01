@@ -452,7 +452,7 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
 
   /**
-   * Shared tail of every join (channel join + join_from_blob): pull the full
+   * Shared tail of every join (plain + blob paths): pull the full
    * retained history into the local cache, then build the structural index
    * card the joining agent reads to orient itself.
    */

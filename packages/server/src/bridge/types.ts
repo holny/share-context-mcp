@@ -154,7 +154,7 @@ export interface ChannelBridge {
   readonly governance: boolean;
   /**
    * Base URL of the backing relay (relay-backed bridges only; undefined for
-   * git/S3). join_from_blob compares it against a blob's relayUrl so a
+   * git/S3). the blob join path compares it against a blob's relayUrl so a
    * copy-paste invite for a DIFFERENT relay fails with a readable error
    * instead of silently joining the wrong server.
    */
