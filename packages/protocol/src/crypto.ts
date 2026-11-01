@@ -349,10 +349,18 @@ export function parseBlobEnvelope(blob: string): {
     throw new Error("invalid blob: missing scmc2- prefix");
   }
   let inner: BlobEnvelopeInner;
+  const body32 = trimmed.slice(BLOB_PREFIX.length);
   try {
-    inner = JSON.parse(Buffer.from(b32decode(trimmed.slice(BLOB_PREFIX.length))).toString("utf8")) as BlobEnvelopeInner;
+    inner = JSON.parse(Buffer.from(b32decode(body32)).toString("utf8")) as BlobEnvelopeInner;
   } catch {
     throw new Error("invalid blob: body is not a decodable envelope");
+  }
+  // Canonical-form check (completes the "any character" tamper wall): the
+  // lenient decoder ignores case and dashes, so a case-flip or inserted dash
+  // would otherwise decode byte-identically. Re-encoding the decoded bytes
+  // must reproduce the body EXACTLY — anything else is tampering.
+  if (b32(Buffer.from(b32decode(body32))) !== body32) {
+    throw new Error("invalid blob: body is not canonical base32 (possible tampering)");
   }
   if (typeof inner !== "object" || inner === null) throw new Error("invalid blob: body is not a JSON object");
   if (inner.v !== BLOB_VERSION) throw new Error(`invalid blob: unsupported version ${String(inner.v)}`);

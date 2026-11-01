@@ -153,10 +153,11 @@ describe("scmc2 blob envelope", () => {
 
   test("round trip preserves type, payload, expiresAt, maxUses for all four types", () => {
     for (const [i, type] of ALL_TYPES.entries()) {
+      const exp = Date.now() + 7 * 86_400_000 + i;
       const blob = encodeBlobEnvelope({
         type,
         payload: { channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 },
-        expiresAt: Date.now() + 7 * 86_400_000 + i,
+        expiresAt: exp,
         maxUses: i + 1,
       });
       expect(blob.startsWith("scmc2-")).toBe(true);
@@ -164,7 +165,7 @@ describe("scmc2 blob envelope", () => {
       const parsed = parseBlobEnvelope(blob);
       expect(parsed.type).toBe(type);
       expect(parsed.payload).toEqual({ channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 });
-      expect(parsed.expiresAt).toBe(Date.now() + 7 * 86_400_000 + i);
+      expect(parsed.expiresAt).toBe(exp);
       expect(parsed.maxUses).toBe(i + 1);
     }
   });
@@ -201,6 +202,27 @@ describe("scmc2 blob envelope", () => {
     expect(isBlobExpired({ expiresAt: now - 1 }, now)).toBe(true);
     expect(isBlobExpired({ expiresAt: now + 60_000 }, now)).toBe(false);
     expect(isBlobExpired({}, now)).toBe(false);
+  });
+
+  test("non-canonical body (case flip / inserted dash) fails the parse — full any-character tamper wall", () => {
+    const blob = encodeBlobEnvelope({
+      type: "join_password",
+      payload: { channelId: "ch-canonical", password: "scmc1-aaaa-bbbb" },
+    });
+    const body = blob.slice("scmc2-".length);
+    // case flip: decoder is case-insensitive → only the canonical check catches it
+    const upper = body[3].toUpperCase();
+    if (upper !== body[3]) {
+      expect(() => parseBlobEnvelope(`scmc2-${body.slice(0, 3)}${upper}${body.slice(4)}`)).toThrow(
+        /invalid blob: body is not canonical base32/,
+      );
+    }
+    // inserted dash: decoder strips dashes → only the canonical check catches it
+    expect(() => parseBlobEnvelope(`scmc2-${body.slice(0, 5)}-${body.slice(5)}`)).toThrow(
+      /invalid blob: body is not canonical base32/,
+    );
+    // the pristine blob still parses
+    expect(parseBlobEnvelope(blob).type).toBe("join_password");
   });
 
   test("parse rejects an expired envelope (expiry enforced at the protocol chokepoint)", () => {
