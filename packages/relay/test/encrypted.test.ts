@@ -99,7 +99,7 @@ describe("encrypted toggle — relay side", () => {
     expect((await meta(channelId, creatorToken)).keyVersion).toBe(0);
 
     // the version comes only from the owner's rotate-key
-    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, creatorToken)).status).toBe(200);
+    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, creatorToken)).status).toBe(200);
     expect((await meta(channelId, creatorToken)).keyVersion).toBe(1);
 
     const off = await postJson(`/channels/${channelId}/set-encryption`, { encrypted: false }, creatorToken);
@@ -124,7 +124,7 @@ describe("encrypted toggle — relay side", () => {
 
     await postJson(`/channels/${channelId}/set-encryption`, { encrypted: true }, creatorToken);
     // owner mints v1 (the ONLY key-material generation point besides creation)
-    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, creatorToken)).status).toBe(200);
+    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, creatorToken)).status).toBe(200);
     // encrypted phase: keyVersion required for a sealed row
     const missing = await postMessage(channelId, creatorToken, "idem-enc-missing");
     expect(missing.status).toBe(200); // plaintext send is allowed; stamped encrypted=0
@@ -205,7 +205,7 @@ describe("key governance (v3) — owner-only rotate-key, relay-enforced key_vers
     expect(rows[0].encrypted).toBe(0);
 
     // owner rotates to v2 → the v1 send is now stale → 409 with actionable body
-    const rot2 = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 2 }, creatorToken);
+    const rot2 = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 2, sealedKey: "c2VhbGVkLXYy" }, creatorToken);
     expect(rot2.status).toBe(200);
     const stale = await postMessage(channelId, memberToken, "idem-kg-stale", { keyVersion: 1 });
     expect(stale.status).toBe(409);
@@ -218,11 +218,11 @@ describe("key governance (v3) — owner-only rotate-key, relay-enforced key_vers
     const ok2 = await postMessage(channelId, memberToken, "idem-kg-002", { keyVersion: 2 });
     expect(ok2.status).toBe(200);
 
-    // sealed_key tracks the LATEST rotation: the v1 deposit was dropped when
-    // the owner rotated to v2 without depositing a new copy (spec §3.1: one
-    // active key version — a stale sealed copy must not survive).
+    // sealed_key tracks the LATEST rotation: a public rotation MUST deposit a
+    // fresh sealed copy (spec §3.1 — one active key version; the relay's copy
+    // is what lets new joiners decrypt), so it is replaced, never dropped.
     const chRow = relay.db.prepare("SELECT sealed_key, key_rotated_at FROM channels WHERE id = ?").get(channelId) as { sealed_key: string | null; key_rotated_at: string | null };
-    expect(chRow.sealed_key).toBeNull();
+    expect(chRow.sealed_key).toBe("c2VhbGVkLXYy");
     expect(chRow.key_rotated_at).not.toBeNull();
   });
 
@@ -237,13 +237,13 @@ describe("key governance (v3) — owner-only rotate-key, relay-enforced key_vers
     const xfer = await postJson(`/channels/${channelId}/transfer`, { to: "mgr" }, ownerToken);
     expect(xfer.status).toBe(200);
     // manager who is NOT the creator → 403
-    const byMgr = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, mgrToken);
+    const byMgr = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, mgrToken);
     expect(byMgr.status).toBe(403);
     // regular member → 403
-    const byMember = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, memberToken);
+    const byMember = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, memberToken);
     expect(byMember.status).toBe(403);
     // creator → ok, audited
-    const byOwner = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, ownerToken);
+    const byOwner = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, ownerToken);
     expect(byOwner.status).toBe(200);
     const auditRows = relay.db.prepare("SELECT action FROM audit_log WHERE channel_id = ?").all(channelId) as Array<{ action: string }>;
     expect(auditRows.some((r) => r.action === "rotate-key")).toBe(true);
@@ -258,7 +258,7 @@ describe("key governance (v3) — owner-only rotate-key, relay-enforced key_vers
       ws.addEventListener("error", () => resolve());
     });
     ws.addEventListener("message", (ev) => frames.push(JSON.parse(String((ev as MessageEvent).data))));
-    const rot = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, creatorToken);
+    const rot = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, creatorToken);
     expect(rot.status).toBe(200);
     await Bun.sleep(300);
     ws.close();
@@ -271,14 +271,70 @@ describe("key governance (v3) — owner-only rotate-key, relay-enforced key_vers
     expect(JSON.stringify(gov)).not.toMatch(/sealed|key_material|keyData/i);
   });
 
+  test("trial-tier members are rate-limited to 10 messages/hour; regular members unaffected (M-4)", async () => {
+    // channel with probation: the joining member lands in the trial tier
+    const channelId = randomBytes(8).toString("hex");
+    const created = await postJson("/channels", {
+      channelId, memberName: "owner", probationEnabled: true,
+      verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId),
+    });
+    expect(created.status).toBe(200);
+    const ownerToken = await join(channelId, "owner");
+    const trialToken = await join(channelId, "probie");
+    const role = (relay.db.prepare("SELECT permission_role FROM members WHERE channel_id = ? AND name = 'probie'").get(channelId) as { permission_role: string }).permission_role;
+    expect(role).toBe("trial");
+
+    // 10 sends pass, the 11th within the hour → 429 with an actionable error
+    for (let i = 0; i < 10; i++) {
+      const ok = await postMessage(channelId, trialToken, `idem-trial-${String(i).padStart(3, "0")}`);
+      expect(ok.status).toBe(200);
+    }
+    const over = await postMessage(channelId, trialToken, "idem-trial-over");
+    expect(over.status).toBe(429);
+    expect((over.body as { error: string }).error).toContain("trial rate limit");
+
+    // the owner (regular tier) is unaffected
+    const ownerSend = await postMessage(channelId, ownerToken, "idem-owner-ok");
+    expect(ownerSend.status).toBe(200);
+  });
+
+  test("public rotation without sealedKey → 400; strict +1 lineage enforced (M-6)", async () => {
+    const { channelId, creatorToken } = await createChannel(); // public channel
+    // public + no sealedKey → 400 (the relay's distribution copy must never be stripped)
+    const noSeal = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, creatorToken);
+    expect(noSeal.status).toBe(400);
+    expect((noSeal.body as { error: string }).error).toContain("sealedKey is required");
+    // version jump 0 → 2 → 400 (strict +1)
+    const jump = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 2, sealedKey: "c2VhbGVk" }, creatorToken);
+    expect(jump.status).toBe(400);
+    expect((jump.body as { error: string }).error).toContain("must be exactly 1");
+  });
+
+  test("key-mismatch contact falls back to the creator member name when contact_info is unset (M-7)", async () => {
+    // encrypted channel with NO contact_info; creator is "owner"
+    const { channelId, creatorToken, memberToken } = await createEncryptedChannel();
+    // owner rotates to v1; the member (holding no key) claims v1 anyway → 409
+    const rot = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVk" }, creatorToken);
+    expect(rot.status).toBe(200);
+    const stale = await postMessage(channelId, memberToken, "idem-contact-fb", { keyVersion: 1 });
+    // the member actually holds v1 — force staleness with a v2 rotation instead
+    if (stale.status !== 409) {
+      const rot2 = await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 2, sealedKey: "c2VhbGVkLXYy" }, creatorToken);
+      expect(rot2.status).toBe(200);
+    }
+    const staleAfter = await postMessage(channelId, memberToken, "idem-contact-fb2", { keyVersion: 1 });
+    expect(staleAfter.status).toBe(409);
+    expect(staleAfter.body.contact).toBe("owner"); // creator name — contact_info was never set
+  });
+
   test("rotate-key rejects non-increasing versions and sealed keys on private channels", async () => {    const channelId = randomBytes(8).toString("hex");
     const created = await postJson("/channels", { channelId, memberName: "owner", verifyKeyB64: verifyKeyB64Of(PASSWORD, channelId) });
     expect(created.status).toBe(200);
     const ownerToken = await join(channelId, "owner");
     expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 0 }, ownerToken)).status).toBe(400);
-    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, ownerToken)).status).toBe(200);
-    // same or lower version after rotation → 409
-    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, ownerToken)).status).toBe(409);
+    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1, sealedKey: "c2VhbGVkLWtleQ==" }, ownerToken)).status).toBe(200);
+    // same-or-lower version after rotation → 400 (strict +1 lineage)
+    expect((await postJson(`/channels/${channelId}/rotate-key`, { keyVersion: 1 }, ownerToken)).status).toBe(400);
     // sealed key on a PRIVATE channel → 400 (relay must not hold keys there)
     expect(
       (await postJson(`/channels/${channelId}/set-admission`, { visibility: "private" }, ownerToken)).status,

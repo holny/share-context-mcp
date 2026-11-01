@@ -211,7 +211,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
 
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, visibility, probation_enabled, invite_skips_probation, sealed_key, key_rotated_at, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
-  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id FROM members WHERE channel_id = ? AND token_hash = ?");
+  const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id, permission_role FROM members WHERE channel_id = ? AND token_hash = ?");
   const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at, permission_role, activity_role, activity_expires_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
@@ -301,8 +301,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   );
   const stmtOpenVote = db.prepare("SELECT id, type, initiator, target, started_at, ends_at FROM votes WHERE channel_id = ? AND status = 'open'");
   const stmtVoteById = db.prepare("SELECT * FROM votes WHERE channel_id = ? AND id = ?");
-  const stmtOpenVotes = db.prepare("SELECT id, type, target, ends_at FROM votes WHERE channel_id = ? AND status = 'open'");
-  const stmtVoteHistory = db.prepare("SELECT id, type, initiator, target, status, started_at, ends_at FROM votes WHERE channel_id = ? ORDER BY started_at DESC");
+  const stmtOpenVotes = db.prepare("SELECT id, type, target, ends_at, params_json FROM votes WHERE channel_id = ? AND status = 'open'");
+  const stmtVoteHistory = db.prepare("SELECT id, type, initiator, target, status, started_at, ends_at, params_json FROM votes WHERE channel_id = ? ORDER BY started_at DESC");
   const stmtBallots = db.prepare("SELECT voter_name, choice FROM ballots WHERE channel_id = ? AND vote_id = ?");
   const stmtInsertBallot = db.prepare(
     "INSERT INTO ballots(channel_id, vote_id, voter_name, choice) VALUES (?, ?, ?, ?)",
@@ -1358,6 +1358,11 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           const params: Record<string, unknown> = {};
           if (parsed.body.banIp === true) params.banIp = true;
           if (parsed.body.revokeInvitees === true) params.revokeInvitees = true;
+          // v3 (M-3): the initiator's reason travels with the vote — surfaced
+          // in vote listings/meta so members can judge before casting.
+          if (typeof parsed.body.reason === "string" && parsed.body.reason.trim().length > 0) {
+            params.reason = parsed.body.reason.trim().slice(0, 500);
+          }
           const now = Date.now();
           stmtInsertVote.run(
             channelId,
@@ -1382,17 +1387,25 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           const auth = authenticate(channelId, req);
           if (auth === "banned") return jsonError(403, "banned");
           if (!auth) return jsonError(401, "unauthorized");
-          const open = stmtOpenVotes.all(channelId) as Array<{ id: string; type: string; target: string; ends_at: number }>;
+          const reasonOf = (paramsJson: string | null): string | undefined => {
+            try {
+              const r = (JSON.parse(paramsJson ?? "{}") as { reason?: string }).reason;
+              return typeof r === "string" ? r : undefined;
+            } catch {
+              return undefined;
+            }
+          };
+          const open = stmtOpenVotes.all(channelId) as Array<{ id: string; type: string; target: string; ends_at: number; params_json: string | null }>;
           const history = stmtVoteHistory.all(channelId) as Array<{
-            id: string; type: string; initiator: string; target: string; status: string; started_at: string; ends_at: number;
+            id: string; type: string; initiator: string; target: string; status: string; started_at: string; ends_at: number; params_json: string | null;
           }>;
           const withTallies = history.map((v) => {
             const ballots = stmtBallots.all(channelId, v.id) as Array<{ choice: string }>;
             return { ...v, yes: ballots.filter((b) => b.choice === "yes").length, no: ballots.filter((b) => b.choice === "no").length };
           });
           return json({
-            open: open.map((v) => ({ id: v.id, type: v.type, target: v.target, endsAt: v.ends_at })),
-            history: withTallies,
+            open: open.map((v) => ({ id: v.id, type: v.type, target: v.target, endsAt: v.ends_at, ...(reasonOf(v.params_json) ? { reason: reasonOf(v.params_json) } : {}) })),
+            history: withTallies.map((v) => ({ ...v, ...(reasonOf(v.params_json) ? { reason: reasonOf(v.params_json) } : {}) })),
           });
         }
         return jsonError(405, "method not allowed");
@@ -1557,13 +1570,22 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         if (typeof kv !== "number" || !Number.isInteger(kv) || kv < 1) {
           return jsonError(400, "invalid request: keyVersion must be an integer >= 1");
         }
-        if (kv <= (auth.channel.key_version ?? 0)) {
-          return jsonError(409, "invalid request: keyVersion must be greater than the current version");
+        const currentVersion = auth.channel.key_version ?? 0;
+        if (kv !== currentVersion + 1) {
+          // Strict +1 increments keep a single canonical version lineage — a
+          // jump means some owner machine is out of sync with the relay.
+          return jsonError(400, `invalid request: keyVersion must be exactly ${currentVersion + 1} (current ${currentVersion})`);
         }
         let sealedKey: string | null = null;
-        if (typeof parsed.body.sealedKey === "string" && (parsed.body.sealedKey as string).length > 0) {
-          if ((auth.channel.visibility ?? "public") !== "public") {
-            return jsonError(400, "invalid request: sealedKey is only accepted on public channels");
+        const sealedProvided = typeof parsed.body.sealedKey === "string" && (parsed.body.sealedKey as string).length > 0;
+        if (sealedProvided && (auth.channel.visibility ?? "public") !== "public") {
+          return jsonError(400, "invalid request: sealedKey is only accepted on public channels");
+        }
+        if ((auth.channel.visibility ?? "public") === "public") {
+          // A public rotation WITHOUT a sealed copy would silently strip the
+          // relay's distribution key — new joiners could no longer decrypt.
+          if (!sealedProvided) {
+            return jsonError(400, "invalid request: sealedKey is required when rotating a public channel");
           }
           sealedKey = parsed.body.sealedKey as string;
         }
@@ -1573,7 +1595,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         wsHub?.notifyGovernance(channelId, {
           type: "key_rotated",
           keyVersion: kv,
-          contact: auth.channel.contact_info ?? "",
+          contact: auth.channel.contact_info || auth.channel.creator_member || "",
           rotatedAt,
         });
         return json({ ok: true, keyVersion: kv });
@@ -1645,7 +1667,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
                 JSON.stringify({
                   error: "message key rotated",
                   currentVersion: current,
-                  contact: liveChannel?.contact_info ?? "",
+                  contact: liveChannel?.contact_info || liveChannel?.creator_member || "",
                   rotatedAt: liveChannel?.key_rotated_at ?? null,
                 }),
                 { status: 409, headers: { "content-type": "application/json" } },
@@ -1658,6 +1680,16 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
           // send — allowed (spec §3.2: unencrypted messages are unaffected;
           // the E2E/plain mismatch is a client concern). The row is stamped
           // with what the sender actually sent.
+          // v3 (M-4): trial-tier members send at a reduced rate — 10 messages
+          // per rolling hour, enforced here (the quota is real, not a label).
+          if ((auth.member.permission_role ?? "regular") === "trial") {
+            const recent = (db.prepare(
+              "SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND sender = ? AND created_at > ?",
+            ).get(channelId, auth.member.name, new Date(Date.now() - 3_600_000).toISOString()) as { n: number }).n;
+            if (recent >= 10) {
+              return jsonError(429, "trial rate limit: 10 messages per hour — ask the owner to end probation early or wait");
+            }
+          }
           const stored = storeMessage(channelId, auth.member.name, shape.values.nonce, ciphertext, shape.values.idemKey, encrypted, keyVersion);
           if (!stored.deduped) {
             // Push-wake only (spec §5.7): notifications carry seq+epoch, never

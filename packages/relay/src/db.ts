@@ -58,6 +58,8 @@ export interface MemberRow {
   last_active_at: string | null;
   /** Owning relay-global user (user/consumer model, governance v2 §3). */
   user_id: string | null;
+  /** v3 permission tier: creator | manager | representative | vip | regular | trial. */
+  permission_role?: string;
 }
 
 /** Relay-global user identity (governance v2 §3). The session token binds to

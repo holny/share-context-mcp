@@ -1100,8 +1100,7 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
       },
       safe(async ({ channel_id, type, target, reason }) => {
         const ch = resolveChannel(store, channel_id);
-        void reason; // v1: the relay records params only; surfaced in the vote frame later
-        const res = await (bridge as Required<Pick<ChannelBridge, "startVote">>).startVote(ch, target);
+        const res = await (bridge as Required<Pick<ChannelBridge, "startVote">>).startVote(ch, target, reason ? { reason } : {});
         return quoteWrap(JSON.stringify({ ok: true, channelId: ch, type, target, ...res }));
       }),
     );

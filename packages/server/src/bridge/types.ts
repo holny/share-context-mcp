@@ -145,7 +145,7 @@ export interface ChannelBridge {
    * Open a governance vote (v3 spec §5: start_vote on the MCP surface —
    * same relay checks as the CLI path). Relay-backed bridges only.
    */
-  startVote?(channelId: string, target: string, opts?: { banIp?: boolean; revokeInvitees?: boolean }): Promise<{ voteId: string; endsAt: number }>;
+  startVote?(channelId: string, target: string, opts?: { banIp?: boolean; revokeInvitees?: boolean; reason?: string }): Promise<{ voteId: string; endsAt: number }>;
   /**
    * Governance capability (§governance): true only for the relay-backed
    * bridge — roles/votes/bans/directory are relay-tier features. git/S3

@@ -307,11 +307,17 @@ export class RelayBridge implements ChannelBridge {
     return { channelId, password };
   }
 
-  async startVote(channelId: string, target: string, opts: { banIp?: boolean; revokeInvitees?: boolean } = {}): Promise<{ voteId: string; endsAt: number }> {
+  async startVote(channelId: string, target: string, opts: { banIp?: boolean; revokeInvitees?: boolean; reason?: string } = {}): Promise<{ voteId: string; endsAt: number }> {
     const res = await this.request(`/channels/${channelId}/votes`, {
       method: "POST",
       headers: { ...this.authHeaders(channelId), "content-type": "application/json" },
-      body: JSON.stringify({ type: "kick", target, ...(opts.banIp ? { banIp: true } : {}), ...(opts.revokeInvitees ? { revokeInvitees: true } : {}) }),
+      body: JSON.stringify({
+        type: "kick",
+        target,
+        ...(opts.banIp ? { banIp: true } : {}),
+        ...(opts.revokeInvitees ? { revokeInvitees: true } : {}),
+        ...(opts.reason ? { reason: opts.reason } : {}),
+      }),
     });
     if (typeof res.voteId !== "string") throw new Error("relay did not open the vote");
     return { voteId: res.voteId, endsAt: res.endsAt as number };

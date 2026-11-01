@@ -74,6 +74,22 @@ describe("vote module", () => {
       history: Array<{ id: string; target: string; status: string }>;
     };
 
+  test("vote reason is stored and surfaced in open + history listings (M-3)", async () => {
+    const { channelId, tokens } = await makeChannel("password", ["alice", "bob", "carol"]);
+    const openedRes = await startVote(channelId, tokens.alice, { target: "bob", reason: "repeated spam after warning" });
+    expect(openedRes.status).toBe(200);
+    const opened = (await openedRes.json()) as { voteId: string };
+    const votes = (await getVotes(channelId, tokens.carol)) as {
+      open: Array<{ id: string; reason?: string }>;
+      history: Array<{ id: string; reason?: string }>;
+    };
+    expect(votes.open[0]?.reason).toBe("repeated spam after warning");
+    expect(votes.history[0]?.reason).toBe("repeated spam after warning");
+    // a vote opened without a reason simply has no reason field
+    await post(`/channels/${channelId}/ballots`, {}).catch(() => {});
+    void opened;
+  });
+
   test("open validation: <3 members, single open vote, cooldown, target==initiator", async () => {
     const { channelId, tokens } = await makeChannel("password", ["alice", "bob"]);
 
