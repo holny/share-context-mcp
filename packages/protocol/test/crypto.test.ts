@@ -156,7 +156,7 @@ describe("scmc2 blob envelope", () => {
       const blob = encodeBlobEnvelope({
         type,
         payload: { channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 },
-        expiresAt: 1_780_000_000_000 + i,
+        expiresAt: Date.now() + 7 * 86_400_000 + i,
         maxUses: i + 1,
       });
       expect(blob.startsWith("scmc2-")).toBe(true);
@@ -164,7 +164,7 @@ describe("scmc2 blob envelope", () => {
       const parsed = parseBlobEnvelope(blob);
       expect(parsed.type).toBe(type);
       expect(parsed.payload).toEqual({ channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 });
-      expect(parsed.expiresAt).toBe(1_780_000_000_000 + i);
+      expect(parsed.expiresAt).toBe(Date.now() + 7 * 86_400_000 + i);
       expect(parsed.maxUses).toBe(i + 1);
     }
   });
@@ -201,6 +201,24 @@ describe("scmc2 blob envelope", () => {
     expect(isBlobExpired({ expiresAt: now - 1 }, now)).toBe(true);
     expect(isBlobExpired({ expiresAt: now + 60_000 }, now)).toBe(false);
     expect(isBlobExpired({}, now)).toBe(false);
+  });
+
+  test("parse rejects an expired envelope (expiry enforced at the protocol chokepoint)", () => {
+    const blob = encodeBlobEnvelope({
+      type: "join_invite",
+      payload: { channelId: "ch-expired1", inviteCode: "scmc1-expired0" },
+      expiresAt: Date.now() - 1_000,
+      maxUses: 1,
+    });
+    expect(() => parseBlobEnvelope(blob)).toThrow(/invalid blob: envelope expired/);
+    // the same envelope with a future expiry parses fine
+    const fresh = encodeBlobEnvelope({
+      type: "join_invite",
+      payload: { channelId: "ch-expired1", inviteCode: "scmc1-expired0" },
+      expiresAt: Date.now() + 60_000,
+      maxUses: 1,
+    });
+    expect(parseBlobEnvelope(fresh).type).toBe("join_invite");
   });
 
   test("input longer than 8192 chars throws", () => {

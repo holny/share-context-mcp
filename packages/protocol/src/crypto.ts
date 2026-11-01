@@ -367,6 +367,12 @@ export function parseBlobEnvelope(blob: string): {
   ) {
     throw new Error("invalid blob: malformed expiry or maxUses");
   }
+  // Expiry is enforced here — the protocol layer is the one chokepoint every
+  // consumer (MCP join, CLI join, future relay-executed blobs) passes through.
+  // The relay's invite-code ledger remains as the authoritative backstop.
+  if (isBlobExpired({ expiresAt: inner.exp })) {
+    throw new Error("invalid blob: envelope expired");
+  }
   const body = JSON.stringify({
     v: inner.v,
     type: inner.type,
