@@ -1,6 +1,6 @@
 {
   "name": "@share-context-mcp/console",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "type": "module",
   "dependencies": {
     "@share-context-mcp/server": "workspace:*"

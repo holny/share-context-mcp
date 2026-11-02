@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.1";
 
 function arg(name: string): string | undefined {
   const prefix = `--${name}`;

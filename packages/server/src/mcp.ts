@@ -39,7 +39,7 @@ export const TOOL_NAMES = [
 ] as const;
 
 const SERVER_NAME = "share-context-mcp";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.1";
 const ACTIVE_CHANNEL_KEY = "activeChannel";
 const CARD_STATEMENT_MAX = 80;
 const SEARCH_RESULT_CAP = 50;
