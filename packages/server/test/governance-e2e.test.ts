@@ -102,7 +102,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     expect(fetched.messages.some((m) => m.statement.includes("governance rules apply"))).toBe(true);
 
     // ---- 4. kick vote opened via the CLI tier (raw HTTP; no MCP surface) ----
-    const aliceToken = JSON.parse(alice.store.getSecret(`token:${channelId}`)!) as { token: string };
+    const aliceToken = { token: alice.store.getMembershipToken(channelId, "alice")! };
     const voteRes = await fetch(`${baseUrl}/channels/${channelId}/votes`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${aliceToken.token}` },
@@ -117,11 +117,11 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     };
     expect(withVote.openVotes.some((v) => v.id === voteId && v.target === "dave")).toBe(true);
 
-    const carolToken = JSON.parse(carol.store.getSecret(`token:${channelId}`)!) as { token: string };
+    const carolToken = { token: carol.store.getMembershipToken(channelId, "carol")! };
     // dave (the target) cannot vote
     const daveBallot = await fetch(`${baseUrl}/channels/${channelId}/votes/${voteId}/ballot`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${(JSON.parse(dave.store.getSecret(`token:${channelId}`)!) as { token: string }).token}` },
+      headers: { "content-type": "application/json", authorization: `Bearer ${dave.store.getMembershipToken(channelId, "dave")!}` },
       body: JSON.stringify({ choice: "no" }),
     });
     expect(daveBallot.status).toBe(403);
@@ -136,7 +136,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     // after 2 yes + 0 no of 3 eligible: yes(2) > (2+1)/2 → passes immediately
 
     // ---- 6. kick enforcement: dave's token answers 403 banned ----
-    const daveToken = (JSON.parse(dave.store.getSecret(`token:${channelId}`)!) as { token: string }).token;
+    const daveToken = dave.store.getMembershipToken(channelId, "dave")!;
     const daveMeta = await fetch(`${baseUrl}/channels/${channelId}/meta`, {
       headers: { authorization: `Bearer ${daveToken}` },
     });
@@ -186,7 +186,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     // owner shares the v1 key blob → erin tops up and can read
     const v1Blob = JSON.parse(textOf(await alice.client.callTool({ name: "generate_share_blob", arguments: { channel_id: channelId } })));
     expect(parseBlobEnvelope(v1Blob.blob).type).toBe("join_key");
-    const v1TopUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: v1Blob.blob } });
+    const v1TopUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: v1Blob.blob, member_name: "erin" } });
     expect(isError(v1TopUp)).toBe(false);
     expect(erin.store.messageKey(channelId, 1)).not.toBeNull();
 
@@ -219,7 +219,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     // fresh key-only blob from the owner → erin tops up without re-joining
     const keyBlob = JSON.parse(textOf(await alice.client.callTool({ name: "generate_share_blob", arguments: { channel_id: channelId } })));
     expect(parseBlobEnvelope(keyBlob.blob).type).toBe("join_key");
-    const topUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: keyBlob.blob } });
+    const topUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: keyBlob.blob, member_name: "erin" } });
     expect(isError(topUp)).toBe(false);
     expect(Buffer.from(erin.store.messageKey(channelId, 2)!).equals(alice.store.messageKey(channelId, 2)!)).toBe(true);
     expect(Buffer.from(alice.store.messageKey(channelId, 2)!).equals(before)).toBe(false); // genuinely a NEW key

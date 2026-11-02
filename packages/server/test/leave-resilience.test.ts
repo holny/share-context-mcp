@@ -77,7 +77,7 @@ describe("channel leave is locally resilient", () => {
     const key = deriveChannelKey(password, channelId);
     const auth = { authorization: `Bearer ${(b.bridge as unknown as { authHeaders: (c: string) => Record<string, string> }).authHeaders(channelId).authorization?.slice(7)}` };
     void auth;
-    const victimToken = JSON.parse(b.store.getSecret(`token:${channelId}`)!) as { token: string };
+    const victimToken = { token: b.store.getMembershipToken(channelId, "b")! };
     const dis = await fetch(`${baseUrl}/channels/${channelId}/leave`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${victimToken.token}` },

@@ -11,6 +11,7 @@
  * absorbs it.
  */
 import { createHmac, randomBytes } from "node:crypto";
+import { hostname } from "node:os";
 import {
   LIMITS,
   deriveChannelKey,
@@ -77,6 +78,8 @@ export class RelayBridge implements ChannelBridge {
   private readonly store: Store;
   /** Session tokens per channel — memory first, encrypted fallback in the store. */
   private readonly tokens = new Map<string, string>();
+  /** The member this process uses per channel (set at join; restored from the consumer ledger). */
+  private readonly memberByChannel = new Map<string, string>();
   /** Default channel for the brief's `send(msg)` form; set on create/join. */
   private defaultChannelId: string | null = null;
   /** Live listeners per channel, marked active by send/poll (spec §5.8). */
@@ -118,6 +121,32 @@ export class RelayBridge implements ChannelBridge {
     return body ?? {};
   }
 
+  /**
+   * The member this process acts as on a channel: join-time registration
+   * first, then the consumer ledger (survives restarts), then the only
+   * membership when the machine holds exactly one.
+   */
+  private resolveMember(channelId: string): string | undefined {
+    const joined = this.memberByChannel.get(channelId);
+    if (joined) return joined;
+    const viaConsumer = this.store.memberForConsumer(this.consumerId, channelId);
+    if (viaConsumer) {
+      this.memberByChannel.set(channelId, viaConsumer);
+      return viaConsumer;
+    }
+    const names = this.store.listMembershipNames(channelId);
+    if (names.length === 1) {
+      this.memberByChannel.set(channelId, names[0]);
+      return names[0];
+    }
+    return undefined;
+  }
+
+  /** Public view of resolveMember — the MCP layer scopes cursor reads by member. */
+  currentMember(channelId: string): string | undefined {
+    return this.resolveMember(channelId);
+  }
+
   authHeaders(channelId: string): Record<string, string> {
     const token = this.loadToken(channelId);
     if (!token) throw new Error(`not joined: ${channelId}`);
@@ -142,8 +171,17 @@ export class RelayBridge implements ChannelBridge {
    * the session of the member name it holds without re-challenging.
    */
   private loadToken(channelId: string): string | null {
-    const mem = this.tokens.get(channelId);
-    if (mem) return mem;
+    const member = this.resolveMember(channelId);
+    if (member) {
+      const mem = this.tokens.get(`${channelId}|${member}`);
+      if (mem) return mem;
+      const sealed = this.store.getMembershipToken(channelId, member);
+      if (sealed) {
+        this.tokens.set(`${channelId}|${member}`, sealed);
+        return sealed;
+      }
+    }
+    // legacy single-member store (pre multi-membership): kv slot keyed by channel
     const session = this.loadStoredSession(channelId);
     if (session) {
       this.tokens.set(channelId, session.token);
@@ -160,8 +198,14 @@ export class RelayBridge implements ChannelBridge {
       body: JSON.stringify({}),
     });
     if (typeof data.token !== "string") throw new Error("relay did not issue a refreshed token");
-    this.tokens.set(channelId, data.token);
-    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: data.token, memberName: this.loadStoredSession(channelId)?.memberName ?? "" }));
+    const member = this.resolveMember(channelId);
+    if (member) {
+      this.tokens.set(`${channelId}|${member}`, data.token);
+      this.store.setMembershipToken(channelId, member, data.token);
+    } else {
+      this.tokens.set(channelId, data.token);
+      this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: data.token, memberName: this.loadStoredSession(channelId)?.memberName ?? "" }));
+    }
   }
 
   /**
@@ -189,15 +233,28 @@ export class RelayBridge implements ChannelBridge {
    * loaded (the caller must verify it with an authed call).
    */
   private adoptStoredSession(channelId: string, memberName: string): boolean {
+    // membership-scoped token first (the multi-membership store), then the
+    // legacy kv slot (stores written before the identity iteration)
+    const sealed = this.store.getMembershipToken(channelId, memberName);
+    if (sealed) {
+      this.tokens.set(`${channelId}|${memberName}`, sealed);
+      return true;
+    }
     const session = this.loadStoredSession(channelId);
     if (!session || session.memberName !== memberName) return false;
     this.tokens.set(channelId, session.token);
     return true;
   }
 
-  private forgetToken(channelId: string): void {
-    this.tokens.delete(channelId);
-    this.store.deleteKv(`token:${channelId}`);
+  private forgetToken(channelId: string, member?: string): void {
+    const m = member ?? this.resolveMember(channelId);
+    if (m) {
+      this.tokens.delete(`${channelId}|${m}`);
+      this.store.deleteMembershipToken(channelId, m);
+    } else {
+      this.tokens.delete(channelId);
+      this.store.deleteKv(`token:${channelId}`);
+    }
   }
 
   private channelIdFor(msg: ClaimInput, channelId?: string): string {
@@ -241,19 +298,28 @@ export class RelayBridge implements ChannelBridge {
     const joined = (await this.request(`/channels/${channelId}/join`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ memberName, proof, consumerId: this.consumerId }),
+      body: JSON.stringify({ memberName, proof, consumerId: this.consumerId, ...this.userSpec() }),
     })) as { token?: string; epoch?: number };
     if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
-    this.tokens.set(channelId, joined.token);
-    // Persist (encrypted) TOGETHER WITH the memberName so a restart or a
-    // second process sharing the SQLite can adopt this session — but only
-    // ever under the SAME member name (adoption across identities would
-    // silently ride someone else's session).
+    this.memberByChannel.set(channelId, memberName);
+    this.tokens.set(`${channelId}|${memberName}`, joined.token);
+    // Persist (encrypted) under the member identity: a second membership of
+    // the same channel on this machine must never overwrite this session.
     try {
-      this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: joined.token, memberName }));
+      this.store.setMembershipToken(channelId, memberName, joined.token);
     } catch {
       // token persistence is best-effort; memory still works this session
     }
+  }
+
+  /**
+   * Stable machine-level user identity sent on every join: the relay dedupes
+   * users by name, so all members/consumers of one machine map to ONE
+   * relay-global user regardless of member name.
+   */
+  private userSpec(): Record<string, unknown> {
+    const name = hostname().toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32) || "user";
+    return { user: { name } };
   }
 
   // ---- ChannelBridge ----
@@ -297,6 +363,14 @@ export class RelayBridge implements ChannelBridge {
       memberName: opts.memberName,
       epoch: typeof created.epoch === "number" ? created.epoch : 1,
     });
+    this.store.upsertMembership({
+      channelId,
+      password,
+      memberName: opts.memberName,
+      epoch: typeof created.epoch === "number" ? created.epoch : 1,
+    });
+    this.memberByChannel.set(channelId, opts.memberName);
+    this.store.recordConsumerChannel(this.consumerId, channelId, opts.memberName);
     this.defaultChannelId = channelId;
     // Owner-only key governance (spec §3.1): channel creation is one of the
     // two key-generation points. Enabling encryption here mints v1 on THIS
@@ -400,6 +474,14 @@ export class RelayBridge implements ChannelBridge {
       memberName,
       epoch: typeof meta.epoch === "number" ? meta.epoch : 1,
     });
+    this.store.upsertMembership({
+      channelId,
+      password,
+      memberName,
+      epoch: typeof meta.epoch === "number" ? meta.epoch : 1,
+    });
+    this.memberByChannel.set(channelId, memberName);
+    this.store.recordConsumerChannel(this.consumerId, channelId, memberName);
     // Sync the encrypted-toggle state (§11): a joining member must know the
     // channel is encrypted and at which key version — it holds no key yet
     // (keys travel out-of-band), so sends will fail with a readable error
@@ -470,7 +552,12 @@ export class RelayBridge implements ChannelBridge {
     const nextSeq = typeof data.nextSeq === "number" ? data.nextSeq : undefined;
     if (minSeq !== undefined && minSeq > 1) {
       const raiseTarget = nextSeq !== undefined ? Math.min(minSeq, nextSeq - 1) : minSeq;
-      if (raiseTarget > this.store.getCursor(channelId)) {
+      const member = this.resolveMember(channelId);
+      if (member) {
+        if (raiseTarget > this.store.getMembershipCursor(channelId, member)) {
+          this.store.setMembershipCursor(channelId, member, raiseTarget);
+        }
+      } else if (raiseTarget > this.store.getCursor(channelId)) {
         this.store.setCursor(channelId, raiseTarget);
       }
       const gapKey = `gap:${channelId}`;
@@ -548,7 +635,7 @@ export class RelayBridge implements ChannelBridge {
     // (C-1): an undecryptable page prefix (old-epoch ciphertext after a
     // rotate) must advance the cursor, or it would re-fetch forever and
     // permanently block every newer message behind it.
-    this.store.recordCursorFromMessages(channelId, envelopes);
+    this.store.recordCursorFromMessages(channelId, envelopes, this.resolveMember(channelId));
     // A fetch is activity (spec §5.8) — usually triggered BY a listener's
     // wake (already marked), but direct poll() calls count too. AGENT-SCOPED
     // (Review F3): the broadcaster's background poll passes markActivity:
@@ -615,6 +702,8 @@ export class RelayBridge implements ChannelBridge {
         joinedAt: m.joinedAt as string,
         lastActiveAt: (m.lastActiveAt as string | null) ?? null,
         permissionRole: m.permissionRole as string | undefined,
+        userId: m.userId as string | undefined,
+        userName: m.userName as string | undefined,
       })),
       nextSeq: data.nextSeq as number,
       minSeq: typeof data.minSeq === "number" ? data.minSeq : undefined,
@@ -718,6 +807,12 @@ export class RelayBridge implements ChannelBridge {
       memberName: secret.memberName,
       epoch: typeof res.epoch === "number" ? res.epoch : secret.epoch + 1,
     });
+    this.store.upsertMembership({
+      channelId,
+      password: newPassword,
+      memberName: secret.memberName,
+      epoch: typeof res.epoch === "number" ? res.epoch : secret.epoch + 1,
+    });
     // All tokens (including ours) are dead after rotate; re-join to continue.
     this.forgetToken(channelId);
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
@@ -730,8 +825,10 @@ export class RelayBridge implements ChannelBridge {
       headers: { "content-type": "application/json", ...this.authHeaders(channelId) },
       body: JSON.stringify(opts?.transferTo ? { transferTo: opts.transferTo } : {}),
     });
-    this.store.removeChannel(channelId);
-    this.forgetToken(channelId);
+    const member = this.resolveMember(channelId);
+    if (member) this.store.deleteMembership(channelId, member);
+    else this.store.removeChannel(channelId);
+    this.forgetToken(channelId, member);
     if (this.defaultChannelId === channelId) this.defaultChannelId = null;
   }
 
@@ -747,17 +844,26 @@ export class RelayBridge implements ChannelBridge {
     const joined = (await this.request(`/channels/${channelId}/join`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ memberName, consumerId: this.consumerId, inviteCodeId: parsed.codeId }),
+      body: JSON.stringify({ memberName, consumerId: this.consumerId, inviteCodeId: parsed.codeId, ...this.userSpec() }),
     })) as { token?: string; epoch?: number };
     if (typeof joined.token !== "string") throw new Error("relay did not issue a session token");
-    this.tokens.set(channelId, joined.token);
-    this.store.putSecret(`token:${channelId}`, JSON.stringify({ token: joined.token, memberName }));
+    this.memberByChannel.set(channelId, memberName);
+    this.tokens.set(`${channelId}|${memberName}`, joined.token);
+    this.store.setMembershipToken(channelId, memberName, joined.token);
     this.store.upsertChannel({
       channelId,
       password: code,
       memberName,
       epoch: typeof joined.epoch === "number" ? joined.epoch : 1,
     });
+    this.store.upsertMembership({
+      channelId,
+      password: code,
+      memberName,
+      epoch: typeof joined.epoch === "number" ? joined.epoch : 1,
+    });
+    this.memberByChannel.set(channelId, memberName);
+    this.store.recordConsumerChannel(this.consumerId, channelId, memberName);
     this.defaultChannelId = channelId;
   }
 }

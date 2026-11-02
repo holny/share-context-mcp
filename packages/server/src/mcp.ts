@@ -39,7 +39,7 @@ export const TOOL_NAMES = [
 ] as const;
 
 const SERVER_NAME = "share-context-mcp";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.1";
 const ACTIVE_CHANNEL_KEY = "activeChannel";
 const CARD_STATEMENT_MAX = 80;
 const SEARCH_RESULT_CAP = 50;
@@ -456,6 +456,11 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
    * retained history into the local cache, then build the structural index
    * card the joining agent reads to orient itself.
    */
+  const memberCursor = (ch: string): number => {
+    const member = bridge instanceof RelayBridge ? bridge.currentMember(ch) : undefined;
+    return store.getCursor(ch, member);
+  };
+
   const joinCard = async (ch: string): Promise<string> => {
     // Full-history fetch (spec: retention bounds relay history, so "all of
     // it" is finite): page from the local cursor until caught up with the
@@ -464,10 +469,10 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
     // re-joining member starts from its stored cursor — the cursor never
     // moves backward and already-cached messages are not re-pulled.
     const meta = await bridge.meta(ch);
-    let since = store.getCursor(ch);
+    let since = memberCursor(ch);
     for (let pages = 0; pages < 10_000; pages++) {
       await bridge.poll(ch, since);
-      const advanced = store.getCursor(ch);
+      const advanced = memberCursor(ch);
       if (advanced <= since) break; // empty page — caught up
       since = advanced;
       if (since >= meta.nextSeq - 1) break; // reached relay head
@@ -486,7 +491,37 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
       // advanced after a successful send, so the next fetch retries.
       console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
     });
-    return quoteWrap(JSON.stringify(name ? { ...card, channelName: name } : card));
+    // v3 UX: the join response alone answers "who is here, what happened
+    // recently" — members with roles plus the last few messages, truncated.
+    // Anything more points at fetch_messages / channel_info (size discipline:
+    // never flood the joining session's context).
+    const roleOf = (memberName: string): string =>
+      memberName === meta.creatorMember
+        ? "creator/owner"
+        : memberName === meta.managerMember
+          ? "manager"
+          : (meta.members.find((m) => m.memberName === memberName)?.permissionRole ?? "member");
+    const RECENT_CAP = 5;
+    const STATEMENT_CAP = 80;
+    const recentMessages = (all as Array<{ statement: string; kind: string; ts?: string; provenance?: { member?: string } }>)
+      .slice(-RECENT_CAP)
+      .map((m) => ({
+        from: m.provenance?.member,
+        kind: m.kind,
+        statement: m.statement.length > STATEMENT_CAP ? m.statement.slice(0, STATEMENT_CAP) + "…" : m.statement,
+        ...(m.ts ? { at: m.ts } : {}),
+      }));
+    const withRoles = {
+      ...card,
+      members: (card.members as Array<Record<string, unknown>>).map((m) => ({
+        ...m,
+        role: roleOf(m.memberName as string),
+        ...(m.userName ? { user: m.userName } : {}),
+      })),
+      recentMessages,
+      moreHint: "fetch_messages({topic}|{query}) for older/full text — channel_info for the full briefing",
+    };
+    return quoteWrap(JSON.stringify(name ? { ...withRoles, channelName: name } : withRoles));
   };
 
   /**
@@ -676,7 +711,7 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
           Math.min(limit ?? SEARCH_RESULT_CAP, SEARCH_RESULT_CAP),
         );
         return quoteWrap(
-          JSON.stringify({ channelId: ch, messages, skipped: 0, cursor: store.getCursor(ch), remaining: 0 }),
+          JSON.stringify({ channelId: ch, messages, skipped: 0, cursor: memberCursor(ch), remaining: 0 }),
         );
       }
       // HISTORY mode: newest matching messages, oldest first in the batch;
@@ -687,8 +722,8 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
         let messages = pick();
         if (messages.length < lim) {
           const meta = await bridge.meta(ch);
-          if (meta.nextSeq > store.getCursor(ch)) {
-            await bridge.poll(ch, store.getCursor(ch));
+          if (meta.nextSeq > memberCursor(ch)) {
+            await bridge.poll(ch, memberCursor(ch));
             messages = pick();
           }
         }
@@ -698,7 +733,7 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
             channelId: ch,
             messages: messages.slice().reverse(),
             skipped: 0,
-            cursor: store.getCursor(ch),
+            cursor: memberCursor(ch),
             remaining: 0,
             ...(openVotes ? { openVotes } : {}),
           }),
@@ -706,9 +741,9 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
       }
       // DELTA mode: poll the relay, serve the undelivered window.
       const consumerDelivered = deliveredFor(consumerIdFromExtra(extra));
-      const prevHigh = store.getCursor(ch);
+      const prevHigh = memberCursor(ch);
       const pollResult = await bridge.poll(ch, prevHigh);
-      const high = store.getCursor(ch);
+      const high = memberCursor(ch);
       // Digest failure must not break the fetch (see joinCard note).
       await maybePostDigest(bridge, store, ch).catch((e: unknown) => {
         console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
@@ -814,11 +849,23 @@ visibility (public|private) controls discoverability; admissionMode (no_limit|pa
       setActiveChannel(store, newId);
       onChannelJoined?.(newId); // create joins implicitly — start broadcasting
       if (name) store.setKv(`channelName:${newId}`, name);
+      // v3 UX: the invite package ships WITH the creation result — the user
+      // copies ONE block (intro + project link + key string + SOP) and sends
+      // it to teammates. No separate generate_share_blob call needed.
+      let share: { blob: string | null; text: string } | undefined;
+      if (bridge instanceof RelayBridge) {
+        try {
+          share = await buildSharePackage(bridge, store, newId);
+        } catch (err) {
+          console.error(`share-context-mcp: share package build failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       return JSON.stringify({
         ok: true,
         channel_id: newId,
         password: newPassword,
         note: "The password is shown only this once — deliver it out of band; never post it back through the channel.",
+        ...(share ? { share } : {}),
       });
     }),
   );
@@ -848,8 +895,20 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
       },
     },
     safe(async ({ channel_id, member_name, password, invite_code, blob }, extra) => {
-      // Blob mode: everything is extracted from the envelope.
+      // Blob mode: everything is extracted from the envelope. The paste is
+      // tolerated in ANY form — the whole share message, extra prose, line
+      // breaks — as long as exactly one scmc2- token can be found in it.
       if (typeof blob === "string" && blob.length > 0) {
+        if (!blob.startsWith("scmc2-")) {
+          const matches = blob.match(/scmc2-[A-Za-z2-7]+/g);
+          if (!matches || matches.length === 0) {
+            throw new Error('invalid blob: no scmc2- key string found in the text — paste the whole share message or just the key line');
+          }
+          if (matches.length > 1) {
+            throw new Error(`invalid blob: ${matches.length} scmc2- key strings found — paste only one`);
+          }
+          blob = matches[0];
+        }
         const parsed = parseBlobEnvelope(blob);
         const p = parsed.payload as {
           relayUrl?: string;
@@ -878,9 +937,13 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
             ? new Uint8Array(Buffer.from(p.messageKey, "base64"))
             : null;
         if (key !== null && key.length !== 32) throw new Error("invalid blob: messageKey must decode to 32 bytes");
-        // Already a member? Top up the key and NEVER re-join (spec §4.5): a
-        // re-join attempt would 409 on the live member name.
-        if (store.getChannelSecret(p.channelId)) {
+        // Already a member on THIS machine? Only treat it as a key top-up when
+        // the requested member name matches the local membership. A different
+        // name means the user wants a genuinely new member — silently swapping
+        // it for a top-up was the v3.0 bug (bob never appeared in the list).
+        const existing = store.getChannelSecret(p.channelId);
+        const requestedName = name ?? defaultMemberName();
+        if (existing && existing.memberName === requestedName) {
           if (key === null || typeof p.keyVersion !== "number") {
             return quoteWrap(JSON.stringify({ ok: true, channelId: p.channelId, alreadyMember: true }));
           }
@@ -889,11 +952,15 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
           return JSON.stringify({
             ok: true,
             channelId: p.channelId,
+            member: requestedName,
             keyTopUp: true,
             keyVersion: p.keyVersion,
             note: `message key v${p.keyVersion} installed locally — sending on the encrypted channel works again`,
           });
         }
+        // A DIFFERENT member name = a genuinely new member of the same user
+        // (one machine may hold several memberships of one channel). Fall
+        // through to the real join — the store keeps both memberships apart.
         const secret = p.inviteCode ?? p.password;
         if (typeof secret !== "string" || secret.length === 0) {
           throw new Error("invalid blob: payload needs a password or inviteCode");
@@ -1012,9 +1079,13 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
         .filter((m) => q === undefined || m.memberName.toLowerCase().includes(q))
         .map((m) => {
           const activity = activityBucket(m.lastActiveAt);
-          return activity === undefined
-            ? { memberName: m.memberName, joinedAt: m.joinedAt }
-            : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
+          return {
+            memberName: m.memberName,
+            joinedAt: m.joinedAt,
+            // user grouping: several members may belong to one human
+            ...(m.userName ? { user: m.userName } : {}),
+            ...(activity !== undefined ? { activity } : {}),
+          };
         });
       return quoteWrap(JSON.stringify({ channelId: ch, members }));
     }),
@@ -1125,6 +1196,108 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
     }),
   );
 
+
+/**
+ * Build the complete copy-paste share package for a relay channel (v3 §4.3).
+ * One block an invitee's agent fully understands: intro, project link, the
+ * key string, and what to do with it. Used by create_channel (automatic) and
+ * generate_share_blob (on demand).
+ */
+async function buildSharePackage(
+  bridge: RelayBridge,
+  store: Store,
+  ch: string,
+): Promise<{ blob: string | null; text: string; type: string }> {
+  const meta = await bridge.meta(ch);
+  const secret = store.getChannelSecret(ch);
+  if (!secret) throw new Error(`not joined: ${ch}`);
+  const name = store.getKv(`channelName:${ch}`) ?? undefined;
+
+  let messageKey: string | undefined;
+  let keyVersion = 0;
+  if (meta.encrypted) {
+    keyVersion = meta.keyVersion ?? 0;
+    const key = store.messageKey(ch, keyVersion);
+    if (!key) {
+      throw new Error(
+        `message key not available locally — ask the owner for a fresh blob (channel ${ch}, key v${keyVersion})`,
+      );
+    }
+    messageKey = Buffer.from(key).toString("base64");
+  }
+  const keyFields = messageKey ? { messageKey, keyVersion } : {};
+  const relayUrl = bridge.baseUrl;
+
+  let type: (typeof BLOB_TYPES)[number];
+  let payload: Record<string, unknown>;
+  let expiresAt: number | undefined;
+  let maxUses: number | undefined;
+  if (meta.admissionMode === "invite") {
+    type = "join_invite";
+    const ttlMs = 7 * 24 * 3600 * 1000;
+    expiresAt = Date.now() + ttlMs;
+    maxUses = 1;
+    const codeId = randomBytes(8).toString("hex");
+    const { code } = mintInviteCode(bridge.channelKey(ch), codeId, ttlMs);
+    await bridge.registerInviteCode(ch, codeId, expiresAt);
+    payload = { relayUrl, channelId: ch, inviteCode: code, channelName: name, visibility: meta.visibility, ...keyFields };
+  } else if (meta.admissionMode === "no_limit") {
+    if (!meta.encrypted) {
+      // nothing sensitive to carry: the SOP text alone is the share package
+      const text = [
+        "📢 share-context-mcp channel invite",
+        "",
+        `Channel:  ${name ?? ch} (${ch}, ${meta.visibility}, ${meta.admissionMode})`,
+        `Invited by: ${secret.memberName}`,
+        "",
+        "Anyone with the channel id can join — no key string needed.",
+        "Tell your agent: join_channel with channel_id " + ch,
+      ].join("\n");
+      return { blob: null, text, type: "none" };
+    }
+    type = "join_key";
+    payload = { relayUrl, channelId: ch, channelName: name, visibility: meta.visibility, ...keyFields };
+  } else {
+    type = meta.encrypted && meta.visibility === "public" ? "join_key" : "join_password";
+    payload = {
+      relayUrl,
+      channelId: ch,
+      ...(type === "join_password" ? { password: secret.password } : {}),
+      channelName: name,
+      visibility: meta.visibility,
+      ...keyFields,
+    };
+  }
+  const blob = encodeBlobEnvelope({ type, payload, expiresAt, maxUses });
+
+  const typeLine =
+    type === "join_invite"
+      ? `INVITE (one-time use, expires ${new Date(expiresAt ?? 0).toISOString().slice(0, 10)})`
+      : type === "join_password"
+        ? "PASSWORD"
+        : "MESSAGE KEY (decrypts channel history)";
+  const me = meta.members.find((m) => m.memberName === secret.memberName);
+  const role = meta.creatorMember === secret.memberName ? "creator/owner" : meta.managerMember === secret.memberName ? "manager" : "member";
+  const text = [
+    "📢 share-context-mcp channel invite",
+    "",
+    `Channel:   ${name ?? ch} (${ch}, ${meta.visibility}, ${meta.admissionMode}${meta.encrypted ? ", encrypted" : ""})`,
+    `Invited by: ${secret.memberName} — role: ${role}${me?.lastActiveAt ? `, last active: ${me.lastActiveAt.slice(0, 10)}` : ""}`,
+    `Type:      ${typeLine}`,
+    "",
+    "share-context-mcp is a realtime shared-context channel for AI coding agents.",
+    "Project & install: https://github.com/holny/share-context-mcp (prebuilt binaries on Releases; or bun)",
+    "",
+    "Give the line below to your agent — it joins and decrypts by itself:",
+    blob,
+    "",
+    "If the MCP server is not configured yet, tell your agent:",
+    '"Follow the share-context-mcp README Quick Start, then join with the blob above."',
+  ].join("\n");
+  return { blob, text, type };
+}
+
+
   // ---- generate_share_blob (spec §4.3; implemented in the v3 iteration) ----
   server.registerTool(
     "generate_share_blob",
@@ -1138,85 +1311,7 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
       if (!(bridge instanceof RelayBridge)) {
         throw new Error("generate_share_blob requires a relay-backed channel (git/S3 bridges have no admission credentials)");
       }
-      const meta = await bridge.meta(ch);
-      const secret = store.getChannelSecret(ch);
-      if (!secret) throw new Error(`not joined: ${ch}`);
-      const name = store.getKv(`channelName:${ch}`) ?? undefined;
-
-      // Message key embedding (only when the channel is encrypted; read-only —
-      // nothing on the MCP surface can create or rotate key material).
-      let messageKey: string | undefined;
-      let keyVersion = 0;
-      if (meta.encrypted) {
-        keyVersion = meta.keyVersion ?? 0;
-        const key = store.messageKey(ch, keyVersion);
-        if (!key) {
-          throw new Error(
-            `message key not available locally — ask the owner for a fresh blob (channel ${ch}, key v${keyVersion})`,
-          );
-        }
-        messageKey = Buffer.from(key).toString("base64");
-      }
-      const keyFields = messageKey ? { messageKey, keyVersion } : {};
-      const relayUrl = bridge.baseUrl;
-
-      // Type inference (spec §4.3): invite → invite code; password admission →
-      // password blob, EXCEPT public+encrypted where the password is not the
-      // interesting part (discovery is open) → key-only share; no_limit → key
-      // share when encrypted, nothing otherwise.
-      let type: (typeof BLOB_TYPES)[number];
-      let payload: Record<string, unknown>;
-      let expiresAt: number | undefined;
-      let maxUses: number | undefined;
-      if (meta.admissionMode === "invite") {
-        type = "join_invite";
-        const ttlMs = 7 * 24 * 3600 * 1000;
-        expiresAt = Date.now() + ttlMs;
-        maxUses = 1;
-        const codeId = randomBytes(8).toString("hex");
-        const { code } = mintInviteCode(bridge.channelKey(ch), codeId, ttlMs);
-        await bridge.registerInviteCode(ch, codeId, expiresAt);
-        payload = { relayUrl, channelId: ch, inviteCode: code, channelName: name, visibility: meta.visibility, ...keyFields };
-      } else if (meta.admissionMode === "no_limit") {
-        if (!meta.encrypted) {
-          throw new Error(`nothing to share — channel ${ch} is no_limit and unencrypted (anyone with the id can join)`);
-        }
-        type = "join_key";
-        payload = { relayUrl, channelId: ch, channelName: name, visibility: meta.visibility, ...keyFields };
-      } else {
-        type = meta.encrypted && meta.visibility === "public" ? "join_key" : "join_password";
-        payload = {
-          relayUrl,
-          channelId: ch,
-          ...(type === "join_password" ? { password: secret.password } : {}),
-          channelName: name,
-          visibility: meta.visibility,
-          ...keyFields,
-        };
-      }
-      const blob = encodeBlobEnvelope({ type, payload, expiresAt, maxUses });
-
-      const typeLine =
-        type === "join_invite"
-          ? `INVITE (one-time use, expires ${new Date(expiresAt ?? 0).toISOString().slice(0, 10)})`
-          : type === "join_password"
-            ? "PASSWORD"
-            : "MESSAGE KEY (for decrypting channel messages)";
-      const me = meta.members.find((m) => m.memberName === secret.memberName);
-      const role = meta.creatorMember === secret.memberName ? "creator/owner" : meta.managerMember === secret.memberName ? "manager" : "member";
-      const text = [
-        "📢 share-context-mcp channel share",
-        "",
-        `Type:     ${typeLine}`,
-        `Channel:  ${name ?? ch} (${ch}, ${meta.visibility}, ${meta.admissionMode}${meta.encrypted ? ", encrypted" : ""})`,
-        `Inviter:  ${secret.memberName} — role: ${role}${me?.lastActiveAt ? `, last active: ${me.lastActiveAt.slice(0, 10)}` : ""}`,
-        `Shared at: ${new Date().toISOString().slice(0, 16)}Z`,
-        "",
-        "Key string (paste this line to your agent):",
-        blob,
-        "",
-        "Your agent will use it to join the channel (and decrypt history if encrypted).",
-      ].join("\n");
+      const { blob, text } = await buildSharePackage(bridge, store, ch);
       return JSON.stringify({ blob, text });
     }),
   );

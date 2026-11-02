@@ -212,7 +212,10 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
   const stmtChannel = db.prepare("SELECT id, epoch, next_seq, verify_key, created_at, min_seq, creator_member, manager_member, admission_mode, visibility, probation_enabled, invite_skips_probation, sealed_key, key_rotated_at, invite_policy, contact_info, vote_cooldown_until, admission_credential_revoked, encrypted, key_version FROM channels WHERE id = ?");
   const stmtMemberByName = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, last_active_at, user_id FROM members WHERE channel_id = ? AND name = ?");
   const stmtMemberByToken = db.prepare("SELECT channel_id, name, token_hash, token_expires_at, epoch, joined_at, status, can_invite, user_id, permission_role FROM members WHERE channel_id = ? AND token_hash = ?");
-  const stmtMembers = db.prepare("SELECT name, joined_at, last_active_at, permission_role, activity_role, activity_expires_at FROM members WHERE channel_id = ? ORDER BY joined_at ASC");
+  const stmtMembers = db.prepare(`SELECT m.name, m.joined_at, m.last_active_at, m.permission_role, m.activity_role, m.activity_expires_at,
+      m.user_id, u.name AS user_name
+    FROM members m LEFT JOIN users u ON u.user_id = m.user_id
+    WHERE m.channel_id = ? ORDER BY m.joined_at ASC`);
   const stmtSetLastActive = db.prepare("UPDATE members SET last_active_at = ? WHERE channel_id = ? AND name = ?");
   const stmtInsertChannel = db.prepare("INSERT INTO channels(id, epoch, next_seq, verify_key, created_at) VALUES (?, 1, 1, ?, ?)");
   const stmtUpsertMember = db.prepare(`
@@ -1759,7 +1762,7 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
         const auth = authenticate(channelId, req);
         if (auth === "banned") return jsonError(403, "banned");
         if (!auth) return jsonError(401, "unauthorized");
-        const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string; last_active_at: string | null; permission_role: string; activity_role: string | null; activity_expires_at: number | null }>;
+        const members = stmtMembers.all(channelId) as Array<{ name: string; joined_at: string; last_active_at: string | null; permission_role: string; activity_role: string | null; activity_expires_at: number | null; user_id: string | null; user_name: string | null }>;
         return json({
           channelId: auth.channel.id,
           epoch: auth.channel.epoch,
@@ -1781,6 +1784,8 @@ export function createRelayHandler(db: Database, wsHub?: WsHub, retention: Relay
             lastActiveAt: m.last_active_at,
             permissionRole: m.permission_role,
             activityRole: m.activity_role ?? undefined,
+            ...(m.user_id ? { userId: m.user_id } : {}),
+            ...(m.user_name ? { userName: m.user_name } : {}),
             ...(m.activity_expires_at !== null ? { activityExpiresAt: m.activity_expires_at } : {}),
           })),
         });

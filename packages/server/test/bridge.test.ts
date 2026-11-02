@@ -75,12 +75,12 @@ describe("RelayBridge against a real relay", () => {
     expect(got.messages.map((m) => m.statement)).toEqual(["one", "two", "three"]);
     expect(got.messages.map((m) => m.seq)).toEqual([1, 2, 3]);
     expect(got.skipped).toBe(0);
-    expect(storeB.getCursor(channelId)).toBe(3);
+    expect(storeB.getCursor(channelId, "b")).toBe(3);
 
     // incremental poll from the cursor is empty
     expect(await mbB.poll(channelId, 3)).toEqual({ messages: [], skipped: 0, minSeq: 1, encryptedCount: 0 });
     // empty poll must not regress the cursor
-    expect(storeB.getCursor(channelId)).toBe(3);
+    expect(storeB.getCursor(channelId, "b")).toBe(3);
   });
 
   test("wrong-password join throws 'wrong password' and leaves no store residue", async () => {
@@ -166,7 +166,7 @@ describe("RelayBridge against a real relay", () => {
     expect(got.messages.map((m) => m.statement)).toEqual(["before rotate", "after rotate"]);
     expect(got.messages.map((m) => m.seq)).toEqual([1, 2]);
     expect(got.skipped).toBe(0);
-    expect(storeB.getCursor(channelId)).toBe(2);
+    expect(storeB.getCursor(channelId, "b")).toBe(2);
   });
 
   test("I-2: old-key retention — a member who re-joins with the new password keeps reading old-epoch messages", async () => {
@@ -193,7 +193,7 @@ describe("RelayBridge against a real relay", () => {
       "epoch 2 begins",
     ]);
     expect(got.skipped).toBe(0);
-    expect(storeB.getCursor(channelId)).toBe(3);
+    expect(storeB.getCursor(channelId, "b")).toBe(3);
   });
 
   test("I-2: epoch key retention is bounded to the last 5 epochs", async () => {
@@ -242,14 +242,14 @@ describe("RelayBridge against a real relay", () => {
       const page1 = await mbC.poll(channelId, 0);
       expect(page1.messages).toEqual([]);
       expect(page1.skipped).toBe(200);
-      expect(storeC.getCursor(channelId)).toBe(200);
+      expect(storeC.getCursor(channelId, "c")).toBe(200);
 
       // page 2 delivers the new-epoch message; the cursor lands on 202
-      const page2 = await mbC.poll(channelId, storeC.getCursor(channelId));
+      const page2 = await mbC.poll(channelId, storeC.getCursor(channelId, "c"));
       expect(page2.messages.map((m) => m.statement)).toEqual(["new epoch begins"]);
       expect(page2.messages[0]?.seq).toBe(newMsg.seq);
       expect(page2.skipped).toBe(1);
-      expect(storeC.getCursor(channelId)).toBe(202);
+      expect(storeC.getCursor(channelId, "c")).toBe(202);
     } finally {
       storeC.close();
       rmSync(dirC, { recursive: true, force: true });
@@ -286,8 +286,8 @@ describe("RelayBridge against a real relay", () => {
       const res = await b2.poll(channelId, 0);
       // only seq 3 survives (count bound 1); minSeq 3 > poll-since 0
       expect(res.minSeq).toBe(3);
-      expect(store2.getCursor(channelId)).toBeGreaterThanOrEqual(3);
-      expect(store2.getKv(`gap:${channelId}`)).toBe("3");
+      expect(store2.getCursor(channelId, "g")).toBeGreaterThanOrEqual(3);
+      expect(store2.getKv(`gap:${channelId}`)).toBe("3"); // gap kv stays channel-level
     } finally {
       await r2.stop();
     }
