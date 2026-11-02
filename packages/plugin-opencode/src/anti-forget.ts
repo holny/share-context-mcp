@@ -4,7 +4,7 @@
  * turn boundary it asks shouldRemind whether a gentle nudge is due.
  *
  * Misfire guards: read-only sessions (no write-ish actions) never remind;
- * turns that already called share_update never remind; share_update is
+ * turns that already called send_message never remind; send_message is
  * recognized under every name it may carry in opencode (MCP namespace
  * prefixes like "mcp__server__", the "channel_" prefix, path segments).
  */
@@ -25,7 +25,7 @@ export function isActionTool(tool: string): boolean {
 
 /** True only for the sharing tool itself — never for other channel tools. */
 export function isShareTool(tool: string): boolean {
-  return bareToolName(tool) === "share_update";
+  return bareToolName(tool) === "send_message";
 }
 
 /** The whole decision: remind iff the turn wrote something and shared nothing. */
@@ -35,5 +35,5 @@ export function shouldRemind(actions: number, sharedThisTurn: boolean): boolean 
 
 /** The gentle one-liner — offers the ignore-out so noisy turns are not nagged. */
 export function renderReminder(): string {
-  return "💡 小提醒：这一轮你修改了工作区，但还没有调用 share_update。如果其中有 teammates 需要知道的决策、契约变更或踩坑，请花一句话同步到协作通道；若只是琐碎改动，忽略本提示即可。";
+  return "💡 小提醒：这一轮你修改了工作区，但还没有调用 send_message。如果其中有 teammates 需要知道的决策、契约变更或踩坑，请花一句话同步到协作通道；若只是琐碎改动，忽略本提示即可。";
 }

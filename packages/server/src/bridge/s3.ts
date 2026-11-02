@@ -190,9 +190,9 @@ export class S3Bridge implements ChannelBridge {
   async poll(channelId: string, since: number, _opts?: { markActivity?: boolean }): Promise<PollResult> {
     const s = this.secret(channelId);
     const head = await this.getJson<{ nextSeq: number; epoch: number }>(s, `channels/${channelId}/state/head.json`);
-    if (!head) return { messages: [], skipped: 0 };
+    if (!head) return { messages: [], skipped: 0, encryptedCount: 0 };
     const high = head.data.nextSeq - 1;
-    if (high <= since) return { messages: [], skipped: 0 };
+    if (high <= since) return { messages: [], skipped: 0, encryptedCount: 0 };
     const conn = this.conn(s);
     // List every message key after the padded `since` position, ascending.
     const listPrefix = `${conn.prefix}/channels/${channelId}/messages/`;
@@ -227,7 +227,7 @@ export class S3Bridge implements ChannelBridge {
       if (!delivered) skipped++;
     }
     out.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    return { messages: out, skipped };
+    return { messages: out, skipped, encryptedCount: 0 };
   }
 
   async meta(channelId: string): Promise<ChannelMeta> {
@@ -236,6 +236,9 @@ export class S3Bridge implements ChannelBridge {
     const head = await this.getJson<{ nextSeq: number; epoch: number }>(s, `channels/${channelId}/state/head.json`);
     return { members: members?.data ?? [], nextSeq: head?.data.nextSeq ?? 1 };
   }
+
+  /** No-op: S3 has no presence endpoint (spec: activity inference is relay-backed in v1). */
+  async reportActivity(_channelId: string, _lastActiveAt: string): Promise<void> {}
 
   listen(channelId: string, onNotify: (seq: number) => void, _tuning?: TransportTuning): { stop: () => Promise<void>; markActivity(): void; closeForTest(): void; readonly state: TransportState } {
     const interval = this.opts.pollIntervalMs ?? 10_000;
@@ -262,12 +265,22 @@ export class S3Bridge implements ChannelBridge {
     await this.putJson(s, `channels/${channelId}/state/head.json`, { nextSeq: head?.data.nextSeq ?? 1, epoch: s.epoch });
   }
 
-  async leave(channelId: string): Promise<void> {
+  async leave(channelId: string, _opts?: { transferTo?: string }): Promise<void> {
     this.secrets.delete(channelId);
     const t = this.timers.get(channelId);
     if (t) clearInterval(t);
     this.timers.delete(channelId);
   }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async votes(_channelId: string): Promise<{ open: never[]; history: never[] }> {
+    return { open: [], history: [] };
+  }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async castVote(_channelId: string, _voteId: string, _choice: "yes" | "no"): Promise<void> {}
+
+  readonly governance = false;
 }
 
 function headKey(channelId: string): string {

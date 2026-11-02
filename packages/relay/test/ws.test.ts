@@ -76,6 +76,7 @@ async function setupChannel(): Promise<{ channelId: string; token: string }> {
   const joined = await postJson(`/channels/${channelId}/join`, {
     memberName: "alice",
     proof: proofOf(verifyKeyB64Of(PASSWORD, channelId), nonceB64),
+    consumerId: "s/ws0000001",
   });
   expect(joined.status).toBe(200);
   const { token } = (await joined.json()) as { token: string };
@@ -329,7 +330,7 @@ describe("relay websocket push", () => {
       const joined = await (await fetch(`${base2}/channels/${channelId}/join`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ memberName: "alice", proof: proofOf(vk, ch.nonceB64) }),
+        body: JSON.stringify({ memberName: "alice", proof: proofOf(vk, ch.nonceB64), consumerId: "s/ws0000002" }),
       })).json() as { token: string };
 
       const s = new WsSession(`${wsBase2}/channels/${channelId}/ws?token=${encodeURIComponent(joined.token)}`);

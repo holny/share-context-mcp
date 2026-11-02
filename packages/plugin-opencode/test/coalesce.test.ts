@@ -1,7 +1,7 @@
 /**
  * Coalesce/render tests (task-4 brief Step 1, Review Focus #3): card merging
  * for the plugin-side pending slot and digest card rendering in the M1 style
- * ("用 fetch_updates 展开" hint, @你 count, skipped suffix, bullet cap).
+ * ("用 fetch_messages 展开" hint, @你 count, skipped suffix, bullet cap).
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -89,7 +89,7 @@ describe("renderDigestCard", () => {
     expect(text).toContain("> #12·decision·auth alice: use JWT rotation");
     expect(text).toContain("> #13·howto·db bob: index the cursor");
     expect(text).toContain("另有 1 条未能解密。");
-    expect(text).toContain("用 fetch_updates 展开详情");
+    expect(text).toContain("用 fetch_messages 展开详情");
     // No piggyback separator inside the body — the injection site adds it.
     expect(text.startsWith(CARD_SEPARATOR)).toBe(false);
   });
@@ -106,7 +106,7 @@ describe("renderDigestCard", () => {
     );
     expect(text).toContain("📬 协作通道紧急消息（@你）");
     expect(text).toContain("carol");
-    expect(text).toContain("用 fetch_updates 展开详情");
+    expect(text).toContain("用 fetch_messages 展开详情");
   });
 
   test(`caps bullets at ${MAX_BULLET_LINES} and marks truncation`, () => {

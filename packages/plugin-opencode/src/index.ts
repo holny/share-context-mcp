@@ -6,7 +6,7 @@
  * - urgent cards (@me) → session.synthetic(delivery: "steer") immediately
  * - digest cards → pending slot; the next tool result in that session
  *   carries the card appended to its output (piggyback), then pending clears
- * - anti-forget: a turn with write-ish actions but no share_update gets a
+ * - anti-forget: a turn with write-ish actions but no send_message gets a
  *   gentle reminder injected at the START of the next turn
  *   (session.execution.started → synthetic steer) — anchored there because
  *   turn N's tool hooks are all complete by the time turn N+1 starts, so
@@ -14,7 +14,7 @@
  *   judged (an idle-boundary reset CAN: idle events are delivered
  *   asynchronously and raced the next turn's hooks in testing)
  *
- * Module contract (opencode v2 loader, core/src/plugin/module.ts): the
+ * Module contract (opencode-compatible loader, core/src/plugin/module.ts): the
  * default export must be { id, setup }. The plugin imports NOTHING from the
  * host — the promise-plugin Context is matched structurally, so this file
  * stays loadable as a local path plugin with a self-contained import graph.
@@ -53,7 +53,7 @@ interface PluginContext {
 interface SessionState {
   /** Write-ish tool calls completed this turn (anti-forget counter). */
   actions: number;
-  /** Whether share_update ran this turn. */
+  /** Whether send_message ran this turn. */
   sharedThisTurn: boolean;
   /** Cards waiting to piggyback on the next tool result. */
   pending: DigestCard[];

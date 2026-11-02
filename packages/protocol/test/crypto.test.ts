@@ -1,5 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { deriveChannelKey, seal, open, hmacProof } from "../src/crypto";
+import {
+  encodeBlobEnvelope,
+  parseBlobEnvelope,
+  isBlobExpired,
+  deriveChannelKey,
+  seal,
+  open,
+  hmacProof,
+  mintAdmissionCredential,
+  parseAdmissionCredential,
+  mintInviteCode,
+  parseInviteCode,
+} from "../src/crypto";
 import { validateClaim, type ClaimMessage } from "../src/schema";
 
 function validInput() {
@@ -99,5 +111,152 @@ describe("hmacProof", () => {
       .update(Buffer.from(nonceB64, "base64"))
       .digest("base64");
     expect(hmacProof(key, nonceB64)).toBe(expected);
+  });
+});
+
+describe("self-contained credentials", () => {
+  const channelKey = deriveChannelKey("test-password", "testchannel01");
+
+  test("admission credential round trip unwraps the exact channel key", () => {
+    const { credential, verifyKeyB64 } = mintAdmissionCredential(channelKey);
+    expect(credential.startsWith("scmc1-")).toBe(true);
+    const unwrapped = parseAdmissionCredential(credential);
+    expect(Array.from(unwrapped)).toEqual(Array.from(channelKey));
+    expect(verifyKeyB64).not.toBeNull();
+  });
+
+  test("message key never derives from the credential text", () => {
+    const { credential } = mintAdmissionCredential(channelKey);
+    const wrong = deriveChannelKey(credential, "testchannel01");
+    expect(Array.from(wrong)).not.toEqual(Array.from(channelKey));
+  });
+
+  test("invite code round trip: code id, key, expiry", () => {
+    const codeId = "code-abc12345";
+    const { code, codeId: outId, expiresAt } = mintInviteCode(channelKey, codeId, 86_400_000);
+    expect(outId).toBe(codeId);
+    const parsed = parseInviteCode(code);
+    expect(parsed.codeId).toBe(codeId);
+    expect(Array.from(parsed.channelKey)).toEqual(Array.from(channelKey));
+    expect(Math.abs((parsed.expiresAt ?? 0) - expiresAt)).toBeLessThan(2000);
+  });
+
+  test("parse rejects tampered/truncated credentials", () => {
+    expect(() => parseAdmissionCredential("scmc1-garbage")).toThrow();
+    expect(() => parseInviteCode("scmc1-garbage")).toThrow();
+  });
+});
+
+describe("scmc2 blob envelope", () => {
+  const ALL_TYPES = ["join_password", "join_invite", "join_key", "key_update"] as const;
+  const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+
+  test("round trip preserves type, payload, expiresAt, maxUses for all four types", () => {
+    for (const [i, type] of ALL_TYPES.entries()) {
+      const exp = Date.now() + 7 * 86_400_000 + i;
+      const blob = encodeBlobEnvelope({
+        type,
+        payload: { channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 },
+        expiresAt: exp,
+        maxUses: i + 1,
+      });
+      expect(blob.startsWith("scmc2-")).toBe(true);
+      expect(blob).not.toMatch(/\s/);
+      const parsed = parseBlobEnvelope(blob);
+      expect(parsed.type).toBe(type);
+      expect(parsed.payload).toEqual({ channelId: `ch${i}`, password: "scmc1-aaaa-bbbb", keyVersion: i + 1 });
+      expect(parsed.expiresAt).toBe(exp);
+      expect(parsed.maxUses).toBe(i + 1);
+    }
+  });
+
+  test("optional fields round trip as absent", () => {
+    const blob = encodeBlobEnvelope({ type: "key_update", payload: { channelId: "ch", keyVersion: 2 } });
+    const parsed = parseBlobEnvelope(blob);
+    expect(parsed.type).toBe("key_update");
+    expect(parsed.payload).toEqual({ channelId: "ch", keyVersion: 2 });
+    expect(parsed.expiresAt).toBeUndefined();
+    expect(parsed.maxUses).toBeUndefined();
+  });
+
+  test("a single mutated character anywhere in the base32 body fails the parse", () => {
+    const blob = encodeBlobEnvelope({
+      type: "join_invite",
+      payload: { channelId: "invite0ch01", inviteCode: "scmc1-xxxx-yyyy", keyVersion: 1 },
+      expiresAt: Date.now() + 7 * 86_400_000,
+      maxUses: 1,
+    });
+    const body = blob.slice("scmc2-".length);
+    // five positions spanning the body: start, early, middle, late, end
+    const positions = [0, 7, Math.floor(body.length / 2), body.length - 9, body.length - 1];
+    for (const p of positions) {
+      const mutated = body[p];
+      const replacement = B32[(B32.indexOf(mutated) + 7) % B32.length];
+      const tampered = `scmc2-${body.slice(0, p)}${replacement}${body.slice(p + 1)}`;
+      expect(() => parseBlobEnvelope(tampered)).toThrow(/invalid blob:/);
+    }
+  });
+
+  test("isBlobExpired: past expiresAt → true; future → false; absent → false", () => {
+    const now = Date.now();
+    expect(isBlobExpired({ expiresAt: now - 1 }, now)).toBe(true);
+    expect(isBlobExpired({ expiresAt: now + 60_000 }, now)).toBe(false);
+    expect(isBlobExpired({}, now)).toBe(false);
+  });
+
+  test("non-canonical body (case flip / inserted dash) fails the parse — full any-character tamper wall", () => {
+    const blob = encodeBlobEnvelope({
+      type: "join_password",
+      payload: { channelId: "ch-canonical", password: "scmc1-aaaa-bbbb" },
+    });
+    const body = blob.slice("scmc2-".length);
+    // case flip: decoder is case-insensitive → only the canonical check catches it
+    const upper = body[3].toUpperCase();
+    if (upper !== body[3]) {
+      expect(() => parseBlobEnvelope(`scmc2-${body.slice(0, 3)}${upper}${body.slice(4)}`)).toThrow(
+        /invalid blob: body is not canonical base32/,
+      );
+    }
+    // inserted dash: decoder strips dashes → only the canonical check catches it
+    expect(() => parseBlobEnvelope(`scmc2-${body.slice(0, 5)}-${body.slice(5)}`)).toThrow(
+      /invalid blob: body is not canonical base32/,
+    );
+    // the pristine blob still parses
+    expect(parseBlobEnvelope(blob).type).toBe("join_password");
+  });
+
+  test("parse rejects an expired envelope (expiry enforced at the protocol chokepoint)", () => {
+    const blob = encodeBlobEnvelope({
+      type: "join_invite",
+      payload: { channelId: "ch-expired1", inviteCode: "scmc1-expired0" },
+      expiresAt: Date.now() - 1_000,
+      maxUses: 1,
+    });
+    expect(() => parseBlobEnvelope(blob)).toThrow(/invalid blob: envelope expired/);
+    // the same envelope with a future expiry parses fine
+    const fresh = encodeBlobEnvelope({
+      type: "join_invite",
+      payload: { channelId: "ch-expired1", inviteCode: "scmc1-expired0" },
+      expiresAt: Date.now() + 60_000,
+      maxUses: 1,
+    });
+    expect(parseBlobEnvelope(fresh).type).toBe("join_invite");
+  });
+
+  test("input longer than 8192 chars throws", () => {
+    // encode refuses to produce an over-long envelope
+    expect(() =>
+      encodeBlobEnvelope({ type: "join_password", payload: { channelId: "ch", password: "y".repeat(6000) } }),
+    ).toThrow(/invalid blob:/);
+    // parse rejects an over-long input before decoding anything
+    expect(() => parseBlobEnvelope(`scmc2-${"a".repeat(9000)}`)).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope(`scmc2-${"a".repeat(8186)}`)).not.toThrow(/size/);
+  });
+
+  test("non-scmc2 prefix and garbage input throw", () => {
+    expect(() => parseBlobEnvelope("scmc1-abcdefg")).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope("")).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope("scmc2-notbase32!!!")).toThrow(/invalid blob:/);
+    expect(() => parseBlobEnvelope("scmc2-" + Buffer.from("garbage").toString("base64"))).toThrow(/invalid blob:/);
   });
 });

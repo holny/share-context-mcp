@@ -7,6 +7,16 @@ export {
   seal,
   open,
   hmacProof,
+  mintAdmissionCredential,
+  parseAdmissionCredential,
+  mintInviteCode,
+  parseInviteCode,
+  encodeBlobEnvelope,
+  parseBlobEnvelope,
+  isBlobExpired,
+  BLOB_TYPES,
+  BLOB_MAX_CHARS,
+  type BlobTypes,
   type SealedEnvelope,
 } from "./crypto";
 export {

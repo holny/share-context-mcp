@@ -31,6 +31,8 @@ export interface WsHub {
   remove(channelId: string, ws: Socket): void;
   /** Push {type:"message", seq, epoch} to every socket of the channel. */
   notifyMessage(channelId: string, seq: number, epoch: number): void;
+  /** Governance frames (member-left, role-changed): names/ids only — blind-safe. */
+  notifyGovernance(channelId: string, frame: Record<string, unknown>): void;
   /**
    * Push {type:"epoch-invalidated", epoch} then close(1008) every socket of
    * the channel (rotate). `epoch` is the NEW epoch that invalidated them.
@@ -73,6 +75,13 @@ export function createWsHub(): WsHub {
       if (!s) return;
       const frame = JSON.stringify({ type: "message", seq, epoch });
       for (const ws of s) ws.send(frame);
+    },
+
+    notifyGovernance(channelId, frame) {
+      const s = channels.get(channelId);
+      if (!s) return;
+      const text = JSON.stringify({ governance: true, ...frame });
+      for (const ws of s) ws.send(text);
     },
 
     invalidateChannel(channelId, epoch) {

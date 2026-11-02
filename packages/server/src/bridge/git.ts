@@ -204,7 +204,7 @@ export class GitBridge implements ChannelBridge {
     const s = this.secret(channelId);
     this.syncHead(s);
     const base = join(this.workCopy(channelId), `channels/${channelId}/messages`);
-    if (!existsSync(base)) return { messages: [], skipped: 0 };
+    if (!existsSync(base)) return { messages: [], skipped: 0, encryptedCount: 0 };
     const out: ClaimMessage[] = [];
     let skipped = 0;
     // Read every epoch directory this member can decrypt (spec §5.5: old-key
@@ -227,7 +227,7 @@ export class GitBridge implements ChannelBridge {
       }
     }
     out.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    return { messages: out, skipped };
+    return { messages: out, skipped, encryptedCount: 0 };
   }
 
   /** After a raced push, find the seq our claim actually landed at (by idemKey file suffix). */
@@ -249,6 +249,9 @@ export class GitBridge implements ChannelBridge {
     const high = this.syncHead(s).nextSeq - 1;
     return { members, nextSeq: high + 1 };
   }
+
+  /** No-op: git has no presence endpoint (spec: activity inference is relay-backed in v1). */
+  async reportActivity(_channelId: string, _lastActiveAt: string): Promise<void> {}
 
   listen(channelId: string, onNotify: (seq: number) => void, tuning?: TransportTuning): BridgeListener {
     const interval = this.opts.pollIntervalMs ?? 15_000;
@@ -276,13 +279,23 @@ export class GitBridge implements ChannelBridge {
     ], `rotate to epoch ${s.epoch}`);
   }
 
-  async leave(channelId: string): Promise<void> {
+  async leave(channelId: string, _opts?: { transferTo?: string }): Promise<void> {
     this.secrets.delete(channelId);
     const t = this.timers.get(channelId);
     if (t) clearInterval(t);
     this.timers.delete(channelId);
     rmSync(this.workCopy(channelId), { recursive: true, force: true });
   }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async votes(_channelId: string): Promise<{ open: never[]; history: never[] }> {
+    return { open: [], history: [] };
+  }
+
+  /** No-op: governance is relay-tier (§governance). */
+  async castVote(_channelId: string, _voteId: string, _choice: "yes" | "no"): Promise<void> {}
+
+  readonly governance = false;
 }
 
 function deriveGroupedPassword(): string {

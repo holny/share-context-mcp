@@ -7,8 +7,8 @@
  * stdio, the exact path production MCP clients take.
  *
  * Lifecycle under test: create → out-of-band password handoff → join card →
- * share ×3 → fetch → topic catch_up → search → rotate (old token dies) →
- * re-join with the new password → keep fetching. Also asserts that neither
+ * share ×3 → fetch → filtered fetch_messages → keep fetching (governance
+ * ops moved to the CLI tier). Also asserts that neither
  * server process ever logs a plaintext password to stderr — an assertion made
  * meaningful by a negative-path child (missing relay URL) that provably bails
  * through the same stderr capture.
@@ -98,18 +98,19 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
   }
 
   test(
-    "create → join → share ×3 → fetch → catch_up → search → rotate → 401 → re-join → fetch",
+    "create → join → send ×3 → fetch → filtered fetch_messages → fetch round trip",
     async () => {
       const a = await spawnAgent("a");
       const b = await spawnAgent("b");
 
       // ---- A creates the channel; the password leaves via the test (out of band) ----
       const created = textOf(
-        await a.client.callTool({ name: "create_channel", arguments: { memberName: "alice", name: "e2e" } }),
+        await a.client.callTool({ name: "create_channel",
+      arguments: { memberName: "alice", name: "e2e" } }),
       );
-      expect(created).toContain("channel created");
-      const channelId = created.match(/channel_id=([a-z0-9]+)/)![1];
-      const password = created.match(/password=([a-z0-9-]+)/)![1];
+      expect(JSON.parse(created).ok).toBe(true);
+      const channelId = JSON.parse(created).channel_id;
+      const password = JSON.parse(created).password;
       expect(channelId).toMatch(/^[a-z0-9]{12}$/);
       expect(password).toMatch(/^[a-z0-9]{4}(-[a-z0-9]{4}){4}$/);
 
@@ -117,7 +118,7 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       const joined = textOf(
         await b.client.callTool({
           name: "join_channel",
-          arguments: { channelId, password, memberName: "bob" },
+      arguments: { channel_id: channelId, password, member_name: "bob" },
         }),
       );
       expect(joined.startsWith(QUOTE_HEADER)).toBe(true);
@@ -146,14 +147,14 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       ];
       const seqs: number[] = [];
       for (const s of shared) {
-        const res = await a.client.callTool({ name: "share_update", arguments: { ...s } });
+        const res = await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, ...s} });
         expect(isError(res)).toBe(false);
         seqs.push((JSON.parse(textOf(res)) as { seq: number }).seq);
       }
 
       // ---- B fetches and gets all three, wrapped in the reference block ----
       const fetched = JSON.parse(
-        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: {} }))),
+        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } }))),
       ) as {
         messages: Array<{ seq: number; statement: string; kind: string; topic: string }>;
         skipped: number;
@@ -164,77 +165,33 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       expect(fetched.messages.map((m) => m.topic)).toEqual(["auth", "db", "export"]);
       expect(fetched.skipped).toBe(0);
 
-      // ---- B catch_up filtered by topic ----
+      // ---- B fetch_messages filtered by topic ----
       const byTopic = JSON.parse(
-        unwrapQuote(textOf(await b.client.callTool({ name: "catch_up", arguments: { topic: "db" } }))),
-      ) as { messages: Array<{ topic: string; statement: string }>; count: number };
-      expect(byTopic.count).toBe(1);
+        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId, topic: "db"} }))),
+      ) as { messages: Array<{ topic: string; statement: string }> };
+      expect(byTopic.messages).toHaveLength(1);
       expect(byTopic.messages[0].topic).toBe("db");
       expect(byTopic.messages[0].statement).toContain("WAL");
 
       // ---- B search: `a&b,c` = (a AND b) OR c ----
       const hits = JSON.parse(
         unwrapQuote(
-          textOf(await b.client.callTool({ name: "search_messages", arguments: { query: "cookies&httpOnly, wal" } })),
+          textOf(await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId, query: "cookies&httpOnly, wal"} })),
         ),
-      ) as { messages: Array<{ topic: string }>; count: number };
-      expect(hits.count).toBe(2);
+      ) as { messages: Array<{ topic: string }> };
+      expect(hits.messages).toHaveLength(2);
       expect(hits.messages.map((m) => m.topic).sort()).toEqual(["auth", "db"]);
 
-      // ---- A rotates: the old password/epoch dies, A auto-rejoins ----
-      const rotated = textOf(await a.client.callTool({ name: "rotate_password", arguments: {} }));
-      expect(rotated).toContain("epoch 2");
-      const newPassword = rotated.match(/password=([a-z0-9-]+)/)![1];
-      expect(newPassword).toMatch(/^[a-z0-9]{4}(-[a-z0-9]{4}){4}$/);
-      expect(newPassword).not.toBe(password);
-
-      // ---- B's old session token is dead: fetch now fails unauthorized ----
-      const stale = await b.client.callTool({ name: "fetch_updates", arguments: {} });
-      expect(isError(stale)).toBe(true);
-      expect(textOf(stale)).toContain("unauthorized");
-
-      // ---- A (auto re-joined) can still share into epoch 2 ----
-      const postRotate = await a.client.callTool({
-        name: "share_update",
-        arguments: {
-          statement: "epoch 2 begins: old password is dead, everyone joins with the new one",
-          kind: "progress",
-          topic: "meta",
-        },
-      });
-      expect(isError(postRotate)).toBe(false);
-
-      // ---- B re-joins with the NEW password and keeps fetching ----
-      const rejoined = await b.client.callTool({
-        name: "join_channel",
-        arguments: { channelId, password: newPassword, memberName: "bob" },
-      });
-      expect(isError(rejoined)).toBe(false);
-      const rejoinedCard = textOf(rejoined);
-      expect(rejoinedCard.startsWith(QUOTE_HEADER)).toBe(true);
-      expect(rejoinedCard).toContain("bob");
-
-      // the join window already delivered the epoch-2 message; a share from A
-      // after the rejoin must flow to B through a plain fetch (epoch-2 key)
-      const second = await a.client.callTool({
-        name: "share_update",
-        arguments: {
-          statement: "back in business: epoch 2 delivery works end to end",
-          kind: "progress",
-          topic: "meta",
-        },
-      });
-      expect(isError(second)).toBe(false);
-      const resumed = JSON.parse(
-        unwrapQuote(textOf(await b.client.callTool({ name: "fetch_updates", arguments: {} }))),
-      ) as { messages: Array<{ statement: string }>; skipped: number };
-      expect(resumed.messages.some((m) => m.statement.startsWith("back in business"))).toBe(true);
+      // ---- rotate moved to CLI (breaking, governance iteration) — covered
+      // by relay-level tests + CLI tests; here we verify B's session survives
+      // a plain fetch round trip instead ----
+      const still = await b.client.callTool({ name: "fetch_messages", arguments: { channel_id: channelId } });
+      expect(isError(still)).toBe(false);
 
       // ---- security: no plaintext password in either server's stderr ----
       // (meaningful only because the test below proves the capture is live)
       for (const p of procs) {
         expect(p.stderr).not.toContain(password);
-        expect(p.stderr).not.toContain(newPassword);
       }
     },
     60_000,
@@ -273,5 +230,107 @@ describe("e2e: two server processes, one relay, full channel lifecycle", () => {
       rmSync(dir, { recursive: true, force: true });
     },
     30_000,
+  );
+});
+
+describe("e2e: retention + digest + consumer identity (Task 8)", () => {
+  let relay: RelayHandle;
+  let baseUrl: string;
+  const procs: Proc[] = [];
+  let prevThreshold: string | undefined;
+
+  beforeAll(async () => {
+    relay = await startRelay({ port: 0, maxMessages: 3 });
+    baseUrl = `http://127.0.0.1:${relay.port}`;
+    prevThreshold = process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = "3";
+  });
+
+  afterAll(async () => {
+    if (prevThreshold === undefined) delete process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS;
+    else process.env.SHARE_CONTEXT_DIGEST_MIN_MSGS = prevThreshold;
+    for (const p of procs) {
+      await p.client.close().catch(() => {});
+      rmSync(p.dir, { recursive: true, force: true });
+    }
+    await relay.stop();
+  });
+
+  async function spawnAgent(label: string): Promise<Proc> {
+    const dir = mkdtempSync(join(tmpdir(), `scm-t8-${label}-`));
+    const transport = new StdioClientTransport({
+      command: "bun",
+      args: ["run", ENTRY_PATH],
+      env: {
+        ...process.env,
+        SHARE_CONTEXT_RELAY_URL: baseUrl,
+        SHARE_CONTEXT_DB_PATH: join(dir, "state.db"),
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: `t8-${label}`, version: "0.0.0" });
+    await client.connect(transport);
+    const proc: Proc = { client, dir, stderr: "" };
+    procs.push(proc);
+    return proc;
+  }
+
+  test(
+    "two sessions in one server consume independently; eviction → digest in B's fetch",
+    async () => {
+      const a = await spawnAgent("a");
+      const b = await spawnAgent("b");
+
+      const created = textOf(
+        await a.client.callTool({ name: "create_channel",
+      arguments: { memberName: "alice" } }),
+      );
+      const channelId = JSON.parse(created).channel_id;
+      const password = JSON.parse(created).password;
+
+      await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "decided: e2e digest flow", kind: "decision", topic: "digest"} });
+      await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "progress on topic one", kind: "progress", topic: "topic-one"} });
+      await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: "progress on topic two", kind: "progress", topic: "topic-two"} });
+
+      // B joins → full history cached + index card rollup
+      const joined = textOf(
+        await b.client.callTool({ name: "join_channel",
+      arguments: { channel_id: channelId, password, member_name: "bob" } }),
+      );
+      const card = JSON.parse(unwrapQuote(joined)) as {
+        topics: Array<{ topic: string; count: number }>;
+      };
+      expect(card.topics.find((t) => t.topic === "digest")?.count).toBe(1);
+      expect(card.topics.find((t) => t.topic === "topic-one")?.count).toBe(1);
+
+      // two sessionIDs sharing B's single server process — independent consumers
+      const call = (name: string, args: Record<string, unknown>, sid?: string) =>
+        b.client.callTool({
+          name,
+          arguments: args,
+          ...(sid === undefined ? {} : { _meta: { "ai.opencode/sessionID": sid } }),
+        });
+      const f1 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111")))) as { messages: unknown[] };
+      expect(f1.messages.length).toBe(3);
+      const f2 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId }, "ses_bbbb2222")))) as { messages: unknown[] };
+      expect(f2.messages.length).toBe(3);
+      const f1b = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111")))) as { messages: unknown[] };
+      expect(f1b.messages.length).toBe(0);
+
+      // A sends 3 more → relay evicts seq 1 (minSeq 2..4 across sends); B's
+      // evicted-but-cached range reaches the env-tuned watermark (3)
+      for (let i = 1; i <= 3; i++) {
+        await a.client.callTool({ name: "send_message", arguments: { channel_id: channelId, statement: `chatter ${i}`, kind: "progress", topic: "chatter" } });
+      }
+      await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111"); // gap advances; digest posted
+      await call("fetch_messages", { channel_id: channelId }, "ses_aaaa1111"); // digest lands in B's cache
+      const store = b.client; // digest assertion via B's own search through a third session
+      const f3 = JSON.parse(unwrapQuote(textOf(await call("fetch_messages", { channel_id: channelId, query: "digest", kind: "digest" }, "ses_aaaa1111")))) as {
+        messages: Array<{ statement: string; scope?: Record<string, string> }>;
+      };
+      expect(f3.messages.length).toBeGreaterThanOrEqual(1);
+      expect(f3.messages.some((m) => m.statement.includes("decided: e2e digest flow"))).toBe(true);
+    },
+    60_000,
   );
 });

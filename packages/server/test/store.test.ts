@@ -172,6 +172,55 @@ describe("Store", () => {
     store.close();
   });
 
+  test("searchCache ranks BM25 relevance: denser match first, newest-first only as tiebreak", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [
+      // seq 1: sparse match — must NOT outrank seq 2 even though its rowid is lower
+      mkMsg(1, "a long rambling status note about many unrelated things, mentioning token and also refresh somewhere in the middle of it all"),
+      // seq 2 (newer, HIGHER rowid): dense match (short statement, both terms) — BM25 must rank it first
+      mkMsg(2, "token refresh flow now uses a sliding window"),
+    ]);
+    const hits = store.searchCache(ch, "token&refresh");
+    expect(hits.map((m) => m.seq)).toEqual([2, 1]);
+    store.close();
+  });
+
+  test("searchCache FTS path does not match topic/kind columns (parity with LIKE)", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [
+      mkMsg(1, "plain content", { kind: "decision" as ClaimKind, topic: "decision" }),
+    ]);
+    // "decision" is a kind and a topic — neither is searchable content
+    expect(store.searchCache(ch, "decision")).toEqual([]);
+    store.close();
+  });
+
+  test("searchCache survives FTS5 metacharacters in query terms", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [mkMsg(1, "plain statement")]);
+    expect(() => store.searchCache(ch, 'a"b OR (')).not.toThrow();
+    expect(store.searchCache(ch, 'a"b OR (')).toEqual([]);
+    expect(() => store.searchCache(ch, 'foo&bar,baz')).not.toThrow();
+    store.close();
+  });
+
+  test("searchCache sees upserted text, not the stale original", () => {
+    const store = new Store(join(dir, "state.db"));
+    const ch = "chabcdefgh12";
+    store.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    store.cacheMessages(ch, [mkMsg(1, "original wording")]);
+    store.cacheMessages(ch, [mkMsg(1, "edited wording")]);
+    expect(store.searchCache(ch, "edited").map((m) => m.seq)).toEqual([1]);
+    expect(store.searchCache(ch, "original")).toEqual([]);
+    store.close();
+  });
+
   test("searchCache implements `a&b,c&d` = (a AND b) OR (c AND d), case-insensitive", () => {
     const store = new Store(join(dir, "state.db"));
     const ch = "chabcdefgh12";
@@ -183,9 +232,10 @@ describe("Store", () => {
       mkMsg(4, "FOO and BAR mixed"),
     ]);
 
-    // (foo AND bar) OR (baz) → m1, m4, m2, m3 — newest first
+    // (foo AND bar) OR (baz) → m1, m4, m2, m3. Pure-FTS query → BM25 rank order
+    // (relevance first); assert membership, order is pinned by the BM25 test.
     const hits = store.searchCache(ch, "foo&bar,baz");
-    expect(hits.map((m) => m.seq)).toEqual([4, 3, 2, 1]);
+    expect([...hits.map((m) => m.seq)].sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([1, 2, 3, 4]);
 
     // (foo AND baz) → no message has both → empty
     expect(store.searchCache(ch, "foo&baz")).toEqual([]);
@@ -194,7 +244,7 @@ describe("Store", () => {
     expect(store.searchCache(ch, "qux,missingword").map((m) => m.seq)).toEqual([2]);
 
     // AND within a group: foo&bar → m1, m4 (both contain both terms)
-    expect(store.searchCache(ch, "foo&bar").map((m) => m.seq)).toEqual([4, 1]);
+    expect([...store.searchCache(ch, "foo&bar").map((m) => m.seq)].sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([1, 4]);
     store.close();
   });
 
@@ -224,5 +274,21 @@ describe("Store", () => {
     store.recordCursorFromMessages(ch, [mkMsg(2, "b")]);
     expect(store.getCursor(ch)).toBe(3);
     store.close();
+  });
+
+  test("reopening an existing DB backfills an empty FTS index (pre-upgrade stores)", () => {
+    const path = join(dir, "backfill.db");
+    const s1 = new Store(path);
+    const ch = "chabcdefgh12";
+    s1.upsertChannel({ channelId: ch, password: "p", memberName: "a", epoch: 1 });
+    s1.cacheMessages(ch, [mkMsg(1, "legacy searchable content")]);
+    // simulate a pre-upgrade store: rows cached before the FTS index existed
+    (s1 as unknown as { db: { prepare: (sql: string) => { run: () => void } } }).db
+      .prepare("DELETE FROM messages_fts")
+      .run();
+    s1.close();
+    const s2 = new Store(path);
+    expect(s2.searchCache(ch, "legacy searchable").map((m) => m.seq)).toEqual([1]);
+    s2.close();
   });
 });

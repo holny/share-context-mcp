@@ -190,7 +190,40 @@ export class Store {
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS consumer_channels (
+        consumer_id TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        joined_at   TEXT NOT NULL,
+        PRIMARY KEY(consumer_id, channel_id)
+      );
+      CREATE TABLE IF NOT EXISTS message_keys (
+        channel_id  TEXT NOT NULL,
+        key_version INTEGER NOT NULL,
+        key_enc     TEXT NOT NULL,
+        PRIMARY KEY(channel_id, key_version)
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        statement, detail, topic, kind, scope,
+        tokenize = 'trigram'
+      );
     `);
+    // Encrypted toggle (governance v2 §11): per-channel state columns
+    // (older stores get them via ALTER).
+    try { this.db.exec("ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { this.db.exec("ALTER TABLE channels ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
+    // One-time backfill for stores created before the FTS index existed:
+    // rows cached pre-upgrade would otherwise be invisible to >=3-char
+    // searches forever. Runs only when the index is empty while the cache
+    // is not — a populated index means nothing to do.
+    const ftsEmpty = this.db.prepare("SELECT NOT EXISTS (SELECT 1 FROM messages_fts) AS e").get() as { e: number };
+    const hasRows = this.db.prepare("SELECT EXISTS (SELECT 1 FROM messages) AS h").get() as { h: number };
+    if (ftsEmpty.e && hasRows.h) {
+      this.db.exec(`
+        INSERT INTO messages_fts(rowid, statement, detail, topic, kind, scope)
+        SELECT rowid, statement, coalesce(detail, ''), topic, kind, coalesce(scope_json, '')
+        FROM messages
+      `);
+    }
   }
 
   // ---- channels ----
@@ -283,6 +316,75 @@ export class Store {
     return rows.map((r) => r.channel_id);
   }
 
+  // ---- message keyring (encrypted toggle, governance v2 §11) ----
+  //
+  // {channelId → {keyVersion → key}} in memory; entries are persisted
+  // GCM-sealed under the machine key so a restarted server keeps decrypting
+  // old-version rows. Keys are NEVER derived from the admission credential —
+  // they travel out-of-band (credential wrap / manager handoff).
+
+  private readonly keyring = new Map<string, Map<number, Uint8Array>>();
+
+  /** Channel encryption state: {encrypted, keyVersion}. Defaults off/0. */
+  encryptionState(channelId: string): { encrypted: boolean; keyVersion: number } {
+    const row = this.db.prepare("SELECT encrypted, key_version FROM channels WHERE channel_id = ?").get(channelId) as
+      | { encrypted: number; key_version: number }
+      | undefined;
+    return { encrypted: (row?.encrypted ?? 0) === 1, keyVersion: row?.key_version ?? 0 };
+  }
+
+  /** Record the relay-reported toggle state (post set-encryption / join meta). */
+  setEncryptionState(channelId: string, encrypted: boolean, keyVersion: number): void {
+    this.db
+      .prepare("UPDATE channels SET encrypted = ?, key_version = ? WHERE channel_id = ?")
+      .run(encrypted ? 1 : 0, keyVersion, channelId);
+  }
+
+  /** Store a message key under its version (memory + GCM-sealed at rest). */
+  setMessageKey(channelId: string, keyVersion: number, key: Uint8Array): void {
+    if (key.length !== 32) throw new Error("message key must be 32 bytes");
+    let perChannel = this.keyring.get(channelId);
+    if (!perChannel) {
+      perChannel = new Map();
+      this.keyring.set(channelId, perChannel);
+    }
+    perChannel.set(keyVersion, key);
+    this.db
+      .prepare(
+        "INSERT INTO message_keys(channel_id, key_version, key_enc) VALUES (?, ?, ?) " +
+          "ON CONFLICT(channel_id, key_version) DO UPDATE SET key_enc = excluded.key_enc",
+      )
+      .run(channelId, keyVersion, encryptSecret(this.machineKey, Buffer.from(key).toString("base64")));
+  }
+
+  /** Drop one locally-held message key (tests / owner re-mint scenarios). */
+  forgetMessageKey(channelId: string, keyVersion: number): void {
+    this.keyring.get(channelId)?.delete(keyVersion);
+    this.db.prepare("DELETE FROM message_keys WHERE channel_id = ? AND key_version = ?").run(channelId, keyVersion);
+  }
+
+  /** The key for a version, or null when this member does not hold it. */
+  messageKey(channelId: string, keyVersion: number): Uint8Array | null {
+    const cached = this.keyring.get(channelId)?.get(keyVersion);
+    if (cached) return cached;
+    const row = this.db
+      .prepare("SELECT key_enc FROM message_keys WHERE channel_id = ? AND key_version = ?")
+      .get(channelId, keyVersion) as { key_enc: string } | undefined;
+    if (!row) return null;
+    try {
+      const key = new Uint8Array(Buffer.from(decryptSecret(this.machineKey, row.key_enc), "base64"));
+      let perChannel = this.keyring.get(channelId);
+      if (!perChannel) {
+        perChannel = new Map();
+        this.keyring.set(channelId, perChannel);
+      }
+      perChannel.set(keyVersion, key);
+      return key;
+    } catch {
+      return null; // undecryptable residue — treat as not held
+    }
+  }
+
   /** Rejoin candidates: channels with a stored (encrypted) password. */
   rejoinable(): string[] {
     const rows = this.db.prepare("SELECT channel_id FROM channels WHERE password_enc IS NOT NULL ORDER BY joined_at ASC").all() as Array<{
@@ -293,9 +395,19 @@ export class Store {
 
   /** Forget a channel locally (relay-side membership record is untouched in v1). */
   removeChannel(channelId: string): void {
-    this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(channelId);
-    this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(channelId);
-    this.db.prepare("DELETE FROM messages WHERE channel_id = ?").run(channelId);
+    const tx = this.db.transaction((ch: string) => {
+      this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(ch);
+      this.db.prepare("DELETE FROM epoch_keys WHERE channel_id = ?").run(ch);
+      this.db.prepare("DELETE FROM consumer_channels WHERE channel_id = ?").run(ch);
+      this.db.prepare("DELETE FROM message_keys WHERE channel_id = ?").run(ch);
+      // FTS mirror cleanup: orphan rows are otherwise only reclaimed lazily
+      // when a later insert happens to reuse their rowid.
+      this.db
+        .prepare("DELETE FROM messages_fts WHERE rowid IN (SELECT rowid FROM messages WHERE channel_id = ?)")
+        .run(ch);
+      this.db.prepare("DELETE FROM messages WHERE channel_id = ?").run(ch);
+    });
+    tx(channelId);
   }
 
   // ---- cursor (spec §5.7) ----
@@ -343,6 +455,12 @@ export class Store {
          provenance_json = excluded.provenance_json`,
     );
     const insertAll = this.db.transaction((rows: ReadonlyArray<Omit<ClaimMessage, "idempotencyKey">>) => {
+      // Hoisted once per batch — bun:sqlite compiles on prepare.
+      const ftsRowid = this.db.prepare(`SELECT rowid FROM messages WHERE channel_id = ? AND seq = ?`);
+      const ftsDelete = this.db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`);
+      const ftsInsert = this.db.prepare(
+        `INSERT INTO messages_fts(rowid, statement, detail, topic, kind, scope) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
       for (const m of rows) {
         stmt.run(
           channelId,
@@ -356,6 +474,11 @@ export class Store {
           m.to ?? null,
           JSON.stringify(m.provenance),
         );
+        // Mirror into the FTS5 index (trigram): replace any previous text for
+        // this (channel_id, seq) so search sees upserted content, not stale.
+        const row = ftsRowid.get(channelId, m.seq) as { rowid: number };
+        ftsDelete.run(row.rowid);
+        ftsInsert.run(row.rowid, m.statement, m.detail ?? "", m.topic, m.kind, m.scope ? JSON.stringify(m.scope) : "");
       }
     });
     insertAll(msgs);
@@ -363,9 +486,12 @@ export class Store {
 
   /**
    * Keyword search over the decrypted cache: `a&b,c&d` = (a AND b) OR (c AND d);
-   * case-insensitive substring match over statement+detail. Empty/blank query
-   * returns the whole cache. Returns reconstructed ClaimMessages, newest first.
-   * Note: `%`/`_` inside terms act as LIKE wildcards (accepted in v1).
+   * case-insensitive. Hybrid engine: terms of ≥3 chars go through the FTS5
+   * trigram index (BM25 relevance ranking, CJK substring matching); shorter
+   * terms fall back to LIKE over statement+detail (trigram needs 3 chars).
+   * A query made purely of ≥3-char terms orders by BM25 rank; any LIKE
+   * involvement falls back to newest-first. Empty/blank query returns the
+   * whole cache. Returns reconstructed ClaimMessages.
    */
   searchCache(channelId: string, query: string): ClaimMessage[] {
     const groups = query
@@ -373,21 +499,62 @@ export class Store {
       .map((g) => g.split("&").map((t) => t.trim()).filter((t) => t.length > 0))
       .filter((g) => g.length > 0);
 
-    let where = "";
+    const conds: string[] = [];
     const params: string[] = [];
-    if (groups.length > 0) {
-      const match = `lower(coalesce(statement, '') || ' ' || coalesce(detail, '')) LIKE ?`;
-      where = ` AND (${groups.map((g) => `(${g.map(() => match).join(" AND ")})`).join(" OR ")})`;
-      for (const g of groups) {
-        for (const term of g) params.push(`%${term.toLowerCase()}%`);
+    let hasFts = false;
+    let hasLike = false;
+    const ftsGroups: string[] = [];
+    for (const g of groups) {
+      const parts: string[] = [];
+      const ftsParts: string[] = [];
+      for (const term of g) {
+        const quoted = `"${term.replace(/"/g, '""')}"`;
+        if (term.length >= 3) {
+          hasFts = true;
+          // Column-restricted MATCH: parity with the LIKE path, which scans
+          // statement+detail only. topic/kind/scope have dedicated exact
+          // filters (catch_up) and must not leak into content search.
+          ftsParts.push(quoted);
+          parts.push(`m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)`);
+          params.push(`{statement detail}: ${quoted}`);
+        } else {
+          hasLike = true;
+          parts.push(`lower(coalesce(statement, '') || ' ' || coalesce(detail, '')) LIKE ?`);
+          params.push(`%${term.toLowerCase()}%`);
+        }
       }
+      conds.push(`(${parts.join(" AND ")})`);
+      // FTS5 allows exactly one MATCH constraint per table per query, so the
+      // OR-of-groups structure lives INSIDE a single MATCH expression, with
+      // the column filter repeated per group.
+      ftsGroups.push(`{statement detail}: (${ftsParts.join(" AND ")})`);
     }
-    const rows = this.db
-      .prepare(
-        `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
-         FROM messages WHERE channel_id = ?${where} ORDER BY seq DESC`,
-      )
-      .all(channelId, ...params) as MessageRow[];
+    const where = conds.length > 0 ? ` AND (${conds.join(" OR ")})` : "";
+    // Pure-FTS queries rank by relevance; anything touching LIKE keeps the
+    // stable newest-first order (BM25 scores are not comparable to LIKE hits).
+    // Two FTS5 quirks pinned by probes: rank is only populated when the MATCH
+    // targets the scanned FTS table in the same query (a rowid IN (subquery)
+    // filter leaves it NULL), and in a JOIN the MATCH/ORDER BY must reference
+    // the real table name — an alias raises "no such column".
+    let rows: MessageRow[];
+    if (hasFts && !hasLike) {
+      rows = this.db
+        .prepare(
+          `SELECT m.seq, m.ts, m.statement, m.detail, m.kind, m.scope_json, m.topic, m."to" AS to_member, m.provenance_json
+           FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
+           WHERE m.channel_id = ? AND messages_fts MATCH ?
+           ORDER BY messages_fts.rank`,
+        )
+        .all(channelId, ftsGroups.join(" OR ")) as MessageRow[];
+    } else {
+      rows = this.db
+        .prepare(
+          `SELECT seq, ts, statement, detail, kind, scope_json, topic, "to" AS to_member, provenance_json
+           FROM messages WHERE channel_id = ?${where}
+           ORDER BY seq DESC`,
+        )
+        .all(channelId, ...params) as MessageRow[];
+    }
     return rows.map(rowToClaim);
   }
 
@@ -443,8 +610,24 @@ export class Store {
       .run(key, encryptSecret(this.machineKey, plaintext));
   }
 
-  getKv(key: string): string | null {
-    const row = this.db.prepare("SELECT value FROM kvs WHERE key = ?").get(key) as { value: string } | undefined;
+  /** Per-session channel ledger (§6 multi-channel): a consumer's joined channels. */
+  recordConsumerChannel(consumerId: string, channelId: string): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO consumer_channels(consumer_id, channel_id, joined_at) VALUES (?, ?, ?)")
+      .run(consumerId, channelId, new Date().toISOString());
+  }
+
+  listConsumerChannels(consumerId: string): Array<{ channelId: string; joinedAt: string }> {
+    return this.db
+      .prepare("SELECT channel_id AS channelId, joined_at FROM consumer_channels WHERE consumer_id = ? ORDER BY joined_at ASC")
+      .all(consumerId) as Array<{ channelId: string; joinedAt: string }>;
+  }
+
+  removeConsumerChannel(consumerId: string, channelId: string): void {
+    this.db.prepare("DELETE FROM consumer_channels WHERE consumer_id = ? AND channel_id = ?").run(consumerId, channelId);
+  }
+
+  getKv(key: string): string | null {    const row = this.db.prepare("SELECT value FROM kvs WHERE key = ?").get(key) as { value: string } | undefined;
     return row?.value ?? null;
   }
 

@@ -8,6 +8,7 @@
   "dependencies": {
     "@share-context-mcp/relay": "workspace:*",
     "@share-context-mcp/server": "workspace:*",
-    "@share-context-mcp/console": "workspace:*"
+    "@share-context-mcp/console": "workspace:*",
+    "@share-context-mcp/protocol": "workspace:*"
   }
 }

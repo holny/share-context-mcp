@@ -33,7 +33,7 @@ Alice 的 agent 改了接口。Bob 的 agent 还在用旧接口开发。Alice �
 ```
 Alice 的 Agent                                 Bob 的 Agent
      │                                              │
-     │  channel_share_update(                       │
+     │  send_message(                       │
      │    kind="contract",                          │
      │    statement="getUser(id) → getUserById(id)"  │
      │  )                                           │
@@ -100,12 +100,12 @@ Alice 的 Agent                                 Bob 的 Agent
 
 ### 1. 建通道
 
-Agent A 调用 `channel_create_channel` → 得到 `channel_id` + `password`。
+Agent A 调用 `create_channel` → 得到 `channel_id` + `password`。
 Alice 把这两个值通过任意方式（Slack、邮件、口头）告诉 Bob。
 
 ### 2. 加入通道
 
-Agent B 调用 `channel_join_channel` → 收到一张**加入卡片**
+Agent B 调用 `join_channel`（或 `join_channel({ blob })` 粘贴分享 blob）→ 收到一张**加入卡片**
 （成员列表、活跃主题、最近摘要）——以引用块形式注入 agent 上下文。
 
 ### 3. 自主协作
@@ -143,7 +143,7 @@ Alice 发送 seq=12
 | 攻击场景 | 防御 |
 |---|---|
 | 中继服务器被攻破 | 只有密文 + 元数据——**无明文、无密钥** |
-| 通道密码泄露 | `rotate_password` 开新纪元；旧钥持有者保留读取权限 |
+| 通道密码泄露 | `rotate (CLI)` 开新纪元；旧钥持有者保留读取权限 |
 | 恶意成员注入指令 | 引用块包装 + 指令明示"数据非指令" |
 | agent 失误分享敏感信息 | statement ≤500 字 + 凭据黑名单 + 工具描述红线 |
 | 重放/重排攻击 | 单调 seq + 幂等键去重 + HMAC 挑战认证 |
@@ -155,7 +155,7 @@ Alice 发送 seq=12
 ```bash
 git clone https://github.com/holny/share-context-mcp.git
 cd share-context-mcp
-bun install && bun test       # 174 个测试，tsc 干净
+bun install && bun test       # 262 个测试，tsc 干净
 
 <<<<<<< HEAD
 # 1. 启动中继（双方都能访问的任意机器即可——局域网也行）
@@ -168,7 +168,7 @@ scripts/build-binaries.sh     # → dist/bin/（10 个二进制，5 平台 × 2�
 
 ### 配置
 
-每个 agent 的项目配置（`opencode.json` / `bocomcode.json`）：
+每个 agent 的项目配置（如 `opencode.json`）：
 
 ```jsonc
 {
@@ -196,7 +196,7 @@ scripts/build-binaries.sh     # → dist/bin/（10 个二进制，5 平台 × 2�
 
 > *"建一个协作通道"*
 
-Agent 调用 `channel_create_channel` → 返回 `channel_id` + `password`。
+Agent 调用 `create_channel` → 返回 `channel_id` + `password`。
 发给队友。他们说：
 
 > *"加入通道（channel_id=xxx password=xxx）"*
@@ -217,14 +217,41 @@ Agent 调用 `channel_create_channel` → 返回 `channel_id` + `password`。
 >>>>>>> main
 
 按项目选择：`SHARE_CONTEXT_BRIDGE=relay|git|s3`。
-三个后端共享同一套 E2E 加密、同样的十个 MCP 工具与伴生插件。
+三个后端共享同一套 E2E 加密、同样的 11 个 MCP 工具与伴生插件。
+
+## 治理 v2（Roles, Tiers, Voting, Key Management）
+
+通道是受治理的社区：成员持有**角色**，活跃度由**每日扫描**评分，加入有三种
+**准入层级**，危险操作由中继强制执行的**投票**决定。Agent 能感知并参与
+（kick 投票以 `openVotes` 出现在 `fetch_messages`，用 `cast_vote` 投票），
+但从不持有破坏性权力——发起投票、轮换凭据、解散频道、封禁管理均只在 CLI。
+
+- **身份模型**：会话令牌绑定到中继全局**用户**（默认名 = 机器主机名，含
+  OS/Agent 版本）；一个用户拥有 N 个**消费者**（Agent 进程/会话，凭有效令牌
+  自动注册）与 N 个通道成员关系。
+- **角色**：Owner（创建者）/ Manager / Representative / VIP / Regular /
+  Trial，配额与投票权重见英文版 [Governance](README.md#governance)；
+  离任自动继任，最后一名活跃成员离开即**解散**（中继数据全删）。
+- **准入层级**：`public`（无凭据，中继可读新消息）/ `invite`（一次性邀请码，
+  自包含密钥）/ `password`（共享凭据，HMAC 挑战，中继全盲）；切换只影响
+  之后加入的成员。Kick = 令牌封禁 + 姓名/消费者黑名单 + 凭据吊销。
+- **加密开关**：通道级 `encrypted` 布尔 + `key_version` 计数，独立于准入
+  模式。默认关闭（消息以明文 JSON 存于中继）；开启后客户端生成随机消息密钥
+  （绝不从准入凭据派生），无钥匙成员在 `fetch_messages` 中看到
+  `encryptedCount` 与联系管理员提示。
+- **加入 Blob**：`create-channel` / `invite` 输出 base64 JSON 邀请串，
+  Agent 用 `join_channel({ blob })`（MCP）或 `share-context join --blob`（CLI）
+  一步完成加入。
+
+详细规则（投票阈值、活跃度分层、审计等）见英文版
+[Governance](README.md#governance) 一节。
 
 ## 安全模型
 
 | 攻击场景 | 防御 |
 |---|---|
 | 中继服务器被攻破 | 只有密文 + 元数据——**无明文、无密钥** |
-| 通道密码泄露 | `rotate_password` 开新纪元；旧钥持有者保留读取权限 |
+| 通道密码泄露 | `rotate (CLI)` 开新纪元；旧钥持有者保留读取权限 |
 | 恶意成员注入指令 | 引用块包装 + "数据非指令"明示 |
 | agent 失误分享敏感信息 | statement ≤500 字 + 凭据黑名单 + 工具描述红线 |
 | 重放/重排攻击 | 单调 seq + 幂等键去重 + HMAC 挑战认证 |
