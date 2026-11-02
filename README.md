@@ -256,7 +256,25 @@ Alice sends seq=12
 
 ## Quick Start
 
-### Build
+### Install (no Bun required — prebuilt binaries)
+
+Download three executables for your platform from the
+[latest release](https://github.com/holny/share-context-mcp/releases/latest)
+(`darwin-arm64` / `darwin-x64` / `linux-x64` / `linux-arm64` / `windows-x64`):
+
+| Asset | What it is |
+|---|---|
+| `share-context-server-<platform>` | the MCP server (one per agent session) |
+| `share-context-relay-<platform>` | the blind relay (one per team, run it anywhere) |
+| `share-context-<platform>` | the CLI: management, rotation, votes, `relay` and `console` commands |
+
+```bash
+chmod +x share-context-*                 # macOS/Linux
+sudo install -m 755 share-context-* /usr/local/bin/
+share-context relay                      # relay on :8931, db under ~/.share-context-mcp
+```
+
+### Build from source (development)
 
 ```bash
 <<<<<<< HEAD
@@ -304,10 +322,8 @@ first, the relay stays blind, channel data is always quoted data.
 =======
 git clone https://github.com/holny/share-context-mcp.git
 cd share-context-mcp
-bun install && bun test       # 262 tests, tsc clean
-
-# build all-platform binaries
-scripts/build-binaries.sh     # → dist/bin/ (10 binaries, 5 platforms × 2)
+bun install && bun test       # 301 tests, tsc clean
+scripts/build-binaries.sh all # → dist/bin/ (15 binaries: 3 tools × 5 platforms)
 ```
 
 ### Configure
@@ -321,7 +337,7 @@ Each agent's project config (e.g. `opencode.json`):
       "share-context": {
         "type": "local",
         "codemode": false,
-        "command": ["/path/to/dist/bin/share-context-server-bun-darwin-arm64"],
+        "command": ["share-context-server"],   // or an absolute path to the binary
         "environment": {
           "SHARE_CONTEXT_RELAY_URL": "http://<relay-IP>:8931",
           "SHARE_CONTEXT_DB_PATH": "/Users/you/.share-context-mcp/myproject.db"
