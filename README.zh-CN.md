@@ -186,7 +186,7 @@ scripts/build-binaries.sh     # → dist/bin/（10 个二进制，5 平台 × 2�
     }
   },
   // 可选：伴生插件（真·实时注入）
-  "plugin": ["/path/to/share-context-mcp/packages/plugin-opencode"]
+  "plugins": ["/path/to/share-context-mcp/packages/plugin-opencode"]
 }
 ```
 
