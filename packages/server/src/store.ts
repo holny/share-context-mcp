@@ -193,8 +193,19 @@ export class Store {
       CREATE TABLE IF NOT EXISTS consumer_channels (
         consumer_id TEXT NOT NULL,
         channel_id  TEXT NOT NULL,
+        member_name TEXT,
         joined_at   TEXT NOT NULL,
         PRIMARY KEY(consumer_id, channel_id)
+      );
+      CREATE TABLE IF NOT EXISTS memberships (
+        channel_id   TEXT NOT NULL,
+        member_name  TEXT NOT NULL,
+        password_enc TEXT NOT NULL,
+        epoch        INTEGER NOT NULL,
+        cursor       INTEGER NOT NULL DEFAULT 0,
+        token_enc    TEXT,
+        joined_at    TEXT NOT NULL,
+        PRIMARY KEY(channel_id, member_name)
       );
       CREATE TABLE IF NOT EXISTS message_keys (
         channel_id  TEXT NOT NULL,
@@ -211,6 +222,13 @@ export class Store {
     // (older stores get them via ALTER).
     try { this.db.exec("ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { this.db.exec("ALTER TABLE channels ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0"); } catch {}
+    // v3 identity iteration: multiple memberships per channel per machine.
+    // Backfill: every legacy channels row becomes one membership; every
+    // consumer_channels row gets the member it joined as.
+    try { this.db.exec(`INSERT OR IGNORE INTO memberships(channel_id, member_name, password_enc, epoch, cursor, token_enc, joined_at)
+      SELECT channel_id, member_name, password_enc, epoch, cursor, NULL, joined_at FROM channels`); } catch {}
+    try { this.db.exec(`UPDATE consumer_channels SET member_name = (SELECT member_name FROM channels WHERE channels.channel_id = consumer_channels.channel_id)
+      WHERE member_name IS NULL`); } catch {}
     // One-time backfill for stores created before the FTS index existed:
     // rows cached pre-upgrade would otherwise be invisible to >=3-char
     // searches forever. Runs only when the index is empty while the cache
@@ -307,6 +325,124 @@ export class Store {
       memberName: row.member_name,
       epoch: row.epoch,
     };
+  }
+
+  // ---- memberships (v3 identity iteration: several members per channel per machine) ----
+
+  /** Insert or update one (channel, member) membership. Cursor is preserved on conflict. */
+  upsertMembership(ch: ChannelSecretInput): void {
+    this.db
+      .prepare(
+        `INSERT INTO memberships(channel_id, member_name, password_enc, epoch, cursor, joined_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(channel_id, member_name) DO UPDATE SET
+           password_enc = excluded.password_enc,
+           epoch = excluded.epoch`,
+      )
+      .run(
+        ch.channelId,
+        ch.memberName,
+        encryptSecret(this.machineKey, ch.password),
+        ch.epoch,
+        ch.cursor ?? this.getMembershipCursor(ch.channelId, ch.memberName),
+        new Date().toISOString(),
+      );
+    // Keep the legacy channels row pointing at the newest membership so older
+    // code paths (metadata lookups, single-member flows) keep working.
+    this.upsertChannel({ ...ch, cursor: this.getMembershipCursor(ch.channelId, ch.memberName) });
+  }
+
+  getMembership(channelId: string, memberName: string): { password: string; epoch: number; cursor: number } | null {
+    const row = this.db
+      .prepare("SELECT password_enc, epoch, cursor FROM memberships WHERE channel_id = ? AND member_name = ?")
+      .get(channelId, memberName) as { password_enc: string; epoch: number; cursor: number } | undefined;
+    if (!row) return null;
+    return { password: decryptSecret(this.machineKey, row.password_enc), epoch: row.epoch, cursor: row.cursor };
+  }
+
+  hasMembership(channelId: string, memberName: string): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM memberships WHERE channel_id = ? AND member_name = ?")
+      .get(channelId, memberName);
+  }
+
+  /** Member names this machine holds for a channel, oldest first. */
+  listMembershipNames(channelId: string): string[] {
+    return (
+      this.db
+        .prepare("SELECT member_name FROM memberships WHERE channel_id = ? ORDER BY joined_at ASC")
+        .all(channelId) as Array<{ member_name: string }>
+    ).map((r) => r.member_name);
+  }
+
+  deleteMembership(channelId: string, memberName: string): void {
+    this.db.prepare("DELETE FROM memberships WHERE channel_id = ? AND member_name = ?").run(channelId, memberName);
+    if (this.listMembershipNames(channelId).length === 0) this.removeChannel(channelId);
+  }
+
+  getMembershipCursor(channelId: string, memberName: string): number {
+    const row = this.db
+      .prepare("SELECT cursor FROM memberships WHERE channel_id = ? AND member_name = ?")
+      .get(channelId, memberName) as { cursor: number } | undefined;
+    if (row) return row.cursor;
+    // legacy single-member store: channels.cursor doubles as the membership cursor
+    const legacy = this.db.prepare("SELECT cursor FROM channels WHERE channel_id = ?").get(channelId) as { cursor: number } | undefined;
+    return legacy?.cursor ?? 0;
+  }
+
+  setMembershipCursor(channelId: string, memberName: string, seq: number): void {
+    this.db
+      .prepare("UPDATE memberships SET cursor = ? WHERE channel_id = ? AND member_name = ?")
+      .run(seq, channelId, memberName);
+  }
+
+  /** Membership-scoped token storage (AES-sealed at rest). */
+  setMembershipToken(channelId: string, memberName: string, token: string): void {
+    // Upsert: the token can arrive BEFORE the membership row (createChannel
+    // joins the creator before the row is written). The empty password
+    // placeholder is filled by the immediately-following membership upsert.
+    this.db
+      .prepare(
+        `INSERT INTO memberships(channel_id, member_name, password_enc, epoch, cursor, token_enc, joined_at)
+         VALUES (?, ?, '', 0, 0, ?, ?)
+         ON CONFLICT(channel_id, member_name) DO UPDATE SET token_enc = excluded.token_enc`,
+      )
+      .run(channelId, memberName, encryptSecret(this.machineKey, token), new Date().toISOString());
+  }
+
+  getMembershipToken(channelId: string, memberName: string): string | null {
+    const row = this.db
+      .prepare("SELECT token_enc FROM memberships WHERE channel_id = ? AND member_name = ?")
+      .get(channelId, memberName) as { token_enc: string | null } | undefined;
+    if (!row?.token_enc) return null;
+    try {
+      return decryptSecret(this.machineKey, row.token_enc);
+    } catch {
+      return null;
+    }
+  }
+
+  deleteMembershipToken(channelId: string, memberName: string): void {
+    this.db
+      .prepare("UPDATE memberships SET token_enc = NULL WHERE channel_id = ? AND member_name = ?")
+      .run(channelId, memberName);
+  }
+
+  /** The member this consumer joined a channel as (null when never joined here). */
+  memberForConsumer(consumerId: string, channelId: string): string | null {
+    const row = this.db
+      .prepare("SELECT member_name FROM consumer_channels WHERE consumer_id = ? AND channel_id = ?")
+      .get(consumerId, channelId) as { member_name: string | null } | undefined;
+    return row?.member_name ?? null;
+  }
+
+  recordConsumerChannel(consumerId: string, channelId: string, memberName?: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO consumer_channels(consumer_id, channel_id, member_name, joined_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(consumer_id, channel_id) DO UPDATE SET member_name = COALESCE(excluded.member_name, member_name)`,
+      )
+      .run(consumerId, channelId, memberName ?? null, new Date().toISOString());
   }
 
   listChannels(): string[] {
@@ -412,11 +548,16 @@ export class Store {
 
   // ---- cursor (spec §5.7) ----
 
-  setCursor(channelId: string, seq: number): void {
+  setCursor(channelId: string, seq: number, memberName?: string): void {
+    if (memberName) {
+      this.setMembershipCursor(channelId, memberName, seq);
+      return;
+    }
     this.db.prepare("UPDATE channels SET cursor = ? WHERE channel_id = ?").run(seq, channelId);
   }
 
-  getCursor(channelId: string): number {
+  getCursor(channelId: string, memberName?: string): number {
+    if (memberName) return this.getMembershipCursor(channelId, memberName);
     const row = this.db.prepare("SELECT cursor FROM channels WHERE channel_id = ?").get(channelId) as
       | { cursor: number }
       | undefined;
@@ -427,11 +568,11 @@ export class Store {
    * Advance the cursor to the max seq seen. Monotonic: never regresses on
    * re-delivered older messages, no-op for an empty batch or all-null seqs.
    */
-  recordCursorFromMessages(channelId: string, msgs: ReadonlyArray<{ seq: number | null }>): void {
+  recordCursorFromMessages(channelId: string, msgs: ReadonlyArray<{ seq: number | null }>, memberName?: string): void {
     const seqs = msgs.map((m) => m.seq).filter((s): s is number => typeof s === "number");
     if (seqs.length === 0) return;
     const max = Math.max(...seqs);
-    if (max > this.getCursor(channelId)) this.setCursor(channelId, max);
+    if (max > this.getCursor(channelId, memberName)) this.setCursor(channelId, max, memberName);
   }
 
   // ---- decrypted message cache ----
@@ -611,11 +752,7 @@ export class Store {
   }
 
   /** Per-session channel ledger (§6 multi-channel): a consumer's joined channels. */
-  recordConsumerChannel(consumerId: string, channelId: string): void {
-    this.db
-      .prepare("INSERT OR IGNORE INTO consumer_channels(consumer_id, channel_id, joined_at) VALUES (?, ?, ?)")
-      .run(consumerId, channelId, new Date().toISOString());
-  }
+
 
   listConsumerChannels(consumerId: string): Array<{ channelId: string; joinedAt: string }> {
     return this.db

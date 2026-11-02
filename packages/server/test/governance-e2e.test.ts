@@ -102,7 +102,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     expect(fetched.messages.some((m) => m.statement.includes("governance rules apply"))).toBe(true);
 
     // ---- 4. kick vote opened via the CLI tier (raw HTTP; no MCP surface) ----
-    const aliceToken = JSON.parse(alice.store.getSecret(`token:${channelId}`)!) as { token: string };
+    const aliceToken = { token: alice.store.getMembershipToken(channelId, "alice")! };
     const voteRes = await fetch(`${baseUrl}/channels/${channelId}/votes`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${aliceToken.token}` },
@@ -117,11 +117,11 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     };
     expect(withVote.openVotes.some((v) => v.id === voteId && v.target === "dave")).toBe(true);
 
-    const carolToken = JSON.parse(carol.store.getSecret(`token:${channelId}`)!) as { token: string };
+    const carolToken = { token: carol.store.getMembershipToken(channelId, "carol")! };
     // dave (the target) cannot vote
     const daveBallot = await fetch(`${baseUrl}/channels/${channelId}/votes/${voteId}/ballot`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${(JSON.parse(dave.store.getSecret(`token:${channelId}`)!) as { token: string }).token}` },
+      headers: { "content-type": "application/json", authorization: `Bearer ${dave.store.getMembershipToken(channelId, "dave")!}` },
       body: JSON.stringify({ choice: "no" }),
     });
     expect(daveBallot.status).toBe(403);
@@ -136,7 +136,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     // after 2 yes + 0 no of 3 eligible: yes(2) > (2+1)/2 → passes immediately
 
     // ---- 6. kick enforcement: dave's token answers 403 banned ----
-    const daveToken = (JSON.parse(dave.store.getSecret(`token:${channelId}`)!) as { token: string }).token;
+    const daveToken = dave.store.getMembershipToken(channelId, "dave")!;
     const daveMeta = await fetch(`${baseUrl}/channels/${channelId}/meta`, {
       headers: { authorization: `Bearer ${daveToken}` },
     });

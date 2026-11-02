@@ -242,7 +242,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
 
     const joined = await b.client.callTool({
       name: "join_channel",
-      arguments: { channel_id: channelId, password, memberName: "b" },
+      arguments: { channel_id: channelId, password, member_name: "b" },
     });
     const card = textOf(joined);
     expect(card.startsWith(QUOTE_HEADER)).toBe(true);
@@ -267,6 +267,15 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
       skipped: number;
       cursor: number;
     };
+    if (body.messages.length !== 1) {
+      console.error("DEBUG-B", JSON.stringify({
+        members: b.store.listMembershipNames(channelId),
+        cursors: b.store.listMembershipNames(channelId).map((m) => [m, b.store.getCursor(channelId, m)]),
+        consumerRow: b.store.memberForConsumer("p/unknown", channelId),
+        cached: b.store.searchCache(channelId, "").map((m) => [m.seq, m.statement.slice(0, 30)]),
+        body,
+      }));
+    }
     expect(body.messages).toHaveLength(1);
     expect(body.messages[0].statement).toContain("sqlite WAL");
     expect(body.messages[0].kind).toBe("decision");
@@ -747,6 +756,43 @@ describe("session-token adoption on 409 (identity binding)", () => {
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
     return { client, store };
   }
+
+  test("one machine, one store, TWO memberships of one channel coexist (v3 identity model)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "scm-mcp-coexist-"));
+    dirs.push(dir);
+    const store = new Store(join(dir, "state.db"));
+    const ownerBridge = new RelayBridge({ baseUrl, store });
+    const { channelId, password } = await ownerBridge.createChannel({ memberName: "hly" });
+
+    // the SAME store joins two more members of the same channel
+    const mB = new RelayBridge({ baseUrl, store });
+    await mB.join(channelId, password, "bob");
+    const mC = new RelayBridge({ baseUrl, store });
+    await mC.join(channelId, password, "carol");
+
+    expect(store.listMembershipNames(channelId).sort()).toEqual(["bob", "carol", "hly"]);
+    expect(store.hasMembership(channelId, "bob")).toBe(true);
+    expect(store.hasMembership(channelId, "carol")).toBe(true);
+
+    // each member sends; every other member sees all messages
+    const send = (br: RelayBridge, member: string) =>
+      br.send({ statement: `hello from ${member}`, kind: "progress", topic: "t", seq: null, ts: new Date().toISOString(), provenance: { member, source: "agent" } }, channelId);
+    await send(ownerBridge, "hly");
+    await send(mB, "bob");
+    await send(mC, "carol");
+
+    const got = await mB.poll(channelId, 0);
+    const statements = got.messages.map((m) => m.statement).sort();
+    expect(statements).toEqual(["hello from bob", "hello from carol", "hello from hly"]);
+
+    // userId surfaces in meta for same-user grouping
+    const meta = await ownerBridge.meta(channelId);
+    const withUser = meta.members.filter((m) => m.userId);
+    expect(withUser.length).toBeGreaterThan(0);
+    const ids = new Set(meta.members.map((m) => m.userId));
+    expect(ids.size).toBe(1); // all three members belong to the SAME relay-global user
+    store.close();
+  });
 
   test("re-join with the SAME memberName on 409 adopts the live session and works", async () => {
     const dir = mkdtempSync(join(tmpdir(), "scm-mcp-adopt-"));

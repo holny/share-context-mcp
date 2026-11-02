@@ -47,6 +47,10 @@ export interface ChannelMember {
   lastActiveAt?: string | null;
   /** Permission tier from the relay (creator | manager | representative | vip | regular | trial). Relay-backed bridges only. */
   permissionRole?: string;
+  /** Relay-global user id — groups the consumers/sessions of one human. Relay-backed bridges only. */
+  userId?: string;
+  /** Human-friendly user label (default: machine hostname at registration). Relay-backed bridges only. */
+  userName?: string;
 }
 
 export interface ChannelMeta {

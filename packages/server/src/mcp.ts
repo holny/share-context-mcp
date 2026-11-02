@@ -456,6 +456,11 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
    * retained history into the local cache, then build the structural index
    * card the joining agent reads to orient itself.
    */
+  const memberCursor = (ch: string): number => {
+    const member = bridge instanceof RelayBridge ? bridge.currentMember(ch) : undefined;
+    return store.getCursor(ch, member);
+  };
+
   const joinCard = async (ch: string): Promise<string> => {
     // Full-history fetch (spec: retention bounds relay history, so "all of
     // it" is finite): page from the local cursor until caught up with the
@@ -464,10 +469,10 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
     // re-joining member starts from its stored cursor — the cursor never
     // moves backward and already-cached messages are not re-pulled.
     const meta = await bridge.meta(ch);
-    let since = store.getCursor(ch);
+    let since = memberCursor(ch);
     for (let pages = 0; pages < 10_000; pages++) {
       await bridge.poll(ch, since);
-      const advanced = store.getCursor(ch);
+      const advanced = memberCursor(ch);
       if (advanced <= since) break; // empty page — caught up
       since = advanced;
       if (since >= meta.nextSeq - 1) break; // reached relay head
@@ -511,6 +516,7 @@ export function buildMcpServer(deps: McpServerDeps): McpServer {
       members: (card.members as Array<Record<string, unknown>>).map((m) => ({
         ...m,
         role: roleOf(m.memberName as string),
+        ...(m.userName ? { user: m.userName } : {}),
       })),
       recentMessages,
       moreHint: "fetch_messages({topic}|{query}) for older/full text — channel_info for the full briefing",
@@ -705,7 +711,7 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
           Math.min(limit ?? SEARCH_RESULT_CAP, SEARCH_RESULT_CAP),
         );
         return quoteWrap(
-          JSON.stringify({ channelId: ch, messages, skipped: 0, cursor: store.getCursor(ch), remaining: 0 }),
+          JSON.stringify({ channelId: ch, messages, skipped: 0, cursor: memberCursor(ch), remaining: 0 }),
         );
       }
       // HISTORY mode: newest matching messages, oldest first in the batch;
@@ -716,8 +722,8 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
         let messages = pick();
         if (messages.length < lim) {
           const meta = await bridge.meta(ch);
-          if (meta.nextSeq > store.getCursor(ch)) {
-            await bridge.poll(ch, store.getCursor(ch));
+          if (meta.nextSeq > memberCursor(ch)) {
+            await bridge.poll(ch, memberCursor(ch));
             messages = pick();
           }
         }
@@ -727,7 +733,7 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
             channelId: ch,
             messages: messages.slice().reverse(),
             skipped: 0,
-            cursor: store.getCursor(ch),
+            cursor: memberCursor(ch),
             remaining: 0,
             ...(openVotes ? { openVotes } : {}),
           }),
@@ -735,9 +741,9 @@ Returns { channelId, messages, skipped, cursor, remaining, openVotes? }: message
       }
       // DELTA mode: poll the relay, serve the undelivered window.
       const consumerDelivered = deliveredFor(consumerIdFromExtra(extra));
-      const prevHigh = store.getCursor(ch);
+      const prevHigh = memberCursor(ch);
       const pollResult = await bridge.poll(ch, prevHigh);
-      const high = store.getCursor(ch);
+      const high = memberCursor(ch);
       // Digest failure must not break the fetch (see joinCard note).
       await maybePostDigest(bridge, store, ch).catch((e: unknown) => {
         console.error("share-context-mcp: digest posting failed:", e instanceof Error ? e.message : String(e));
@@ -952,13 +958,9 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
             note: `message key v${p.keyVersion} installed locally — sending on the encrypted channel works again`,
           });
         }
-        if (existing && existing.memberName !== requestedName) {
-          throw new Error(
-            `this machine already holds a membership for channel ${p.channelId} as "${existing.memberName}". ` +
-            `Joining as a second member needs a separate local store: set SHARE_CONTEXT_DB_PATH in this ` +
-            `session's MCP config to its own file, then run join_channel again`,
-          );
-        }
+        // A DIFFERENT member name = a genuinely new member of the same user
+        // (one machine may hold several memberships of one channel). Fall
+        // through to the real join — the store keeps both memberships apart.
         const secret = p.inviteCode ?? p.password;
         if (typeof secret !== "string" || secret.length === 0) {
           throw new Error("invalid blob: payload needs a password or inviteCode");
@@ -1077,9 +1079,13 @@ If you are ALREADY a member and the blob carries a newer message key, this perfo
         .filter((m) => q === undefined || m.memberName.toLowerCase().includes(q))
         .map((m) => {
           const activity = activityBucket(m.lastActiveAt);
-          return activity === undefined
-            ? { memberName: m.memberName, joinedAt: m.joinedAt }
-            : { memberName: m.memberName, joinedAt: m.joinedAt, activity };
+          return {
+            memberName: m.memberName,
+            joinedAt: m.joinedAt,
+            // user grouping: several members may belong to one human
+            ...(m.userName ? { user: m.userName } : {}),
+            ...(activity !== undefined ? { activity } : {}),
+          };
         });
       return quoteWrap(JSON.stringify({ channelId: ch, members }));
     }),
