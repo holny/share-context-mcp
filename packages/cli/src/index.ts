@@ -40,7 +40,7 @@ async function cmdRelay() {
   }
   const db = arg("db") ?? join(homedir(), ".share-context-mcp", "relay.db");
   console.error(`share-context relay v${VERSION}`);
-  console.error(`  admin console: http://localhost:${port}/admin`);
+  console.error(`  local management console: share-context console   (separate process)`);
   console.error(`  press Ctrl+C to stop\n`);
   const relay = await startRelay({ port, dbPath: db });
   console.error(`relay listening on http://0.0.0.0:${relay.port}`);
@@ -190,12 +190,25 @@ async function cmdLeave() {
   }
 }
 
+/** Local management console (packages/console) — channels, members, health on localhost. */
+async function cmdConsole() {
+  const port = Number(arg("port") ?? 8941);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`invalid --port: ${arg("port")}`);
+    process.exit(1);
+  }
+  const { startConsole } = await import("@share-context-mcp/console");
+  await startConsole({ port });
+  console.error(`share-context console: http://localhost:${port}/ (Ctrl+C to stop)`);
+}
+
 function cmdHelp() {
   console.log(`share-context v${VERSION}
 
 Commands:
-  relay                        Start blind relay server
+  relay                        Start blind relay server (default :8931, db under ~/.share-context-mcp)
   server                       Start local MCP server (stdio)
+  console [--port 8941]        Local management console: channels, members, health
   create-channel               Create a channel (--member <name> [--visibility public|private] [--mode no_limit|invite|password] [--encrypted] [--probation] [--contact "..."])
   join                         Join a channel (--channel-id <id> --password <pw> | --invite-code <code> | --blob "<blob>") [--member <name>]
   status                       Show channel status (roles, admission mode, contact)
@@ -494,7 +507,7 @@ async function cmdDirectory() {
 
 const command = process.argv[2];
 const commands: Record<string, () => Promise<void>> = {
-  relay: cmdRelay, server: cmdServer, "create-channel": cmdCreateChannel,
+  relay: cmdRelay, server: cmdServer, console: cmdConsole, "create-channel": cmdCreateChannel,
   join: cmdJoin, status: cmdStatus, fetch: cmdFetch,
   "rotate-password": cmdRotatePassword,
   leave: cmdLeave,
