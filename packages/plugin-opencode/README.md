@@ -30,7 +30,7 @@ opencode 兼容加载器（v2+ 的插件加载器）支持本地目录：目录�
 
 ```json
 {
-  "plugin": [
+  "plugins": [
     "/absolute/path/to/share-context-mcp/packages/plugin-opencode"
   ]
 }

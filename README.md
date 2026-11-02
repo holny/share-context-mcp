@@ -212,7 +212,7 @@ Each agent's project config (e.g. `opencode.json`):
     }
   },
   // Optional: companion plugin for real-time injection
-  "plugin": ["/path/to/share-context-mcp/packages/plugin-opencode"]
+  "plugins": ["/path/to/share-context-mcp/packages/plugin-opencode"]
 }
 ```
 
