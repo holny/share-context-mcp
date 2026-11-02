@@ -21,11 +21,12 @@ Requirements: [Bun](https://bun.sh) ≥ 1.2. No accounts, no configuration files
 Start the relay (any machine both participants can reach):
 
 ```sh
-bun run packages/relay/src/index.ts --port 8787 --db relay.db
-# share-context relay: http://127.0.0.1:8787 (db: relay.db) — blind, stores ciphertext only
+bun run packages/relay/src/index.ts            # zero flags needed
+# share-context relay: http://127.0.0.1:8931 (db: ~/.share-context-mcp/relay.db) — blind, stores ciphertext only
 ```
 
-`--port` defaults to 8787, `--db` to `relay.db` in the working directory. The
+`--port` defaults to 8931 (8787 is commonly occupied by local LLM gateways), `--db` to
+`~/.share-context-mcp/relay.db`. Pass `--port` / `--db` only to run extra instances. The
 SQLite file is created on first start; stop with Ctrl-C. Bind a firewalled /
 intranet host only — the relay trusts its network path (TLS termination, if
 needed, is a deployment concern in front of it, not in v1).
@@ -54,7 +55,7 @@ actual data-root convention rather than assuming `~/.config`.
         "codemode": false,
         "command": ["bun", "/abs/path/to/share-context-mcp/packages/server/src/index.ts"],
         "environment": {
-          "SHARE_CONTEXT_RELAY_URL": "http://relay-host:8787"
+          "SHARE_CONTEXT_RELAY_URL": "http://relay-host:8931"
         }
       }
     }
@@ -87,7 +88,7 @@ also works — they share local state by design). Record the outcome in
 `docs/superpowers/spikes/2026-10-25-spike-results.md`.
 
 1. **Relay up**
-   `bun run packages/relay/src/index.ts --port 8787 --db relay.db`
+   `bun run packages/relay/src/index.ts`
    Look for the startup line above; no errors on stderr.
 2. **Both sessions have the server** — add the config snippet, restart both
    sessions, ask each agent to list its channel tools (expect the seven

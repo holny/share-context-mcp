@@ -164,14 +164,19 @@ export async function startRelay(options: RelayOptions = {}): Promise<RelayHandl
 }
 
 if (import.meta.main) {
-  // CLI: bun run packages/relay/src/index.ts --port 8787 --db relay.db
+  // CLI: bun run packages/relay/src/index.ts [--port 8931] [--db <path>]
+  // Defaults match the `share-context relay` command: port 8931 (8787 is
+  // commonly taken by local LLM gateways), db under the user data dir — one
+  // stable relay per machine; --port/--db are for running extra instances.
   const args = process.argv.slice(2);
   const flag = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
   };
-  const port = Number(flag("--port") ?? 8787);
-  const dbPath = flag("--db") ?? "relay.db";
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  const port = Number(flag("--port") ?? 8931);
+  const dbPath = flag("--db") ?? join(homedir(), ".share-context-mcp", "relay.db");
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     console.error(`invalid --port: ${flag("--port")}`);
     process.exit(1);
