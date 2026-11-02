@@ -186,7 +186,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     // owner shares the v1 key blob → erin tops up and can read
     const v1Blob = JSON.parse(textOf(await alice.client.callTool({ name: "generate_share_blob", arguments: { channel_id: channelId } })));
     expect(parseBlobEnvelope(v1Blob.blob).type).toBe("join_key");
-    const v1TopUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: v1Blob.blob } });
+    const v1TopUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: v1Blob.blob, member_name: "erin" } });
     expect(isError(v1TopUp)).toBe(false);
     expect(erin.store.messageKey(channelId, 1)).not.toBeNull();
 
@@ -219,7 +219,7 @@ describe("e2e governance: vote → kick → encryption → blob → dissolve", (
     // fresh key-only blob from the owner → erin tops up without re-joining
     const keyBlob = JSON.parse(textOf(await alice.client.callTool({ name: "generate_share_blob", arguments: { channel_id: channelId } })));
     expect(parseBlobEnvelope(keyBlob.blob).type).toBe("join_key");
-    const topUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: keyBlob.blob } });
+    const topUp = await erin.client.callTool({ name: "join_channel", arguments: { blob: keyBlob.blob, member_name: "erin" } });
     expect(isError(topUp)).toBe(false);
     expect(Buffer.from(erin.store.messageKey(channelId, 2)!).equals(alice.store.messageKey(channelId, 2)!)).toBe(true);
     expect(Buffer.from(alice.store.messageKey(channelId, 2)!).equals(before)).toBe(false); // genuinely a NEW key

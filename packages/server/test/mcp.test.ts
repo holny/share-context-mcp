@@ -171,7 +171,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
         type: "key_update",
         payload: { relayUrl: baseUrl, channelId, messageKey: Buffer.from(key2).toString("base64"), keyVersion: 2 },
       });
-      const res = await b.client.callTool({ name: "join_channel", arguments: { blob } });
+      const res = await b.client.callTool({ name: "join_channel", arguments: { blob, member_name: "b" } });
       expect(isError(res)).toBe(false);
       expect(JSON.parse(textOf(res)).keyTopUp).toBe(true);
       // the top-up key is exactly the rotated v2 key, and B can send again
@@ -644,11 +644,12 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     const r5 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: nlEnc.channel_id } })));
     expect(parseBlobEnvelope(r5.blob).type).toBe("join_key");
 
-    // no_limit + unencrypted → nothing to share
+    // no_limit + unencrypted → text-only SOP package (no blob, nothing sensitive to carry)
     const nlPlain = await mk("gsb-nlp", { admissionMode: "no_limit" });
-    const r6 = await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: nlPlain.channel_id } });
-    expect(isError(r6)).toBe(true);
-    expect(textOf(r6)).toContain("nothing to share");
+    const r6 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id: nlPlain.channel_id } })));
+    expect(r6.blob).toBeNull();
+    expect(r6.text).toContain("no_limit");
+    expect(r6.text).toContain("share-context-mcp");
   });
 
   test("generate_share_blob: invite blob joins end-to-end via join_channel(blob)", async () => {
@@ -697,7 +698,7 @@ describe("MCP tool surface (in-memory transport, real relay)", () => {
     // b joins with the password, then tops up the key from the owner's blob
     await b.client.callTool({ name: "join_channel", arguments: { channel_id, password: created.password, member_name: "b" } });
     const v1 = JSON.parse(textOf(await a.client.callTool({ name: "generate_share_blob", arguments: { channel_id } })));
-    await b.client.callTool({ name: "join_channel", arguments: { blob: v1.blob } });
+    await b.client.callTool({ name: "join_channel", arguments: { blob: v1.blob, member_name: "b" } });
     expect(b.store.messageKey(channel_id, 1)).not.toBeNull();
     // owner rotates to v2
     await a.bridge.rotateKey(channel_id);
