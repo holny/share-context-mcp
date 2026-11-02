@@ -4,5 +4,9 @@
   "type": "module",
   "dependencies": {
     "@share-context-mcp/server": "workspace:*"
+  },
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
   }
 }

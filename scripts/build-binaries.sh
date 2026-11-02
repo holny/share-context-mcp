@@ -25,6 +25,8 @@ build_one() {
   bun build --compile --target=$target packages/relay/src/bin.ts --outfile "dist/bin/share-context-relay-$target$ext"
   echo "building share-context-server ($target)..."
   bun build --compile --target=$target packages/server/src/bin.ts --outfile "dist/bin/share-context-server-$target$ext"
+  echo "building share-context ($target)..."
+  bun build --compile --target=$target packages/cli/src/index.ts --outfile "dist/bin/share-context-$target$ext"
 }
 
 if [ $# -gt 0 ] && [ "$1" = "all" ]; then
